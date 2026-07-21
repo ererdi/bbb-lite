@@ -1,0 +1,433 @@
+"""Mission Control access — the only file allowed to touch the database.
+
+The guarded connection below is ported from haroon-bbb-sync's
+lib/bbb_mc_access.py (rebuild branch, GuardedLocalConnection/GuardedLocalCursor
+and its SQL-shape parser). Remote bridge, the write-gate nonce/marker system,
+board hygiene, and human-approval scaffolding were stripped — this project is
+a single local sqlite file with local mode as the only mode. What's kept:
+a connection (and its cursor()) that refuses any raw SQL setting
+tasks.status='done'; only complete_task() may do that.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import re
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+DB_PATH = Path(__file__).resolve().parent / "mc.db"
+
+
+class MCAccessError(RuntimeError):
+    """Base error for guarded MC access failures."""
+
+
+class MCCompletionRefused(MCAccessError):
+    """A task transition to done was attempted outside complete_task()."""
+
+
+@dataclass(frozen=True)
+class _CompletionAuthorization:
+    """Internal capability minted only by complete_task()."""
+
+    task_id: str
+
+
+def _strip_sql_comments(sql: str) -> str:
+    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.S)
+    return re.sub(r"--[^\n]*", " ", sql)
+
+
+def _split_sql_csv(text: str) -> list[str]:
+    """Small SQL CSV splitter for a single INSERT values list."""
+
+    out: list[str] = []
+    start = 0
+    depth = 0
+    quote: str | None = None
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if quote:
+            if char == quote:
+                if i + 1 < len(text) and text[i + 1] == quote:
+                    i += 1
+                else:
+                    quote = None
+        elif char in {"'", '"'}:
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        elif char == "," and depth == 0:
+            out.append(text[start:i].strip())
+            start = i + 1
+        i += 1
+    out.append(text[start:].strip())
+    return out
+
+
+def _sql_parenthesized(text: str, open_at: int) -> tuple[str, int] | None:
+    """Return balanced SQL parenthesis content + closing index."""
+
+    if open_at < 0 or open_at >= len(text) or text[open_at] != "(":
+        return None
+    depth = 0
+    quote: str | None = None
+    i = open_at
+    while i < len(text):
+        char = text[i]
+        if quote:
+            if char == quote:
+                if i + 1 < len(text) and text[i + 1] == quote:
+                    i += 1
+                else:
+                    quote = None
+        elif char in {"'", '"'}:
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_at + 1:i], i
+        i += 1
+    return None
+
+
+def _bound_value(token: str, sql_prefix: str, params: Iterable[Any]) -> tuple[bool, Any]:
+    """Return (known, value) for a literal or positional placeholder."""
+
+    token = token.strip()
+    if len(token) >= 2 and token[0] in {"'", '"'} and token[-1] == token[0]:
+        return True, token[1:-1]
+    if token == "?":
+        values = list(params)
+        index = sql_prefix.count("?")
+        if index < len(values):
+            return True, values[index]
+        return False, None
+    if re.fullmatch(r"NULL", token, re.I):
+        return True, None
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", token):
+        return True, token
+    return False, None
+
+
+def _insert_values(sql: str, params: Iterable[Any]) -> tuple[str | None, dict[str, tuple[bool, Any, str]]]:
+    """Return table + simple single-row INSERT assignments; unknown shape is empty."""
+
+    clean = _strip_sql_comments(sql)
+    match = re.search(
+        r"\bINSERT\s+(?:OR\s+\w+\s+)?INTO\s+(?:\w+\.)?"
+        r"[\"`\[]?([A-Za-z_][A-Za-z0-9_]*)[\"`\]]?\s*\(",
+        clean,
+        re.I,
+    )
+    if not match:
+        return None, {}
+    columns_group = _sql_parenthesized(clean, match.end() - 1)
+    if columns_group is None:
+        return match.group(1).lower(), {}
+    columns_text, columns_end = columns_group
+    values_match = re.match(r"\s*VALUES\s*\(", clean[columns_end + 1:], re.I)
+    if not values_match:
+        return match.group(1).lower(), {}
+    values_open = columns_end + 1 + values_match.end() - 1
+    values_group = _sql_parenthesized(clean, values_open)
+    if values_group is None:
+        return match.group(1).lower(), {}
+    values_text, values_end = values_group
+    if not re.fullmatch(r"\s*;?\s*", clean[values_end + 1:]):
+        return match.group(1).lower(), {}
+    columns = [part.strip().strip('"`[]').lower() for part in _split_sql_csv(columns_text)]
+    values = _split_sql_csv(values_text)
+    if len(columns) != len(values):
+        return match.group(1).lower(), {}
+    out: dict[str, tuple[bool, Any, str]] = {}
+    search_from = values_open + 1
+    for column, token in zip(columns, values):
+        token_at = clean.find(token, search_from)
+        if token_at < 0:
+            token_at = search_from
+        known, value = _bound_value(token, clean[:token_at], params)
+        out[column] = (known, value, token.strip())
+        search_from = token_at + len(token)
+    return match.group(1).lower(), out
+
+
+def _is_task_done_write(sql: str, params: Iterable[Any] = ()) -> bool:
+    """Conservatively identify a tasks.status transition that may produce done.
+
+    Unknown expressions are treated as potentially-done. Ordinary updates to
+    another task column, or a statically-known non-done status, are unaffected.
+    """
+
+    clean = _strip_sql_comments(sql)
+    values = list(params)
+    update = re.search(r"\bUPDATE\s+(?:OR\s+\w+\s+)?(?:\w+\.)?[\"`\[]?tasks[\"`\]]?\s+SET\s+", clean, re.I)
+    if update:
+        tail = clean[update.end():]
+        set_text = re.split(r"\bWHERE\b|\bRETURNING\b", tail, maxsplit=1, flags=re.I)[0]
+        for assignment in _split_sql_csv(set_text):
+            match = re.match(
+                r"\s*[\"`\[]?([A-Za-z_][A-Za-z0-9_]*)[\"`\]]?\s*=\s*(.+?)\s*$",
+                assignment,
+                re.I | re.S,
+            )
+            if not match:
+                # Tuple/row-value and other unparsed assignments can conceal
+                # status. Completion must fail closed independently.
+                return True
+            if match.group(1).lower() != "status":
+                continue
+            token = match.group(2)
+            absolute_prefix = clean[: clean.find(assignment, update.end()) + match.start(2)]
+            known, value = _bound_value(token, absolute_prefix, values)
+            if not known or str(value).lower() == "done":
+                return True
+        return False
+
+    insert = re.search(
+        r"\bINSERT\s+(?:OR\s+\w+\s+)?INTO\s+(?:\w+\.)?"
+        r"[\"`\[]?tasks[\"`\]]?\s*\(", clean, re.I,
+    )
+    if insert:
+        table, assignments = _insert_values(clean, values)
+        if table != "tasks" or not assignments:
+            return True
+        status = assignments.get("status")
+        if status is None:
+            return False
+        known, value, _token = status
+        if not known or str(value).lower() == "done":
+            return True
+
+    if re.search(
+        r"\bREPLACE\s+(?:OR\s+\w+\s+)?INTO\s+(?:\w+\.)?"
+        r"[\"`\[]?tasks[\"`\]]?\b", clean, re.I,
+    ):
+        return True
+
+    # UPSERT/CTE variants that name the tasks table and assign status are
+    # intentionally conservative if the simple parsers above did not prove a
+    # non-done value.
+    if (re.search(r"\b(?:UPDATE|INSERT|REPLACE)\b", clean, re.I)
+            and re.search(r"\btasks\b", clean, re.I) and re.search(
+        r"\bstatus\s*=\s*(?:['\"]done['\"]|CASE\b|\(|SELECT\b)", clean, re.I
+    )):
+        return True
+    return False
+
+
+def _guard_task_completion(
+    sql: str,
+    params: Iterable[Any],
+    authorization: _CompletionAuthorization | None,
+) -> None:
+    if _is_task_done_write(sql, params) and not isinstance(authorization, _CompletionAuthorization):
+        raise MCCompletionRefused(
+            "tasks.status='done' refused at MC seam; use mc.complete_task() instead"
+        )
+
+
+class GuardedLocalCursor(sqlite3.Cursor):
+    """Cursor form of the same guard; conn.cursor() cannot bypass the seam."""
+
+    def execute(self, sql: str, parameters: Iterable[Any] = ()) -> sqlite3.Cursor:
+        params = tuple(parameters)
+        _guard_task_completion(sql, params, None)
+        return super().execute(sql, params)
+
+    def executemany(
+        self, sql: str, seq_of_parameters: Iterable[Iterable[Any]]
+    ) -> sqlite3.Cursor:
+        rows = [tuple(row) for row in seq_of_parameters]
+        for params in rows:
+            _guard_task_completion(sql, params, None)
+        return super().executemany(sql, rows)
+
+    def executescript(self, sql_script: str) -> sqlite3.Cursor:
+        for statement in sql_script.split(";"):
+            if statement.strip():
+                _guard_task_completion(statement, (), None)
+        return super().executescript(sql_script)
+
+
+class GuardedLocalConnection(sqlite3.Connection):
+    """sqlite connection that keeps the completion gate in the only mode we have."""
+
+    def execute(
+        self,
+        sql: str,
+        parameters: Iterable[Any] = (),
+        *,
+        _completion_authorization: _CompletionAuthorization | None = None,
+    ) -> sqlite3.Cursor:
+        params = tuple(parameters)
+        _guard_task_completion(sql, params, _completion_authorization)
+        return sqlite3.Connection.cursor(self, factory=sqlite3.Cursor).execute(sql, params)
+
+    def executemany(
+        self,
+        sql: str,
+        seq_of_parameters: Iterable[Iterable[Any]],
+    ) -> sqlite3.Cursor:
+        rows = [tuple(row) for row in seq_of_parameters]
+        for params in rows:
+            _guard_task_completion(sql, params, None)
+        return sqlite3.Connection.cursor(self, factory=sqlite3.Cursor).executemany(sql, rows)
+
+    def executescript(self, sql_script: str) -> sqlite3.Cursor:
+        for statement in sql_script.split(";"):
+            if statement.strip():
+                _guard_task_completion(statement, (), None)
+        return sqlite3.Connection.cursor(self, factory=sqlite3.Cursor).executescript(sql_script)
+
+    def cursor(self, _factory: Any = None) -> sqlite3.Cursor:
+        # A caller-supplied stock Cursor factory would reopen the bypass this
+        # connection exists to close, so the guarded factory is unconditional.
+        return super().cursor(factory=GuardedLocalCursor)
+
+
+def _connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path, factory=GuardedLocalConnection)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def init_db(db_path: Path = DB_PATH) -> None:
+    with contextlib.closing(_connect(db_path)) as conn:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                status TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS checkpoints (
+                session_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                current_task TEXT,
+                last_decision TEXT,
+                next_action TEXT,
+                open_queue TEXT,
+                risk TEXT
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        conn.commit()
+
+
+def ensure_session(session_id: str, db_path: Path = DB_PATH) -> str:
+    with contextlib.closing(_connect(db_path)) as conn:
+        row = conn.execute(
+            "SELECT session_id FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO sessions (session_id, started_at, status) VALUES (?, ?, ?)",
+                (session_id, _now(), "active"),
+            )
+            conn.commit()
+    return session_id
+
+
+def write_checkpoint(
+    session_id: str,
+    *,
+    current_task: str | None = None,
+    last_decision: str | None = None,
+    next_action: str | None = None,
+    open_queue: str | None = None,
+    risk: str | None = None,
+    db_path: Path = DB_PATH,
+) -> None:
+    with contextlib.closing(_connect(db_path)) as conn:
+        conn.execute(
+            """INSERT INTO checkpoints
+               (session_id, created_at, current_task, last_decision, next_action, open_queue, risk)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (session_id, _now(), current_task, last_decision, next_action, open_queue, risk),
+        )
+        conn.commit()
+
+
+def latest_checkpoint(session_id: str, db_path: Path = DB_PATH) -> dict | None:
+    with contextlib.closing(_connect(db_path)) as conn:
+        row = conn.execute(
+            """SELECT * FROM checkpoints WHERE session_id = ?
+               ORDER BY created_at DESC LIMIT 1""",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            row = conn.execute(
+                "SELECT * FROM checkpoints ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+    return dict(row) if row else None
+
+
+def add_task(title: str, status: str = "todo", db_path: Path = DB_PATH) -> int:
+    """Create a task. status='done' is refused here — use complete_task()."""
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        cur = conn.execute(
+            "INSERT INTO tasks (title, status, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (title, status, _now(), _now()),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def list_open_tasks(db_path: Path = DB_PATH) -> list[dict]:
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE status != 'done' ORDER BY created_at"
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def complete_task(task_id: int, db_path: Path = DB_PATH) -> dict:
+    """The one sanctioned path to tasks.status='done'; raw SQL is refused by the guard."""
+
+    authorization = _CompletionAuthorization(task_id=str(task_id))
+    now = _now()
+    with contextlib.closing(_connect(db_path)) as conn:
+        task = conn.execute("SELECT id, status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if task is None:
+            raise MCCompletionRefused(f"completion refused: task not found: {task_id}")
+        if task["status"] == "done":
+            raise MCCompletionRefused(f"completion refused: task already done: {task_id}")
+        updated = conn.execute(
+            "UPDATE tasks SET status = 'done', updated_at = ? WHERE id = ? AND status != 'done'",
+            (now, task_id),
+            _completion_authorization=authorization,
+        )
+        if updated.rowcount != 1:
+            raise MCCompletionRefused(
+                f"completion refused: guarded update changed {updated.rowcount} rows"
+            )
+        conn.commit()
+    return {"ok": True, "task_id": task_id, "status": "done"}
+
+
+if __name__ == "__main__":
+    init_db()
