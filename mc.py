@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import re
 import sqlite3
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -334,6 +335,15 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 updated_at TEXT NOT NULL
             )"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS memory_index (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_file TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                keywords TEXT NOT NULL
+            )"""
+        )
         conn.commit()
 
 
@@ -427,6 +437,164 @@ def complete_task(task_id: int, db_path: Path = DB_PATH) -> dict:
             )
         conn.commit()
     return {"ok": True, "task_id": task_id, "status": "done"}
+
+
+_STOPWORDS = {
+    "this", "that", "with", "from", "have", "has", "was", "were", "are",
+    "not", "but", "you", "your", "our", "its", "the", "and", "for", "via",
+    "into", "does", "per", "any", "all", "one", "only", "when", "than",
+    "then", "will", "can", "could", "would", "each", "such", "here",
+    "there", "what", "which", "who", "how", "why", "over", "under",
+}
+
+
+def _significant_words(text: str) -> list[str]:
+    """Lowercase words with stopwords/short words dropped — shared by indexing and search."""
+
+    words = re.findall(r"[a-zA-Z][a-zA-Z0-9_']*", text.lower())
+    return [w for w in words if len(w) > 3 and w not in _STOPWORDS]
+
+
+def _extract_keywords(text: str, *, limit: int = 20) -> str:
+    """Very small keyword picker: significant words, deduped in order, capped at limit."""
+
+    seen: list[str] = []
+    for word in _significant_words(text):
+        if word in seen:
+            continue
+        seen.append(word)
+        if len(seen) >= limit:
+            break
+    return ", ".join(seen)
+
+
+def _parse_memory_file(path: Path) -> tuple[str, str]:
+    """Return (title, body) — title from frontmatter if present, else the filename."""
+
+    text = path.read_text(encoding="utf-8")
+    match = re.match(r"^---\n(.*?)\n---\n(.*)$", text, re.S)
+    if not match:
+        return path.stem, text.strip()
+    frontmatter, body = match.group(1), match.group(2)
+    title_match = re.search(r"^title:\s*(.+)$", frontmatter, re.M)
+    title = title_match.group(1).strip() if title_match else path.stem
+    return title, body.strip()
+
+
+def index_memory_files(db_path: Path = DB_PATH) -> int:
+    """Upsert every memory/*.md file into memory_index. Re-running re-indexes, never duplicates."""
+
+    memory_dir = Path(__file__).resolve().parent / "memory"
+    count = 0
+    with contextlib.closing(_connect(db_path)) as conn:
+        for path in sorted(memory_dir.glob("*.md")):
+            title, body = _parse_memory_file(path)
+            keywords = _extract_keywords(f"{title} {body}")
+            conn.execute(
+                """INSERT INTO memory_index (source_file, title, content, keywords)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(source_file) DO UPDATE SET
+                       title = excluded.title,
+                       content = excluded.content,
+                       keywords = excluded.keywords""",
+                (path.name, title, body, keywords),
+            )
+            count += 1
+        conn.commit()
+    return count
+
+
+def search_memory(query: str, *, limit: int = 3, db_path: Path = DB_PATH) -> list[dict]:
+    """Keyword search over memory_index — never reads memory/*.md directly.
+
+    Mirrors the "recall comes from the index, not the raw docs" split: this
+    is the search layer, backed by whatever index_memory_files() last wrote.
+    Not semantic search — plain keyword-count ranking over title/keywords/content.
+    """
+
+    terms = list(dict.fromkeys(_significant_words(query)))
+    if not terms:
+        return []
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT source_file, title, content, keywords FROM memory_index"
+        ).fetchall()
+    scored: list[tuple[int, dict]] = []
+    for row in rows:
+        haystack = f"{row['title']} {row['keywords']} {row['content']}".lower()
+        score = sum(haystack.count(term) for term in terms)
+        if score > 0:
+            scored.append((score, dict(row)))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _score, item in scored[:limit]]
+
+
+def ask_ollama(prompt: str, model: str = "gemma:2b") -> str | None:
+    """Fail-soft call to a local ollama model; None (never raises) if it's unavailable.
+
+    Mirrors the MC-unreachable-never-breaks-the-session principle: if ollama isn't
+    installed, isn't running, or just times out, callers fall back to their own
+    default behavior instead of crashing.
+    """
+
+    try:
+        result = subprocess.run(
+            ["ollama", "run", model, prompt],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    output = result.stdout.strip()
+    return output or None
+
+
+def log_lesson(
+    title: str, content: str, *, confidence: str = "medium", db_path: Path = DB_PATH
+) -> Path | None:
+    """Write one lesson file to memory/ (one fact per file) — unless ask_ollama() judges it
+    a near-duplicate of the closest existing lesson found via search_memory(). Filesystem +
+    memory_index only, never any other DB table.
+
+    Returns the new file's Path, or None if it was skipped as a likely duplicate.
+    """
+
+    memory_dir = Path(__file__).resolve().parent / "memory"
+    memory_dir.mkdir(exist_ok=True)
+
+    index_memory_files(db_path)
+    candidates = search_memory(f"{title} {content}", limit=1, db_path=db_path)
+    if candidates:
+        existing = candidates[0]
+        verdict = ask_ollama(
+            f"Existing note: '{existing['title']}: {existing['content']}'\n"
+            f"New note: '{title}: {content}'\n"
+            "Are these about the same fact? Answer only yes or no."
+        )
+        if verdict and "yes" in verdict.strip().lower():
+            print(
+                f"[mc.log_lesson] muhtemelen tekrar, eklenmedi: "
+                f"{title!r} ~ {existing['source_file']}"
+            )
+            return None
+
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-") or "lesson"
+    date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    path = memory_dir / f"lesson-{date}-{slug}.md"
+    suffix = 2
+    while path.exists():
+        path = memory_dir / f"lesson-{date}-{slug}-{suffix}.md"
+        suffix += 1
+    path.write_text(
+        f"---\ntitle: {title}\ndate: {date}\nconfidence: {confidence}\n---\n\n{content.strip()}\n",
+        encoding="utf-8",
+    )
+    index_memory_files(db_path)
+    return path
 
 
 if __name__ == "__main__":

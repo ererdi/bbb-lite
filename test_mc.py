@@ -30,7 +30,7 @@ class McTestCase(unittest.TestCase):
                     "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
                 ).fetchall()
             }
-        self.assertEqual({"sessions", "checkpoints", "tasks"}, names)
+        self.assertEqual({"sessions", "checkpoints", "tasks", "memory_index"}, names)
 
     def test_ensure_session_is_idempotent(self) -> None:
         mc.ensure_session("s1", db_path=self.db_path)
