@@ -16,7 +16,7 @@ import re
 import sqlite3
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -486,6 +486,50 @@ def has_completed_task_since(session_id: str, db_path: Path = DB_PATH) -> bool:
     return row is not None
 
 
+def sweep_stale_sessions(hours: int = 24, db_path: Path = DB_PATH) -> int:
+    """Mark 'active' sessions older than `hours` as 'stale'; return how many changed."""
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    with contextlib.closing(_connect(db_path)) as conn:
+        updated = conn.execute(
+            "UPDATE sessions SET status = 'stale' WHERE status = 'active' AND started_at < ?",
+            (cutoff,),
+        )
+        conn.commit()
+        return updated.rowcount
+
+
+def check_floor(db_path: Path = DB_PATH) -> list[str]:
+    """A few deterministic checks over the DB; return findings (empty list if none).
+
+    Mirrors haroon-bbb-sync's bbb-hourly-tripwire.py floor checks, trimmed to
+    what this project's schema has: stale sessions, memory_index size, and
+    long-open tasks.
+    """
+
+    findings: list[str] = []
+    with contextlib.closing(_connect(db_path)) as conn:
+        stale_count = conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE status = 'stale'"
+        ).fetchone()[0]
+        if stale_count > 3:
+            findings.append(f"{stale_count} sessions marked stale")
+
+        memory_index_count = conn.execute("SELECT COUNT(*) FROM memory_index").fetchone()[0]
+        if memory_index_count > 500:
+            findings.append(f"memory_index has {memory_index_count} rows, consider review")
+
+        week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        old_open_count = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'todo' AND created_at < ?",
+            (week_ago,),
+        ).fetchone()[0]
+        if old_open_count > 3:
+            findings.append(f"{old_open_count} tasks open for 7+ days")
+
+    return findings
+
+
 def mark_session_completed(session_id: str, db_path: Path = DB_PATH) -> None:
     with contextlib.closing(_connect(db_path)) as conn:
         conn.execute(
@@ -729,6 +773,51 @@ def ask_ollama(prompt: str, model: str = "gemma:2b") -> str | None:
         return None
     output = result.stdout.strip()
     return output or None
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _normalize_for_match(text: str) -> str:
+    """Lowercase, strip ANSI escapes, and collapse '-'/whitespace runs to a single space.
+
+    Real ollama output can carry terminal control codes (cursor moves, line
+    clears) and phrase an option with a space where it was given with a
+    hyphen (or vice versa); this puts both sides of a match on equal footing.
+    """
+
+    text = _ANSI_ESCAPE_RE.sub("", text)
+    text = re.sub(r"[-\s]+", " ", text.strip().lower())
+    return text
+
+
+def classify(prompt: str, options: Iterable[str], *, model: str = "gemma:2b") -> str | None:
+    """Ask ask_ollama to pick one of `options` for `prompt`; fail-soft to None.
+
+    The model is asked to answer with just the chosen option. Both the answer
+    and each option are run through _normalize_for_match() before the
+    substring check, so minor extra wording, stray ANSI codes, punctuation,
+    or hyphen/space differences from the model don't break the match. Returns
+    the option in its original casing, or None if ollama is unavailable or
+    its answer doesn't match any option.
+    """
+
+    options = list(options)
+    if not options:
+        return None
+    choices = ", ".join(options)
+    full_prompt = (
+        f"{prompt}\nChoose exactly one option from: {choices}\n"
+        "Answer with only the option, nothing else."
+    )
+    answer = ask_ollama(full_prompt, model=model)
+    if answer is None:
+        return None
+    normalized = _normalize_for_match(answer)
+    for option in options:
+        if _normalize_for_match(option) in normalized:
+            return option
+    return None
 
 
 def log_lesson(

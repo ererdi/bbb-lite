@@ -6,6 +6,7 @@ import contextlib
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -215,6 +216,96 @@ class McTestCase(unittest.TestCase):
                 cur.execute(
                     "UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,)
                 )
+
+
+class StageGTestCase(unittest.TestCase):
+    """Stage G: sweep_stale_sessions / check_floor."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        self.db_path = Path(tmp.name)
+        self.db_path.unlink()
+        mc.init_db(self.db_path)
+
+    def tearDown(self) -> None:
+        self.db_path.unlink(missing_ok=True)
+
+    def _insert_session(self, session_id: str, started_at: str, status: str = "active") -> None:
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            conn.execute(
+                "INSERT INTO sessions (session_id, started_at, status) VALUES (?, ?, ?)",
+                (session_id, started_at, status),
+            )
+            conn.commit()
+
+    def _insert_task(self, title: str, created_at: str, status: str = "todo") -> None:
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            conn.execute(
+                "INSERT INTO tasks (title, status, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                (title, status, created_at, created_at),
+            )
+            conn.commit()
+
+    def _insert_memory_row(self, source_file: str) -> None:
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            conn.execute(
+                "INSERT INTO memory_index (source_file, title, content, keywords) "
+                "VALUES (?, ?, ?, ?)",
+                (source_file, "title", "content", "keyword"),
+            )
+            conn.commit()
+
+    def _iso(self, *, hours_ago: float = 0, days_ago: float = 0) -> str:
+        delta = timedelta(hours=hours_ago, days=days_ago)
+        return (datetime.now(timezone.utc) - delta).isoformat()
+
+    def test_sweep_stale_sessions_marks_old_active_sessions_stale(self) -> None:
+        self._insert_session("old", self._iso(hours_ago=48))
+        changed = mc.sweep_stale_sessions(hours=24, db_path=self.db_path)
+        self.assertEqual(1, changed)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT status FROM sessions WHERE session_id = ?", ("old",)
+            ).fetchone()
+        self.assertEqual("stale", row["status"])
+
+    def test_sweep_stale_sessions_leaves_recent_sessions_active(self) -> None:
+        self._insert_session("recent", self._iso(hours_ago=1))
+        changed = mc.sweep_stale_sessions(hours=24, db_path=self.db_path)
+        self.assertEqual(0, changed)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT status FROM sessions WHERE session_id = ?", ("recent",)
+            ).fetchone()
+        self.assertEqual("active", row["status"])
+
+    def test_sweep_stale_sessions_ignores_already_stale_or_completed(self) -> None:
+        self._insert_session("already-stale", self._iso(hours_ago=48), status="stale")
+        self._insert_session("completed", self._iso(hours_ago=48), status="completed")
+        changed = mc.sweep_stale_sessions(hours=24, db_path=self.db_path)
+        self.assertEqual(0, changed)
+
+    def test_check_floor_empty_when_nothing_flagged(self) -> None:
+        self.assertEqual([], mc.check_floor(db_path=self.db_path))
+
+    def test_check_floor_flags_many_stale_sessions(self) -> None:
+        for i in range(4):
+            self._insert_session(f"s{i}", self._iso(hours_ago=48), status="stale")
+        findings = mc.check_floor(db_path=self.db_path)
+        self.assertIn("4 sessions marked stale", findings)
+
+    def test_check_floor_flags_large_memory_index(self) -> None:
+        for i in range(501):
+            self._insert_memory_row(f"file{i}.md")
+        findings = mc.check_floor(db_path=self.db_path)
+        self.assertIn("memory_index has 501 rows, consider review", findings)
+
+    def test_check_floor_flags_old_open_tasks(self) -> None:
+        for i in range(4):
+            self._insert_task(f"task{i}", self._iso(days_ago=8))
+        findings = mc.check_floor(db_path=self.db_path)
+        self.assertIn("4 tasks open for 7+ days", findings)
 
 
 class MemoryHelperTestCase(unittest.TestCase):
@@ -533,6 +624,42 @@ class AskOllamaTestCase(unittest.TestCase):
             self.assertEqual("yes, same fact", mc.ask_ollama("hello", model="gemma:2b"))
         args, kwargs = mocked.call_args
         self.assertEqual(["ollama", "run", "gemma:2b", "hello"], args[0])
+
+
+class ClassifyTestCase(unittest.TestCase):
+    """Stage F: classify() must map an ask_ollama answer onto one of `options`."""
+
+    def test_returns_none_for_no_options(self) -> None:
+        with mock.patch("mc.ask_ollama", return_value="architect"):
+            self.assertIsNone(mc.classify("task", []))
+
+    def test_returns_none_when_ollama_unavailable(self) -> None:
+        with mock.patch("mc.ask_ollama", return_value=None):
+            self.assertIsNone(mc.classify("task", ["architect", "builder"]))
+
+    def test_returns_none_when_answer_matches_no_option(self) -> None:
+        with mock.patch("mc.ask_ollama", return_value="not sure"):
+            self.assertIsNone(mc.classify("task", ["architect", "builder"]))
+
+    def test_matches_option_case_insensitively(self) -> None:
+        with mock.patch("mc.ask_ollama", return_value="Architect") as mocked:
+            self.assertEqual("architect", mc.classify("task", ["architect", "builder"]))
+        mocked.assert_called_once()
+
+    def test_matches_option_within_extra_wording(self) -> None:
+        with mock.patch("mc.ask_ollama", return_value="I'd say builder is enough here."):
+            self.assertEqual("builder", mc.classify("task", ["architect", "builder"]))
+
+    def test_returns_original_casing_of_option(self) -> None:
+        with mock.patch("mc.ask_ollama", return_value="BUILDER"):
+            self.assertEqual("Builder", mc.classify("task", ["Architect", "Builder"]))
+
+    def test_matches_hyphenated_option_despite_dirty_model_output(self) -> None:
+        dirty = "Needs attention.\n\nThe presence of stale sessions indicate\x1b[8D\x1b[Ka problem."
+        with mock.patch("mc.ask_ollama", return_value=dirty):
+            self.assertEqual(
+                "needs-attention", mc.classify("task", ["normal", "needs-attention"])
+            )
 
 
 if __name__ == "__main__":
