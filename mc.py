@@ -615,7 +615,8 @@ def search_memory(query: str, *, limit: int = 3, db_path: Path = DB_PATH) -> lis
 
     Mirrors the "recall comes from the index, not the raw docs" split: this
     is the search layer, backed by whatever index_memory_files() last wrote.
-    Not semantic search — plain keyword-count ranking over title/keywords/content.
+    Not semantic search — weighted keyword-count ranking: a term counted in
+    title is worth 3 points, in keywords 2 points, in content 1 point.
     """
 
     terms = list(dict.fromkeys(_significant_words(query)))
@@ -627,8 +628,13 @@ def search_memory(query: str, *, limit: int = 3, db_path: Path = DB_PATH) -> lis
         ).fetchall()
     scored: list[tuple[int, dict]] = []
     for row in rows:
-        haystack = f"{row['title']} {row['keywords']} {row['content']}".lower()
-        score = sum(haystack.count(term) for term in terms)
+        title = row["title"].lower()
+        keywords = row["keywords"].lower()
+        content = row["content"].lower()
+        score = sum(
+            3 * title.count(term) + 2 * keywords.count(term) + content.count(term)
+            for term in terms
+        )
         if score > 0:
             scored.append((score, dict(row)))
     scored.sort(key=lambda pair: pair[0], reverse=True)

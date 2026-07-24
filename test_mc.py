@@ -309,6 +309,21 @@ class MemoryIndexTestCase(unittest.TestCase):
         results = mc.search_memory("checkpoint", db_path=self.db_path)
         self.assertEqual("b.md", results[0]["source_file"])
 
+    def test_search_memory_title_hit_ranks_above_content_only_hit(self) -> None:
+        self._write_note(
+            "title_and_content.md",
+            "Gizmo overview",
+            "The gizmo behaves as expected in most scenarios.",
+        )
+        self._write_note(
+            "content_only.md",
+            "Widget overview",
+            "The gizmo behaves as expected in most scenarios.",
+        )
+        mc.index_memory_files(db_path=self.db_path)
+        results = mc.search_memory("gizmo", db_path=self.db_path)
+        self.assertEqual("title_and_content.md", results[0]["source_file"])
+
     def test_search_memory_no_match_returns_empty(self) -> None:
         self._write_note("a.md", "Guard note", "The guard blocks raw done writes.")
         mc.index_memory_files(db_path=self.db_path)
