@@ -499,12 +499,43 @@ def sweep_stale_sessions(hours: int = 24, db_path: Path = DB_PATH) -> int:
         return updated.rowcount
 
 
+def check_safepoint_stale(hours: int = 2, db_path: Path = DB_PATH) -> list[str]:
+    """Flag active sessions with no session-scoped checkpoint, or none recent enough.
+
+    Queries checkpoints directly rather than through latest_checkpoint(): that
+    helper falls back to the most recent checkpoint from ANY session when the
+    given session has none of its own (a resume-UX convenience), which would
+    hide a session that never checkpointed as long as some other session did
+    recently. This guard needs the per-session truth, not that fallback.
+    """
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    findings: list[str] = []
+    with contextlib.closing(_connect(db_path)) as conn:
+        active_sessions = conn.execute(
+            "SELECT session_id FROM sessions WHERE status = 'active'"
+        ).fetchall()
+        for row in active_sessions:
+            session_id = row["session_id"]
+            checkpoint = conn.execute(
+                "SELECT created_at FROM checkpoints WHERE session_id = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            if checkpoint is None or checkpoint["created_at"] < cutoff:
+                findings.append(
+                    f"session {session_id}: no recent checkpoint (possible safepoint-stale)"
+                )
+    return findings
+
+
 def check_floor(db_path: Path = DB_PATH) -> list[str]:
     """A few deterministic checks over the DB; return findings (empty list if none).
 
     Mirrors haroon-bbb-sync's bbb-hourly-tripwire.py floor checks, trimmed to
-    what this project's schema has: stale sessions, memory_index size, and
-    long-open tasks.
+    what this project's schema has: stale sessions, memory_index size,
+    long-open tasks, and the safepoint-stale guard (see decisions.md,
+    2026-07-24, for why the other three of Haroon's four checks were left out).
     """
 
     findings: list[str] = []
@@ -527,6 +558,7 @@ def check_floor(db_path: Path = DB_PATH) -> list[str]:
         if old_open_count > 3:
             findings.append(f"{old_open_count} tasks open for 7+ days")
 
+    findings.extend(check_safepoint_stale(db_path=db_path))
     return findings
 
 

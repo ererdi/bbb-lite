@@ -256,6 +256,14 @@ class StageGTestCase(unittest.TestCase):
             )
             conn.commit()
 
+    def _insert_checkpoint(self, session_id: str, created_at: str) -> None:
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            conn.execute(
+                "INSERT INTO checkpoints (session_id, created_at) VALUES (?, ?)",
+                (session_id, created_at),
+            )
+            conn.commit()
+
     def _iso(self, *, hours_ago: float = 0, days_ago: float = 0) -> str:
         delta = timedelta(hours=hours_ago, days=days_ago)
         return (datetime.now(timezone.utc) - delta).isoformat()
@@ -306,6 +314,58 @@ class StageGTestCase(unittest.TestCase):
             self._insert_task(f"task{i}", self._iso(days_ago=8))
         findings = mc.check_floor(db_path=self.db_path)
         self.assertIn("4 tasks open for 7+ days", findings)
+
+    def test_check_safepoint_stale_flags_active_session_without_checkpoint(self) -> None:
+        self._insert_session("no-checkpoint", self._iso(hours_ago=1))
+        findings = mc.check_safepoint_stale(hours=2, db_path=self.db_path)
+        self.assertIn(
+            "session no-checkpoint: no recent checkpoint (possible safepoint-stale)",
+            findings,
+        )
+
+    def test_check_safepoint_stale_flags_active_session_with_old_checkpoint(self) -> None:
+        self._insert_session("stale-checkpoint", self._iso(hours_ago=1))
+        self._insert_checkpoint("stale-checkpoint", self._iso(hours_ago=3))
+        findings = mc.check_safepoint_stale(hours=2, db_path=self.db_path)
+        self.assertIn(
+            "session stale-checkpoint: no recent checkpoint (possible safepoint-stale)",
+            findings,
+        )
+
+    def test_check_safepoint_stale_ignores_session_with_recent_checkpoint(self) -> None:
+        self._insert_session("fresh-checkpoint", self._iso(hours_ago=1))
+        self._insert_checkpoint("fresh-checkpoint", self._iso(hours_ago=0.5))
+        findings = mc.check_safepoint_stale(hours=2, db_path=self.db_path)
+        self.assertEqual([], findings)
+
+    def test_check_safepoint_stale_ignores_non_active_sessions(self) -> None:
+        self._insert_session("stale-session", self._iso(hours_ago=1), status="stale")
+        findings = mc.check_safepoint_stale(hours=2, db_path=self.db_path)
+        self.assertEqual([], findings)
+
+    def test_check_safepoint_stale_does_not_use_another_sessions_checkpoint(self) -> None:
+        """latest_checkpoint()'s cross-session fallback must not leak in here."""
+
+        self._insert_session("has-no-checkpoint", self._iso(hours_ago=1))
+        self._insert_session("has-recent-checkpoint", self._iso(hours_ago=1))
+        self._insert_checkpoint("has-recent-checkpoint", self._iso(hours_ago=0.1))
+        findings = mc.check_safepoint_stale(hours=2, db_path=self.db_path)
+        self.assertIn(
+            "session has-no-checkpoint: no recent checkpoint (possible safepoint-stale)",
+            findings,
+        )
+        self.assertNotIn(
+            "session has-recent-checkpoint: no recent checkpoint (possible safepoint-stale)",
+            findings,
+        )
+
+    def test_check_floor_includes_safepoint_stale_findings(self) -> None:
+        self._insert_session("no-checkpoint", self._iso(hours_ago=1))
+        findings = mc.check_floor(db_path=self.db_path)
+        self.assertIn(
+            "session no-checkpoint: no recent checkpoint (possible safepoint-stale)",
+            findings,
+        )
 
 
 class MemoryHelperTestCase(unittest.TestCase):
