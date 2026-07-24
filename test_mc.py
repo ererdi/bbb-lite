@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
+
 import mc
 
 
@@ -35,6 +37,17 @@ class McTestCase(unittest.TestCase):
         self.assertEqual(
             {"sessions", "checkpoints", "tasks", "memory_index", "task_activity"}, names
         )
+
+    def test_init_db_adds_embedding_column_to_memory_index(self) -> None:
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(memory_index)").fetchall()}
+        self.assertIn("embedding", columns)
+
+    def test_init_db_rerun_is_safe_with_existing_embedding_column(self) -> None:
+        mc.init_db(self.db_path)  # must not raise on a second run
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            columns = [row[1] for row in conn.execute("PRAGMA table_info(memory_index)").fetchall()]
+        self.assertEqual(1, columns.count("embedding"))
 
     def test_ensure_session_is_idempotent(self) -> None:
         mc.ensure_session("s1", db_path=self.db_path)
@@ -388,6 +401,104 @@ class MemoryIndexTestCase(unittest.TestCase):
                 db_path=self.db_path,
             )
         self.assertIsNotNone(result)
+
+
+class SemanticSearchTestCase(unittest.TestCase):
+    """Stage E: real sentence-transformers embeddings, no mocking — proves meaning-based recall.
+
+    Same isolation approach as MemoryIndexTestCase: mc.__file__ is patched into a temp
+    project dir so memory_dir resolves under it, never the real memory/ directory.
+    """
+
+    def setUp(self) -> None:
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        self.db_path = Path(tmp.name)
+        self.db_path.unlink()
+        mc.init_db(self.db_path)
+
+        self.project_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.project_dir.cleanup)
+        self.memory_dir = Path(self.project_dir.name) / "memory"
+        self.memory_dir.mkdir()
+
+        patcher = mock.patch.object(mc, "__file__", str(Path(self.project_dir.name) / "mc.py"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        # _get_embedding_model() needs network on its very first call on a machine
+        # (to download from the Hugging Face Hub); once cached to disk it's offline.
+        # A machine/CI run with neither network nor a warm cache must skip these
+        # tests, not error them out.
+        try:
+            mc._get_embedding_model()
+        except Exception as exc:  # noqa: BLE001 - any failure here means "can't test this"
+            self.skipTest(f"embedding model unavailable (no network and no local cache?): {exc}")
+
+    def tearDown(self) -> None:
+        self.db_path.unlink(missing_ok=True)
+
+    def _write_note(self, filename: str, title: str, body: str) -> None:
+        (self.memory_dir / filename).write_text(
+            f"---\ntitle: {title}\n---\n\n{body}\n", encoding="utf-8"
+        )
+
+    def test_embed_returns_float32_bytes_of_expected_length(self) -> None:
+        vector_bytes = mc._embed("hello world")
+        vector = np.frombuffer(vector_bytes, dtype=np.float32)
+        self.assertEqual(384, vector.shape[0])  # all-MiniLM-L6-v2 output dimension
+
+    def test_index_memory_files_stores_embedding_blob(self) -> None:
+        self._write_note("a.md", "Guard note", "The guard blocks raw done writes.")
+        mc.index_memory_files(db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT embedding FROM memory_index WHERE source_file = 'a.md'"
+            ).fetchone()
+        self.assertIsNotNone(row["embedding"])
+        self.assertEqual(384, np.frombuffer(row["embedding"], dtype=np.float32).shape[0])
+
+    def test_semantic_search_finds_paraphrase_with_no_shared_words(self) -> None:
+        # No word in common with the query below (guard/blocks/unsafe/database/writes
+        # vs. system/refuses/unverified/changes/reach/data/store), only shared meaning.
+        self._write_note(
+            "guard.md", "Guard blocks writes", "the guard blocks unsafe database writes"
+        )
+        self._write_note(
+            "refusal.md",
+            "System refuses changes",
+            "the system refuses to let unverified changes reach the data store",
+        )
+        # Unrelated control note: shares no words AND no meaning with the query.
+        self._write_note(
+            "coffee.md", "Coffee brewing notes", "grind the beans finely before brewing espresso"
+        )
+        mc.index_memory_files(db_path=self.db_path)
+
+        query = "the guard blocks unsafe database writes"
+        semantic_results = mc.semantic_search(query, limit=3, db_path=self.db_path)
+        by_file = {item["source_file"]: item for item in semantic_results}
+
+        print(
+            "\n[semantic_search] query:", query,
+            "\n  guard.md similarity   =", by_file["guard.md"]["similarity"],
+            "\n  refusal.md similarity =", by_file["refusal.md"]["similarity"],
+            "\n  coffee.md similarity  =", by_file["coffee.md"]["similarity"],
+        )
+        # The paraphrase must rank as the clear runner-up to the near-identical
+        # text, and well above the topically unrelated control note.
+        self.assertEqual(
+            ["guard.md", "refusal.md", "coffee.md"],
+            [item["source_file"] for item in semantic_results],
+        )
+        self.assertGreater(by_file["refusal.md"]["similarity"], by_file["coffee.md"]["similarity"])
+
+        # Keyword search over the same data must NOT surface the paraphrase —
+        # this is the gap semantic_search closes.
+        keyword_results = mc.search_memory(query, db_path=self.db_path)
+        keyword_files = {item["source_file"] for item in keyword_results}
+        print("[search_memory] keyword hits:", keyword_files)
+        self.assertNotIn("refusal.md", keyword_files)
 
 
 class AskOllamaTestCase(unittest.TestCase):

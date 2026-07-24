@@ -20,7 +20,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+import numpy as np
+
 DB_PATH = Path(__file__).resolve().parent / "mc.db"
+_EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+_embedding_model: Any = None
 
 
 class MCAccessError(RuntimeError):
@@ -344,6 +348,12 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 keywords TEXT NOT NULL
             )"""
         )
+        existing_columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(memory_index)").fetchall()
+        }
+        if "embedding" not in existing_columns:
+            conn.execute("ALTER TABLE memory_index ADD COLUMN embedding BLOB")
         conn.execute(
             """CREATE TABLE IF NOT EXISTS task_activity (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -587,6 +597,36 @@ def _parse_memory_file(path: Path) -> tuple[str, str]:
     return title, body.strip()
 
 
+def _get_embedding_model() -> Any:
+    """Load the sentence-transformers model once and cache it for the process lifetime.
+
+    Not offline-first: the very first call on a machine downloads the model from the
+    Hugging Face Hub and raises if there's no network. Once Hugging Face's local cache
+    (~/.cache/huggingface) has the model, later calls load from disk and need no network.
+    """
+
+    global _embedding_model
+    if _embedding_model is None:
+        from sentence_transformers import SentenceTransformer
+
+        _embedding_model = SentenceTransformer(_EMBEDDING_MODEL_NAME)
+    return _embedding_model
+
+
+def _embed(text: str) -> bytes:
+    """Encode text into a vector using the cached model, returned as raw float32 bytes."""
+
+    vector = _get_embedding_model().encode(text, convert_to_numpy=True)
+    return np.asarray(vector, dtype=np.float32).tobytes()
+
+
+def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    if denom == 0:
+        return 0.0
+    return float(np.dot(a, b) / denom)
+
+
 def index_memory_files(db_path: Path = DB_PATH) -> int:
     """Upsert every memory/*.md file into memory_index. Re-running re-indexes, never duplicates."""
 
@@ -596,14 +636,16 @@ def index_memory_files(db_path: Path = DB_PATH) -> int:
         for path in sorted(memory_dir.glob("*.md")):
             title, body = _parse_memory_file(path)
             keywords = _extract_keywords(f"{title} {body}")
+            embedding = _embed(f"{title}\n{body}")
             conn.execute(
-                """INSERT INTO memory_index (source_file, title, content, keywords)
-                   VALUES (?, ?, ?, ?)
+                """INSERT INTO memory_index (source_file, title, content, keywords, embedding)
+                   VALUES (?, ?, ?, ?, ?)
                    ON CONFLICT(source_file) DO UPDATE SET
                        title = excluded.title,
                        content = excluded.content,
-                       keywords = excluded.keywords""",
-                (path.name, title, body, keywords),
+                       keywords = excluded.keywords,
+                       embedding = excluded.embedding""",
+                (path.name, title, body, keywords, embedding),
             )
             count += 1
         conn.commit()
@@ -637,6 +679,30 @@ def search_memory(query: str, *, limit: int = 3, db_path: Path = DB_PATH) -> lis
         )
         if score > 0:
             scored.append((score, dict(row)))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _score, item in scored[:limit]]
+
+
+def semantic_search(query: str, *, limit: int = 3, db_path: Path = DB_PATH) -> list[dict]:
+    """Embedding-based search over memory_index — finds meaning matches with no shared words.
+
+    Complements search_memory() (keyword ranking); this ranks by cosine similarity
+    between the query's embedding and each row's stored embedding.
+    """
+
+    query_vector = np.frombuffer(_embed(query), dtype=np.float32)
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT source_file, title, content, keywords, embedding FROM memory_index "
+            "WHERE embedding IS NOT NULL"
+        ).fetchall()
+    scored: list[tuple[float, dict]] = []
+    for row in rows:
+        row_vector = np.frombuffer(row["embedding"], dtype=np.float32)
+        similarity = _cosine_similarity(query_vector, row_vector)
+        item = {key: row[key] for key in row.keys() if key != "embedding"}
+        item["similarity"] = similarity
+        scored.append((similarity, item))
     scored.sort(key=lambda pair: pair[0], reverse=True)
     return [item for _score, item in scored[:limit]]
 
