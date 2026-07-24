@@ -344,6 +344,15 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 keywords TEXT NOT NULL
             )"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS task_activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                activity TEXT NOT NULL,
+                at TEXT NOT NULL
+            )"""
+        )
         conn.commit()
 
 
@@ -395,16 +404,32 @@ def latest_checkpoint(session_id: str, db_path: Path = DB_PATH) -> dict | None:
     return dict(row) if row else None
 
 
-def add_task(title: str, status: str = "todo", db_path: Path = DB_PATH) -> int:
-    """Create a task. status='done' is refused here — use complete_task()."""
+def add_task(
+    title: str,
+    status: str = "todo",
+    *,
+    session_id: str | None = None,
+    db_path: Path = DB_PATH,
+) -> int:
+    """Create a task. status='done' is refused here — use complete_task().
+
+    If session_id is given, records a 'created' row in task_activity so
+    tasks_touched_by_session() can later find it.
+    """
 
     with contextlib.closing(_connect(db_path)) as conn:
         cur = conn.execute(
             "INSERT INTO tasks (title, status, created_at, updated_at) VALUES (?, ?, ?, ?)",
             (title, status, _now(), _now()),
         )
+        task_id = cur.lastrowid
+        if session_id is not None:
+            conn.execute(
+                "INSERT INTO task_activity (task_id, session_id, activity, at) VALUES (?, ?, ?, ?)",
+                (task_id, session_id, "created", _now()),
+            )
         conn.commit()
-        return cur.lastrowid
+        return task_id
 
 
 def list_open_tasks(db_path: Path = DB_PATH) -> list[dict]:
@@ -415,8 +440,84 @@ def list_open_tasks(db_path: Path = DB_PATH) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def complete_task(task_id: int, db_path: Path = DB_PATH) -> dict:
-    """The one sanctioned path to tasks.status='done'; raw SQL is refused by the guard."""
+def pick_next_action(db_path: Path = DB_PATH) -> str | None:
+    """"Next: <title>" for the oldest open task, or None if there isn't one."""
+
+    open_tasks = list_open_tasks(db_path)
+    if not open_tasks:
+        return None
+    return f"Next: {open_tasks[0]['title']}"
+
+
+def session_started_at(session_id: str, db_path: Path = DB_PATH) -> str | None:
+    with contextlib.closing(_connect(db_path)) as conn:
+        row = conn.execute(
+            "SELECT started_at FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+    return row["started_at"] if row else None
+
+
+def has_completed_task_since(session_id: str, db_path: Path = DB_PATH) -> bool:
+    """True if some task reached status='done' at or after this session started.
+
+    tasks carries no session_id column, so this is a time-window proxy: any
+    completion done via complete_task() whose updated_at is on/after this
+    session's started_at counts as evidence the session actually completed one.
+    """
+
+    started_at = session_started_at(session_id, db_path)
+    if started_at is None:
+        return False
+    with contextlib.closing(_connect(db_path)) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM tasks WHERE status = 'done' AND updated_at >= ? LIMIT 1",
+            (started_at,),
+        ).fetchone()
+    return row is not None
+
+
+def mark_session_completed(session_id: str, db_path: Path = DB_PATH) -> None:
+    with contextlib.closing(_connect(db_path)) as conn:
+        conn.execute(
+            "UPDATE sessions SET status = 'completed' WHERE session_id = ?",
+            (session_id,),
+        )
+        conn.commit()
+
+
+def tasks_touched_by_session(session_id: str, db_path: Path = DB_PATH) -> list[dict]:
+    """Distinct tasks this session touched (via add_task/complete_task's session_id).
+
+    Each row also carries completed_by_session: whether this same session is the
+    one that recorded the 'completed' activity for that task — the precise,
+    per-task replacement for the old has_completed_task_since() time-window proxy.
+    """
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            """SELECT t.id AS task_id, t.title AS title, t.status AS status,
+                      MAX(CASE WHEN a.activity = 'completed' THEN 1 ELSE 0 END)
+                          AS completed_by_session
+               FROM task_activity a
+               JOIN tasks t ON t.id = a.task_id
+               WHERE a.session_id = ?
+               GROUP BY t.id, t.title, t.status
+               ORDER BY t.id""",
+            (session_id,),
+        ).fetchall()
+    return [
+        {**dict(row), "completed_by_session": bool(row["completed_by_session"])}
+        for row in rows
+    ]
+
+
+def complete_task(
+    task_id: int, *, session_id: str | None = None, db_path: Path = DB_PATH
+) -> dict:
+    """The one sanctioned path to tasks.status='done'; raw SQL is refused by the guard.
+
+    If session_id is given, records a 'completed' row in task_activity.
+    """
 
     authorization = _CompletionAuthorization(task_id=str(task_id))
     now = _now()
@@ -434,6 +535,11 @@ def complete_task(task_id: int, db_path: Path = DB_PATH) -> dict:
         if updated.rowcount != 1:
             raise MCCompletionRefused(
                 f"completion refused: guarded update changed {updated.rowcount} rows"
+            )
+        if session_id is not None:
+            conn.execute(
+                "INSERT INTO task_activity (task_id, session_id, activity, at) VALUES (?, ?, ?, ?)",
+                (task_id, session_id, "completed", now),
             )
         conn.commit()
     return {"ok": True, "task_id": task_id, "status": "done"}

@@ -1,0 +1,35 @@
+"""PreCompact hook: write a safety checkpoint right before compaction. Silent."""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import mc
+
+
+def main() -> None:
+    payload = json.load(sys.stdin)
+    session_id = payload.get("session_id", "unknown")
+
+    mc.init_db()
+    checkpoint = mc.latest_checkpoint(session_id)
+    if checkpoint is None:
+        mc.write_checkpoint(session_id, current_task="pre-compact safepoint")
+        return
+
+    mc.write_checkpoint(
+        session_id,
+        current_task=checkpoint["current_task"],
+        last_decision=checkpoint["last_decision"],
+        next_action=checkpoint["next_action"],
+        open_queue=checkpoint["open_queue"],
+        risk=checkpoint["risk"],
+    )
+
+
+if __name__ == "__main__":
+    main()
