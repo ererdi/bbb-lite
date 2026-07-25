@@ -55,3 +55,7 @@
   senkronizasyonuna bakıyor (bizde tek makine var, senkronize edilecek ikinci taraf yok).
   4. kontrol (safepoint-stale guard) ise anlamlıydı ve check_safepoint_stale() olarak
   eklendi.
+
+- **2026-07-24 — Curator-only guard, Haroon'un rol sistemine (curator role_for_uuid ile)
+  değil, basit bir BBB_CURATOR ortam değişkenine dayanıyor** - rol sistemi kurmadığımız
+  için (bilerek, kapsam dışı) en yakın karşılık bu.
