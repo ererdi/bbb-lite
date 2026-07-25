@@ -450,6 +450,28 @@ def list_open_tasks(db_path: Path = DB_PATH) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def list_tasks(db_path: Path = DB_PATH) -> list[dict]:
+    """All tasks regardless of status — open and done alike."""
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute("SELECT * FROM tasks ORDER BY created_at").fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_sessions(db_path: Path = DB_PATH) -> list[dict]:
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute("SELECT * FROM sessions ORDER BY started_at").fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_task_activity(db_path: Path = DB_PATH) -> list[dict]:
+    """Every session-task touch — the raw edges behind tasks_touched_by_session()."""
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute("SELECT * FROM task_activity ORDER BY at").fetchall()
+    return [dict(row) for row in rows]
+
+
 def pick_next_action(db_path: Path = DB_PATH) -> str | None:
     """"Next: <title>" for the oldest open task, or None if there isn't one."""
 

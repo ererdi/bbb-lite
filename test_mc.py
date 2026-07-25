@@ -94,6 +94,26 @@ class McTestCase(unittest.TestCase):
         with self.assertRaises(mc.MCCompletionRefused):
             mc.complete_task(task_id, db_path=self.db_path)
 
+    def test_list_tasks_includes_open_and_done(self) -> None:
+        open_id = mc.add_task("write tests", db_path=self.db_path)
+        done_id = mc.add_task("ship it", db_path=self.db_path)
+        mc.complete_task(done_id, db_path=self.db_path)
+        by_id = {task["id"]: task["status"] for task in mc.list_tasks(db_path=self.db_path)}
+        self.assertEqual({open_id: "todo", done_id: "done"}, by_id)
+
+    def test_list_sessions_returns_all_sessions(self) -> None:
+        mc.ensure_session("s1", db_path=self.db_path)
+        mc.ensure_session("s2", db_path=self.db_path)
+        ids = {session["session_id"] for session in mc.list_sessions(db_path=self.db_path)}
+        self.assertEqual({"s1", "s2"}, ids)
+
+    def test_list_task_activity_returns_all_rows(self) -> None:
+        mc.ensure_session("s1", db_path=self.db_path)
+        task_id = mc.add_task("write tests", session_id="s1", db_path=self.db_path)
+        mc.complete_task(task_id, session_id="s1", db_path=self.db_path)
+        activities = [row["activity"] for row in mc.list_task_activity(db_path=self.db_path)]
+        self.assertEqual(["created", "completed"], activities)
+
     def test_add_task_with_done_status_refused(self) -> None:
         with self.assertRaises(mc.MCCompletionRefused):
             mc.add_task("sneaky", status="done", db_path=self.db_path)
