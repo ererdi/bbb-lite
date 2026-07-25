@@ -1,3 +1,4 @@
 mc.db
 __pycache__/
 .claude/settings.local.json
+hooks/pretooluse.log

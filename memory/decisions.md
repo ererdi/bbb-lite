@@ -59,3 +59,7 @@
 - **2026-07-24 — Curator-only guard, Haroon'un rol sistemine (curator role_for_uuid ile)
   değil, basit bir BBB_CURATOR ortam değişkenine dayanıyor** - rol sistemi kurmadığımız
   için (bilerek, kapsam dışı) en yakın karşılık bu.
+
+- **2026-07-24 — Genel PreToolUse guard, Haroon'un role-guard.py'sindeki rol-bazlı izin
+  kontrolü değil (rol sistemi yok), sabit bir kuralı (mc.db'ye Write/Edit aracıyla asla
+  dokunulmaz) zorlayan + her kod değişikliğini loglayan bir versiyon.**
