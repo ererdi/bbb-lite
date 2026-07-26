@@ -113,3 +113,8 @@
   node/edge ilişkileri) Haroon'da elle onaylanan bir süreç - bizim Canvas'ımız
   (Stage H) sessions/tasks/task_activity'yi otomatik gösteriyor, bu haliyle
   amacına uygun ama Haroon'unki kadar zengin bir ilişki modeli yok.**
+
+- **2026-07-24 - Demo Console eklendi (bin/demo_server.py, port 8090), Canvas'tan
+  (port 8080+5173) ayrı tutuldu - Codex'in önerisi: Canvas ilişki-görselleştirme,
+  Demo Console durum/kanıt gösterimi, farklı amaçlar. HOSNI yerine yerel SQLite
+  okuyan aynı 'local eşdeğer' mantığı.**

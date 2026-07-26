@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BBB-Lite Demo Console</title>
+<style>
+  :root {
+    --bg: #0b1220;
+    --panel: #121c30;
+    --panel-border: #24314d;
+    --text: #e7ebf3;
+    --text-dim: #8f9bb8;
+    --accent: #5b8cff;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --bad: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: ui-monospace, Consolas, 'Segoe UI', monospace;
+    background: var(--bg);
+    color: var(--text);
+    padding: 24px;
+  }
+  header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+  h1 {
+    font-size: 22px;
+    margin: 0;
+    color: var(--text);
+    font-weight: 600;
+  }
+  h1 span { color: var(--accent); }
+  #refresh-btn {
+    background: var(--accent);
+    color: #06101f;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 16px;
+    font-family: inherit;
+    font-weight: 600;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  #refresh-btn:hover { opacity: 0.85; }
+  #status-line {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-bottom: 20px;
+  }
+  #flow {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 8px;
+    padding: 14px 18px;
+    margin-bottom: 20px;
+  }
+  #flow h2 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-dim);
+    margin: 0 0 10px;
+  }
+  #flow ol {
+    margin: 0;
+    padding-left: 20px;
+    font-size: 13px;
+    line-height: 1.7;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 16px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 8px;
+    padding: 16px 18px;
+  }
+  .card h2 {
+    font-size: 14px;
+    margin: 0 0 12px;
+    color: var(--accent);
+    border-bottom: 1px solid var(--panel-border);
+    padding-bottom: 8px;
+  }
+  .row {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    font-size: 13px;
+    padding: 3px 0;
+  }
+  .row .k { color: var(--text-dim); }
+  .row .v { text-align: right; word-break: break-word; }
+  .note {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-top: 10px;
+    line-height: 1.5;
+  }
+  .pill {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .pill.ok { background: rgba(74, 222, 128, 0.15); color: var(--ok); }
+  .pill.bad { background: rgba(248, 113, 113, 0.15); color: var(--bad); }
+  .pill.warn { background: rgba(251, 191, 36, 0.15); color: var(--warn); }
+  ul.findings {
+    margin: 0;
+    padding-left: 18px;
+    font-size: 12px;
+  }
+  ul.findings li { margin-bottom: 4px; color: var(--warn); }
+  table.roles {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  table.roles th, table.roles td {
+    text-align: left;
+    padding: 4px 6px;
+    border-bottom: 1px solid var(--panel-border);
+  }
+  table.roles th { color: var(--text-dim); font-weight: 500; }
+  a.canvas-link {
+    display: inline-block;
+    color: var(--accent);
+    font-size: 14px;
+    text-decoration: none;
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    padding: 8px 14px;
+  }
+  a.canvas-link:hover { background: rgba(91, 140, 255, 0.1); }
+  .error-text { color: var(--bad); font-size: 12px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>BBB-Lite <span>Demo Console</span></h1>
+  <button id="refresh-btn">Refresh</button>
+</header>
+<div id="status-line">yükleniyor...</div>
+
+<div id="flow">
+  <h2>Demo Flow</h2>
+  <ol>
+    <li>Varsayılan rol Brozzer (kod yazma izni yok)</li>
+    <li>Rol'ü builder yap (rol izin matrisi değişir)</li>
+    <li>Bir görev oluştur</li>
+    <li>complete_task() ile görevi bitir (guard-enforced, ham SQL ile mümkün değil)</li>
+    <li>Canvas'ta (localhost:5173) session-task bağlantısını gör</li>
+    <li>Memory'de anahtar kelime araması (search_memory)</li>
+    <li>Memory'de anlam bazlı arama (semantic_search)</li>
+    <li>Günlük sağlık kontrolü (check_floor)</li>
+    <li>Test kanıtı (unittest discover sonucu)</li>
+  </ol>
+</div>
+
+<div class="grid" id="grid"></div>
+
+<script>
+const API_URL = '/api/demo-data';
+
+function el(tag, className, text) {
+  const e = document.createElement(tag);
+  if (className) e.className = className;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function row(key, value) {
+  const r = el('div', 'row');
+  r.appendChild(el('span', 'k', key));
+  r.appendChild(el('span', 'v', value === null || value === undefined ? '-' : String(value)));
+  return r;
+}
+
+function errorCard(title, err) {
+  const card = el('div', 'card');
+  card.appendChild(el('h2', null, title));
+  card.appendChild(el('div', 'error-text', 'hata: ' + err));
+  return card;
+}
+
+function missionControlCard(d) {
+  const card = el('div', 'card');
+  card.appendChild(el('h2', null, 'Mission Control'));
+  if (!d) { card.appendChild(el('div', 'error-text', 'veri yok')); return card; }
+  card.appendChild(row('Projeler', d.project_count));
+  card.appendChild(row('Sprintler', d.sprint_count));
+  card.appendChild(row('Açık görevler', d.task_count_open));
+  card.appendChild(row('Biten görevler', d.task_count_done));
+  card.appendChild(el('div', 'note', d.guard_note));
+  return card;
+}
+
+function lifecycleCard(d) {
+  const card = el('div', 'card');
+  card.appendChild(el('h2', null, 'Lifecycle'));
+  if (!d || !d.session_id) { card.appendChild(el('div', 'note', 'aktif session yok')); return card; }
+  card.appendChild(row('Session', d.session_id));
+  const cp = d.checkpoint;
+  if (cp) {
+    card.appendChild(row('Son görev', cp.current_task));
+    card.appendChild(row('Son karar', cp.last_decision));
+    card.appendChild(row('Sıradaki adım', cp.next_action));
+    card.appendChild(row('Risk', cp.risk));
+  } else {
+    card.appendChild(row('Checkpoint', 'yok'));
+  }
+  const score = d.score;
+  if (score) {
+    card.appendChild(row('Skor', score.score));
+    card.appendChild(row('Tamamlanan/Dokunulan', score.tasks_completed + ' / ' + score.tasks_touched));
+    card.appendChild(row('Checkpoint sayısı', score.checkpoints_written));
+  }
+  return card;
+}
+
+function rolesCard(d) {
+  const card = el('div', 'card');
+  card.appendChild(el('h2', null, 'Roles'));
+  if (!d) { card.appendChild(el('div', 'error-text', 'veri yok')); return card; }
+  card.appendChild(row('Son session rolü', d.latest_session_role));
+  const table = el('table', 'roles');
+  const thead = el('tr');
+  ['rol', 'code', 'data'].forEach(h => thead.appendChild(el('th', null, h)));
+  table.appendChild(thead);
+  const perms = d.role_permissions || {};
+  Object.keys(perms).forEach(role => {
+    const tr = el('tr');
+    tr.appendChild(el('td', null, role));
+    tr.appendChild(el('td', null, perms[role].code ? 'evet' : 'hayir'));
+    tr.appendChild(el('td', null, perms[role].data ? 'evet' : 'hayir'));
+    table.appendChild(tr);
+  });
+  card.appendChild(table);
+  return card;
+}
+
+function memoryCard(d) {
+  const card = el('div', 'card');
+  card.appendChild(el('h2', null, 'Memory'));
+  if (!d) { card.appendChild(el('div', 'error-text', 'veri yok')); return card; }
+  card.appendChild(row('.md dosya sayısı', d.file_count));
+  const ex = d.search_example;
+  if (ex) {
+    card.appendChild(el('div', 'note', '"' + ex.query + '" sorgusu:'));
+    card.appendChild(row('  keyword ilk sonuç', ex.keyword_result ? ex.keyword_result.title : '-'));
+    card.appendChild(row('  semantic ilk sonuç', ex.semantic_result ? ex.semantic_result.title : '-'));
+    if (ex.semantic_result && ex.semantic_result.similarity !== undefined) {
+      card.appendChild(row('  semantic benzerlik', ex.semantic_result.similarity.toFixed(3)));
+    }
+  }
+  return card;
+}
+
+function dailyHealthCard(d) {
+  const card = el('div', 'card');
+  card.appendChild(el('h2', null, 'Daily Health'));
+  if (!d) { card.appendChild(el('div', 'error-text', 'veri yok')); return card; }
+  const findings = d.findings || [];
+  if (findings.length === 0) {
+    card.appendChild(el('span', 'pill ok', 'temiz'));
+  } else {
+    card.appendChild(el('span', 'pill warn', findings.length + ' bulgu'));
+    const list = el('ul', 'findings');
+    findings.forEach(f => list.appendChild(el('li', null, f)));
+    card.appendChild(list);
+  }
+  return card;
+}
+
+function canvasLinkCard(link) {
+  const card = el('div', 'card');
+  card.appendChild(el('h2', null, 'Canvas'));
+  const a = el('a', 'canvas-link', link || 'http://localhost:5173');
+  a.href = link || 'http://localhost:5173';
+  a.target = '_blank';
+  card.appendChild(a);
+  card.appendChild(el('div', 'note', 'Canvas ayrı bir süreç olarak zaten çalışıyor olmalı (vite dev server).'));
+  return card;
+}
+
+function evidenceCard(d) {
+  const card = el('div', 'card');
+  card.appendChild(el('h2', null, 'Evidence'));
+  if (!d || d.tests === 'unavailable') {
+    card.appendChild(el('span', 'pill warn', 'tests unavailable'));
+    return card;
+  }
+  const pillClass = d.ok ? 'ok' : 'bad';
+  card.appendChild(el('span', 'pill ' + pillClass, d.passed + ' / ' + d.total + ' passed'));
+  return card;
+}
+
+function render(data) {
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+  const sections = [
+    ['mission_control', missionControlCard],
+    ['lifecycle', lifecycleCard],
+    ['roles', rolesCard],
+    ['memory', memoryCard],
+    ['daily_health', dailyHealthCard],
+    ['canvas_link', canvasLinkCard],
+    ['evidence', evidenceCard],
+  ];
+  sections.forEach(([key, builder]) => {
+    const value = data[key];
+    if (value && typeof value === 'object' && 'error' in value && Object.keys(value).length === 1) {
+      grid.appendChild(errorCard(key, value.error));
+    } else {
+      grid.appendChild(builder(value));
+    }
+  });
+}
+
+async function refresh() {
+  const status = document.getElementById('status-line');
+  status.textContent = 'yükleniyor...';
+  try {
+    const res = await fetch(API_URL);
+    if (!res.ok) throw new Error('API returned ' + res.status);
+    const data = await res.json();
+    render(data);
+    status.textContent = 'son güncelleme: ' + new Date().toLocaleTimeString();
+  } catch (err) {
+    status.textContent = 'yükleme hatası: ' + err.message;
+  }
+}
+
+document.getElementById('refresh-btn').addEventListener('click', refresh);
+refresh();
+</script>
+
+</body>
+</html>
