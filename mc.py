@@ -340,6 +340,28 @@ def init_db(db_path: Path = DB_PATH) -> None:
             )"""
         )
         conn.execute(
+            """CREATE TABLE IF NOT EXISTS projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS sprints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL
+            )"""
+        )
+        existing_task_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        if "sprint_id" not in existing_task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN sprint_id INTEGER")
+        conn.execute(
             """CREATE TABLE IF NOT EXISTS memory_index (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_file TEXT NOT NULL UNIQUE,
@@ -418,19 +440,23 @@ def add_task(
     title: str,
     status: str = "todo",
     *,
+    sprint_id: int | None = None,
     session_id: str | None = None,
     db_path: Path = DB_PATH,
 ) -> int:
     """Create a task. status='done' is refused here — use complete_task().
 
+    sprint_id is optional and defaults to None (backward compatible with
+    tasks created before Stage L's projects/sprints hierarchy existed).
     If session_id is given, records a 'created' row in task_activity so
     tasks_touched_by_session() can later find it.
     """
 
     with contextlib.closing(_connect(db_path)) as conn:
         cur = conn.execute(
-            "INSERT INTO tasks (title, status, created_at, updated_at) VALUES (?, ?, ?, ?)",
-            (title, status, _now(), _now()),
+            "INSERT INTO tasks (title, status, created_at, updated_at, sprint_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (title, status, _now(), _now(), sprint_id),
         )
         task_id = cur.lastrowid
         if session_id is not None:
@@ -455,6 +481,48 @@ def list_tasks(db_path: Path = DB_PATH) -> list[dict]:
 
     with contextlib.closing(_connect(db_path)) as conn:
         rows = conn.execute("SELECT * FROM tasks ORDER BY created_at").fetchall()
+    return [dict(row) for row in rows]
+
+
+def add_project(name: str, status: str = "active", db_path: Path = DB_PATH) -> int:
+    with contextlib.closing(_connect(db_path)) as conn:
+        cur = conn.execute(
+            "INSERT INTO projects (name, status, created_at) VALUES (?, ?, ?)",
+            (name, status, _now()),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def list_projects(db_path: Path = DB_PATH) -> list[dict]:
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute("SELECT * FROM projects ORDER BY created_at").fetchall()
+    return [dict(row) for row in rows]
+
+
+def add_sprint(
+    project_id: int, name: str, status: str = "active", db_path: Path = DB_PATH
+) -> int:
+    with contextlib.closing(_connect(db_path)) as conn:
+        cur = conn.execute(
+            "INSERT INTO sprints (project_id, name, status, created_at) VALUES (?, ?, ?, ?)",
+            (project_id, name, status, _now()),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def list_sprints(project_id: int | None = None, db_path: Path = DB_PATH) -> list[dict]:
+    """All sprints, or only project_id's if given."""
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        if project_id is None:
+            rows = conn.execute("SELECT * FROM sprints ORDER BY created_at").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM sprints WHERE project_id = ? ORDER BY created_at",
+                (project_id,),
+            ).fetchall()
     return [dict(row) for row in rows]
 
 

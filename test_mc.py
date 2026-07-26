@@ -36,7 +36,11 @@ class McTestCase(unittest.TestCase):
                 ).fetchall()
             }
         self.assertEqual(
-            {"sessions", "checkpoints", "tasks", "memory_index", "task_activity"}, names
+            {
+                "sessions", "checkpoints", "tasks", "memory_index", "task_activity",
+                "projects", "sprints",
+            },
+            names,
         )
 
     def test_init_db_adds_embedding_column_to_memory_index(self) -> None:
@@ -49,6 +53,17 @@ class McTestCase(unittest.TestCase):
         with contextlib.closing(mc._connect(self.db_path)) as conn:
             columns = [row[1] for row in conn.execute("PRAGMA table_info(memory_index)").fetchall()]
         self.assertEqual(1, columns.count("embedding"))
+
+    def test_init_db_adds_sprint_id_column_to_tasks(self) -> None:
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        self.assertIn("sprint_id", columns)
+
+    def test_init_db_rerun_is_safe_with_existing_sprint_id_column(self) -> None:
+        mc.init_db(self.db_path)  # must not raise on a second run
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            columns = [row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()]
+        self.assertEqual(1, columns.count("sprint_id"))
 
     def test_ensure_session_is_idempotent(self) -> None:
         mc.ensure_session("s1", db_path=self.db_path)
@@ -100,6 +115,45 @@ class McTestCase(unittest.TestCase):
         mc.complete_task(done_id, db_path=self.db_path)
         by_id = {task["id"]: task["status"] for task in mc.list_tasks(db_path=self.db_path)}
         self.assertEqual({open_id: "todo", done_id: "done"}, by_id)
+
+    def test_add_and_list_projects(self) -> None:
+        mc.add_project("bbb-lite", db_path=self.db_path)
+        mc.add_project("side project", status="paused", db_path=self.db_path)
+        projects = mc.list_projects(db_path=self.db_path)
+        by_name = {project["name"]: project["status"] for project in projects}
+        self.assertEqual({"bbb-lite": "active", "side project": "paused"}, by_name)
+
+    def test_add_and_list_sprints_for_project(self) -> None:
+        project_id = mc.add_project("bbb-lite", db_path=self.db_path)
+        other_project_id = mc.add_project("other", db_path=self.db_path)
+        mc.add_sprint(project_id, "sprint 1", db_path=self.db_path)
+        mc.add_sprint(other_project_id, "other sprint", db_path=self.db_path)
+        names = {sprint["name"] for sprint in mc.list_sprints(project_id, db_path=self.db_path)}
+        self.assertEqual({"sprint 1"}, names)
+
+    def test_list_sprints_without_project_id_returns_all(self) -> None:
+        project_id = mc.add_project("bbb-lite", db_path=self.db_path)
+        other_project_id = mc.add_project("other", db_path=self.db_path)
+        mc.add_sprint(project_id, "sprint 1", db_path=self.db_path)
+        mc.add_sprint(other_project_id, "other sprint", db_path=self.db_path)
+        names = {sprint["name"] for sprint in mc.list_sprints(db_path=self.db_path)}
+        self.assertEqual({"sprint 1", "other sprint"}, names)
+
+    def test_add_task_links_to_sprint(self) -> None:
+        project_id = mc.add_project("bbb-lite", db_path=self.db_path)
+        sprint_id = mc.add_sprint(project_id, "sprint 1", db_path=self.db_path)
+        task_id = mc.add_task("write tests", sprint_id=sprint_id, db_path=self.db_path)
+        task = next(
+            task for task in mc.list_tasks(db_path=self.db_path) if task["id"] == task_id
+        )
+        self.assertEqual(sprint_id, task["sprint_id"])
+
+    def test_add_task_without_sprint_id_defaults_to_none(self) -> None:
+        task_id = mc.add_task("write tests", db_path=self.db_path)
+        task = next(
+            task for task in mc.list_tasks(db_path=self.db_path) if task["id"] == task_id
+        )
+        self.assertIsNone(task["sprint_id"])
 
     def test_list_sessions_returns_all_sessions(self) -> None:
         mc.ensure_session("s1", db_path=self.db_path)
