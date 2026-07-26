@@ -125,3 +125,10 @@
   (`claude -p`) kullanır, yoksa Ollama'ya fail-soft düşer. Her cevap önce rol,
   checkpoint, açık görevler, keyword memory ve semantic memory context'i toplar;
   cevap sonrası lifecycle checkpoint yazar.**
+
+- **2026-07-24 - Voice bilinçli olarak bu stage dışında bırakıldı; Brozzer parity
+  planı eklendi (docs/brozzer-parity-plan.md). Gerekçe: voice ayrı bir ürün
+  yüzeyi; STT/TTS, mic izinleri, latency, barge-in, port izolasyonu ve ayrı
+  red/green harness ister. Bu stage text assistant brain'i kanıtlıyor. Brozzer
+  şu an partial-local-brozzer: MC/memory/lifecycle var; HOSNI durable dispatch,
+  voice mouth, shared active-turns log, Rider veto ve production bridge yok.**

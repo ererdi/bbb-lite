@@ -122,6 +122,7 @@ class PromptTestCase(unittest.TestCase):
             },
         )
         self.assertIn("You cannot access HOSNI, voice", prompt)
+        self.assertIn("You are a partial local Brozzer", prompt)
         self.assertIn("User message:", prompt)
 
 
@@ -135,6 +136,8 @@ class BuildStateTestCase(unittest.TestCase):
             mock.patch("assistant_server.shutil.which", return_value=r"C:\bin\claude.CMD"):
             state = assistant_server.build_state("web")
         self.assertTrue(state["claude_cli_available"])
+        self.assertFalse(state["voice"]["enabled"])
+        self.assertEqual("partial-local-brozzer", state["brozzer_parity"]["status"])
 
 
 class HandlerTestCase(unittest.TestCase):

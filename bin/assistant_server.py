@@ -27,6 +27,34 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CONSOLE_HTML_PATH = Path(__file__).resolve().parent / "assistant_console.html"
 DEFAULT_SESSION_ID = "web-assistant"
 CLAUDE_TIMEOUT_SECONDS = 120
+VOICE_OMISSION_REASON = (
+    "Voice is deliberately out of scope for this stage: it needs STT/TTS, mic "
+    "permissions, latency handling, port isolation, and a separate red/green "
+    "voice harness. This stage proves the local assistant brain first."
+)
+BROZZER_PARITY = {
+    "status": "partial-local-brozzer",
+    "same": [
+        "default brozzer role",
+        "Mission Control context",
+        "keyword and semantic memory recall",
+        "lifecycle checkpoint after replies",
+        "honest local capability boundaries",
+    ],
+    "missing": [
+        "HOSNI durable dispatch",
+        "voice mouth and room-state loop",
+        "Rider decision veto window",
+        "shared active-turns log across chat and voice",
+        "production bridge, Telegram, CRM, and full org pipeline",
+    ],
+    "next": [
+        "make Brozzer refuse unsupported powers more explicitly",
+        "add decision-capture packets for chat messages",
+        "add a local dispatch ledger before any remote/HOSNI bridge",
+        "add voice only after text assistant behavior is stable",
+    ],
+}
 
 _ROLE_EN_RE = re.compile(r"\byou are (?:the )?(brozzer|advisor|architect|builder)\b", re.I)
 _ROLE_TR_RE = re.compile(r"\b(brozzer|advisor|architect|builder|mimarsın|buildersın|builder'sın)\b", re.I)
@@ -163,6 +191,13 @@ Response law:
   calendar, email, CRM, production bridge, or the public internet from this UI.
 - Do not mention implementation details unless they explain a limitation.
 - Never output terminal control characters or raw model artifacts.
+- Voice is intentionally out of scope in this stage. If asked, explain that the
+  text assistant brain is being proven before STT/TTS, mic, latency, and voice
+  harness work.
+- You are a partial local Brozzer, not Haroon's full Brozzer. The missing parts
+  are HOSNI durable dispatch, voice mouth, shared chat/voice active-turns log,
+  Rider decision veto, production bridge, Telegram, CRM, and the full org
+  pipeline. Be proud of the local core, but honest about the boundary.
 
 Session: {context['session_id']}
 Role: {context['role']}
@@ -303,6 +338,8 @@ def build_state(session_id: str = DEFAULT_SESSION_ID, *, db_path: Path = mc.DB_P
         "done_tasks": sum(1 for task in tasks if task.get("status") == "done"),
         "checkpoint": _safe_call(None, mc.latest_checkpoint, session_id, db_path=db_path),
         "claude_cli_available": shutil.which("claude") is not None,
+        "voice": {"enabled": False, "reason": VOICE_OMISSION_REASON},
+        "brozzer_parity": BROZZER_PARITY,
     }
 
 

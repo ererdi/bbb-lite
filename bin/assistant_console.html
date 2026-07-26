@@ -209,6 +209,10 @@
       <div id="state" class="kv"></div>
     </div>
     <div class="panel">
+      <h2>Brozzer Parity</h2>
+      <div id="parity" class="empty">Loading...</div>
+    </div>
+    <div class="panel">
       <h2>Last Context</h2>
       <div id="context" class="empty">Henüz mesaj yok.</div>
     </div>
@@ -227,6 +231,7 @@ const messages = document.querySelector('#messages');
 const form = document.querySelector('#form');
 const input = document.querySelector('#input');
 const stateBox = document.querySelector('#state');
+const parityBox = document.querySelector('#parity');
 const contextBox = document.querySelector('#context');
 const refreshButton = document.querySelector('#refresh');
 
@@ -263,6 +268,35 @@ function renderState(data) {
     else cell.textContent = value;
     stateBox.appendChild(cell);
   }
+  renderParity(data);
+}
+
+function smallList(title, items) {
+  const box = el('div', 'item');
+  box.appendChild(el('strong', '', title));
+  if (!items || !items.length) {
+    box.appendChild(el('div', '', 'none'));
+    return box;
+  }
+  for (const item of items.slice(0, 5)) box.appendChild(el('div', '', item));
+  return box;
+}
+
+function renderParity(data) {
+  parityBox.innerHTML = '';
+  parityBox.className = '';
+  const status = data.brozzer_parity?.status || 'partial-local-brozzer';
+  const voice = data.voice?.enabled ? 'enabled' : 'not in this stage';
+  const head = el('div', 'item');
+  head.appendChild(el('strong', '', status));
+  head.appendChild(el('div', '', `voice: ${voice}`));
+  parityBox.appendChild(head);
+  parityBox.appendChild(smallList('Same core', data.brozzer_parity?.same));
+  parityBox.appendChild(smallList('Missing', data.brozzer_parity?.missing));
+  const voiceReason = el('div', 'item');
+  voiceReason.appendChild(el('strong', '', 'Voice decision'));
+  voiceReason.appendChild(el('div', '', data.voice?.reason || 'not documented'));
+  parityBox.appendChild(voiceReason);
 }
 
 function memoryList(title, items) {
