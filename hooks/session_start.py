@@ -18,6 +18,13 @@ def main() -> None:
 
     mc.init_db()
     mc.ensure_session(session_id)
+    mc.record_lifecycle_run(
+        "session_start",
+        session_id=session_id,
+        source=source,
+        status="ok",
+        details={"source": source},
+    )
 
     role = mc.get_role(session_id)
     print(

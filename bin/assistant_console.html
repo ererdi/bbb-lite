@@ -303,7 +303,12 @@ function renderTrace(data) {
   counts.appendChild(el(
     'div',
     '',
-    `graph nodes ${graph.nodes ?? 0} / graph edges ${graph.edges ?? 0}`
+    `graph nodes ${graph.nodes ?? 0} / graph edges ${graph.edges ?? 0} / curated ${graph.curated_edges ?? 0}`
+  ));
+  counts.appendChild(el(
+    'div',
+    '',
+    `quality ${trace.answer_quality_scores?.length || 0} / receipts ${trace.answer_receipts?.length || 0} / lifecycle ${trace.lifecycle_runs?.length || 0}`
   ));
   traceBox.appendChild(counts);
   traceBox.appendChild(compactRows(
@@ -320,6 +325,21 @@ function renderTrace(data) {
     'Events',
     trace.events,
     row => `${row.event_type || '-'} from ${row.source || '-'}`
+  ));
+  traceBox.appendChild(compactRows(
+    'Quality scores',
+    trace.answer_quality_scores,
+    row => `${row.status || '-'} ${row.total_score ?? '-'} / grounded ${row.groundedness ?? '-'} / action ${row.actionability ?? '-'}`
+  ));
+  traceBox.appendChild(compactRows(
+    'Answer receipts',
+    trace.answer_receipts,
+    row => `${row.engine || '-'} / ${row.role || '-'} / evidence ${row.evidence_id || '-'}`
+  ));
+  traceBox.appendChild(compactRows(
+    'Lifecycle runs',
+    trace.lifecycle_runs,
+    row => `${row.hook_name || '-'} / ${row.source || '-'} / ${row.status || '-'}`
   ));
   traceBox.appendChild(compactRows(
     'Boundaries',

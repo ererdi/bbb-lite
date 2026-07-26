@@ -87,6 +87,13 @@ def main() -> None:
 
     mc.mark_session_completed(session_id)
     open_tasks = mc.list_open_tasks()
+    mc.record_lifecycle_run(
+        "session_wrap",
+        session_id=session_id,
+        source="session_end",
+        status="ok",
+        details={"open_tasks": len(open_tasks), "next_action": next_action},
+    )
     print(f"[bbb-lite] session {session_id} wrapped | {len(open_tasks)} open task(s) remain")
 
     score = mc.session_score(session_id)

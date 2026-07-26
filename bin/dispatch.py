@@ -28,6 +28,14 @@ BUILDER_PROMPT = (
     "the code change you would make for the following task.{plan_context} "
     "Task: {task}"
 )
+DISPATCH_SESSION_ID = "dispatch-cli"
+
+
+def _safe_mc(default, func, *args, **kwargs):
+    try:
+        return func(*args, **kwargs)
+    except Exception:
+        return default
 
 
 def run_claude(prompt: str, *, timeout: int = 120) -> str | None:
@@ -56,6 +64,15 @@ def run_claude(prompt: str, *, timeout: int = 120) -> str | None:
 
 
 def dispatch(task: str) -> None:
+    _safe_mc(None, mc.init_db)
+    _safe_mc(None, mc.ensure_session, DISPATCH_SESSION_ID)
+    run_id = _safe_mc(
+        None,
+        mc.create_dispatch_run,
+        DISPATCH_SESSION_ID,
+        status="running",
+        summary=task,
+    )
     role_needed = mc.classify(
         f"Task: {task}\nDoes this task need an architect to plan it first, or can "
         "a builder just implement it directly?",
@@ -64,14 +81,20 @@ def dispatch(task: str) -> None:
     if role_needed is None:
         role_needed = "builder"
     print(f"[dispatch] role=classify -> {role_needed}")
+    if run_id:
+        _safe_mc(None, mc.record_agent_output, run_id, "classifier", role_needed)
 
     plan_context = ""
     if role_needed == "architect":
         plan = run_claude(ARCHITECT_PROMPT.format(task=task))
         if plan is None:
             print("[dispatch] architect unavailable, skipping")
+            if run_id:
+                _safe_mc(None, mc.record_agent_output, run_id, "architect", "unavailable")
         else:
             print(f"[dispatch] role=architect -> {plan}")
+            if run_id:
+                _safe_mc(None, mc.record_agent_output, run_id, "architect", plan)
             # Flattened to one line: the .cmd shim `claude` runs through cmd.exe,
             # which treats an embedded newline in an argument as a command
             # separator and truncates the prompt there.
@@ -80,9 +103,24 @@ def dispatch(task: str) -> None:
     change = run_claude(BUILDER_PROMPT.format(task=task, plan_context=plan_context))
     if change is None:
         print("[dispatch] builder unavailable, skipping")
+        if run_id:
+            _safe_mc(None, mc.record_agent_output, run_id, "builder", "unavailable")
     else:
         print(f"[dispatch] role=builder -> {change}")
+        if run_id:
+            _safe_mc(None, mc.record_agent_output, run_id, "builder", change)
 
+    if run_id:
+        status = "completed" if change is not None else "needs_attention"
+        _safe_mc(None, mc.complete_dispatch_run, run_id, status=status, summary=f"{role_needed} -> builder")
+        _safe_mc(
+            None,
+            mc.record_evidence,
+            "dispatch",
+            "architect_builder_local_dispatch",
+            "passed" if change is not None else "needs_review",
+            details={"dispatch_run_id": run_id, "role_needed": role_needed},
+        )
     print("[dispatch] baton: done")
 
 

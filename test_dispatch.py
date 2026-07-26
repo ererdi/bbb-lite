@@ -16,6 +16,19 @@ import dispatch
 
 
 class DispatchTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        patches = [
+            mock.patch("dispatch.mc.init_db"),
+            mock.patch("dispatch.mc.ensure_session"),
+            mock.patch("dispatch.mc.create_dispatch_run", return_value="run-1"),
+            mock.patch("dispatch.mc.record_agent_output"),
+            mock.patch("dispatch.mc.complete_dispatch_run"),
+            mock.patch("dispatch.mc.record_evidence"),
+        ]
+        self._ledger_patches = [patcher.start() for patcher in patches]
+        for patcher in patches:
+            self.addCleanup(patcher.stop)
+
     def _run(self, task: str = "add a hello world function") -> str:
         buffer = io.StringIO()
         with redirect_stdout(buffer):

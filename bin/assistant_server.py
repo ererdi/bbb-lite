@@ -38,7 +38,9 @@ BROZZER_PARITY = {
         "default brozzer role",
         "Mission Control context",
         "keyword and semantic memory recall",
+        "graph memory with currentness/confidence",
         "lifecycle checkpoint after replies",
+        "answer quality scoring and receipts",
         "honest local capability boundaries",
     ],
     "missing": [
@@ -49,9 +51,8 @@ BROZZER_PARITY = {
         "production bridge, Telegram, CRM, and full org pipeline",
     ],
     "next": [
-        "make Brozzer refuse unsupported powers more explicitly",
-        "add decision-capture packets for chat messages",
-        "add a local dispatch ledger before any remote/HOSNI bridge",
+        "connect real Claude Code hook settings only when self-interference is safe",
+        "add a stronger local/remote dispatch bridge after text behavior is stable",
         "add voice only after text assistant behavior is stable",
     ],
 }
@@ -196,6 +197,20 @@ def _memory_lines(items: list[dict]) -> str:
     return "\n".join(lines) or "- none"
 
 
+def _structured_local_answer(*, known: list[str], impact: list[str], risks: list[str], actions: list[str]) -> str:
+    def section(title: str, items: list[str]) -> str:
+        return f"{title}:\n" + "\n".join(f"- {item}" for item in items)
+
+    return "\n\n".join(
+        [
+            section("Known", known),
+            section("MC impact", impact),
+            section("Risk", risks),
+            section("Next action", actions),
+        ]
+    )
+
+
 def build_prompt(message: str, context: dict) -> str:
     open_tasks = "\n".join(
         f"- #{task.get('id')} [{task.get('status')}] {task.get('title')}"
@@ -211,8 +226,11 @@ assistant: grounded in Mission Control, memory, role, and the current session.
 Answer in the user's language. Be concrete, calm, and useful.
 
 Response law:
+- Use this compact shape when it fits: Known / MC impact / Risk / Next action.
 - Start from what is known in the supplied context.
 - If the request is operational, produce a direct next-action plan.
+- Name whether the answer is based on Mission Control, memory, graph memory,
+  checkpoint, or a declared limitation.
 - If required facts are missing, ask only the smallest necessary question after
   giving a safe default.
 - Do not claim powers you do not have. You cannot access HOSNI, voice, Telegram,
@@ -312,6 +330,42 @@ def _local_brozzer_answer(message: str, context: dict) -> str:
     )
 
 
+def _enforce_brozzer_contract(answer: str, message: str, context: dict, engine: str) -> str:
+    """Keep weak model output inside the local Brozzer operating contract."""
+
+    clean = _clean_model_output(answer) or ""
+    lower = clean.lower()
+    has_contract = all(label in lower for label in ("known", "risk", "next"))
+    if has_contract and len(clean) >= 80:
+        return clean
+
+    role = context.get("role", "brozzer")
+    open_tasks = context.get("open_tasks") or []
+    first_task = "none"
+    if open_tasks:
+        first = open_tasks[0]
+        first_task = f"#{first.get('id')} {first.get('title')}"
+    weak_model_note = ""
+    if engine in {"ollama", "local-guarded", "unavailable"}:
+        weak_model_note = " Engine is local/fallback, so the answer is treated as needs-check evidence."
+
+    return (
+        "Known:\n"
+        f"- Active role: {role}.\n"
+        f"- First open MC task: {first_task}.\n"
+        "- Context read before answer: checkpoint, keyword memory, semantic memory, graph memory.\n\n"
+        "MC impact:\n"
+        "- This reply will be checkpointed and written to the MC trace.\n"
+        "- A quality score, evidence row, and answer receipt will be created for audit.\n\n"
+        "Risk:\n"
+        f"- Raw model answer did not fully satisfy the Brozzer contract.{weak_model_note}\n"
+        "- Unsupported powers remain blocked here: HOSNI, voice, Telegram, calendar, email, CRM, production bridge.\n\n"
+        "Next action:\n"
+        f"- Treat this as the guarded answer for: {message[:160]}\n"
+        f"- Raw answer summary: {_clip(clean, 260) or 'no useful model text'}"
+    )
+
+
 def answer_message(message: str, session_id: str = DEFAULT_SESSION_ID, *, db_path: Path = mc.DB_PATH) -> dict:
     message = str(message or "").strip()
     if not message:
@@ -345,6 +399,8 @@ def answer_message(message: str, session_id: str = DEFAULT_SESSION_ID, *, db_pat
             "checkpoint context'i toplandı."
         )
         engine = "unavailable"
+    answer = _enforce_brozzer_contract(answer, message, context, engine)
+    checkpoint_risk = "low" if engine != "unavailable" else "model_unavailable"
 
     _safe_call(
         None,
@@ -353,10 +409,10 @@ def answer_message(message: str, session_id: str = DEFAULT_SESSION_ID, *, db_pat
         current_task=_clip(message, 160),
         last_decision="assistant_console_reply",
         next_action=_clip(answer, 180),
-        risk="low" if engine != "unavailable" else "model_unavailable",
+        risk=checkpoint_risk,
         db_path=db_path,
     )
-    _safe_call(
+    assistant_turn_id = _safe_call(
         None,
         mc.record_turn,
         session_id,
@@ -388,11 +444,61 @@ def answer_message(message: str, session_id: str = DEFAULT_SESSION_ID, *, db_pat
             db_path=db_path,
         )
 
+    score = mc.assess_answer_quality(
+        message,
+        answer,
+        context=context,
+        engine=engine,
+        decision_packet_id=decision_packet_id,
+    )
+    quality_score_id = _safe_call(
+        None,
+        mc.record_answer_quality,
+        session_id,
+        score,
+        turn_id=assistant_turn_id,
+        db_path=db_path,
+    )
+    evidence_id = _safe_call(
+        None,
+        mc.record_evidence,
+        "answer",
+        "assistant_console_reply",
+        score["status"],
+        details={
+            "engine": engine,
+            "role": context["role"],
+            "total_score": score["total_score"],
+            "decision_packet_id": decision_packet_id,
+        },
+        db_path=db_path,
+    )
+    answer_id = uuid.uuid4().hex
+    receipt_id = _safe_call(
+        None,
+        mc.record_answer_receipt,
+        session_id,
+        answer_id,
+        engine=engine,
+        role=context["role"],
+        decision_packet_id=decision_packet_id,
+        quality_score_id=quality_score_id,
+        evidence_id=evidence_id,
+        checkpoint_risk=checkpoint_risk,
+        next_action=_clip(answer, 180),
+        details={"message": _clip(message, 180), "score_status": score["status"]},
+        db_path=db_path,
+    )
+
     return {
-        "id": uuid.uuid4().hex,
+        "id": answer_id,
         "answer": answer,
         "engine": engine,
         "decision_packet_id": decision_packet_id,
+        "quality_score": score,
+        "quality_score_id": quality_score_id,
+        "evidence_id": evidence_id,
+        "answer_receipt_id": receipt_id,
         "context": _json_safe(context),
     }
 
@@ -425,6 +531,15 @@ def build_state(session_id: str = DEFAULT_SESSION_ID, *, db_path: Path = mc.DB_P
             "agent_outputs": _safe_call([], mc.list_agent_outputs, limit=5, db_path=db_path),
             "events": _safe_call([], mc.list_events, limit=8, db_path=db_path),
             "evidence": _safe_call([], mc.list_evidence, limit=5, db_path=db_path),
+            "answer_quality_scores": _safe_call(
+                [], mc.list_answer_quality_scores, session_id, limit=5, db_path=db_path
+            ),
+            "answer_receipts": _safe_call(
+                [], mc.list_answer_receipts, session_id, limit=5, db_path=db_path
+            ),
+            "lifecycle_runs": _safe_call(
+                [], mc.list_lifecycle_runs, session_id, limit=5, db_path=db_path
+            ),
             "capability_boundaries": boundaries,
             "graph_stats": _safe_call({}, mc.graph_stats, db_path=db_path),
         },

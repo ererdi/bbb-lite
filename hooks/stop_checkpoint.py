@@ -56,6 +56,13 @@ def main() -> None:
 
     mc.init_db()
     mc.write_checkpoint(session_id, last_decision=summary)
+    mc.record_lifecycle_run(
+        "stop_checkpoint",
+        session_id=session_id,
+        source="stop",
+        status="ok",
+        details={"summary": summary[:120]},
+    )
 
 
 if __name__ == "__main__":

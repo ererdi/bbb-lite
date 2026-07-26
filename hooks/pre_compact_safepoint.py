@@ -19,6 +19,13 @@ def main() -> None:
     checkpoint = mc.latest_checkpoint(session_id)
     if checkpoint is None:
         mc.write_checkpoint(session_id, current_task="pre-compact safepoint")
+        mc.record_lifecycle_run(
+            "pre_compact_safepoint",
+            session_id=session_id,
+            source="compact",
+            status="ok",
+            details={"checkpoint": "created-empty"},
+        )
         return
 
     mc.write_checkpoint(
@@ -28,6 +35,13 @@ def main() -> None:
         next_action=checkpoint["next_action"],
         open_queue=checkpoint["open_queue"],
         risk=checkpoint["risk"],
+    )
+    mc.record_lifecycle_run(
+        "pre_compact_safepoint",
+        session_id=session_id,
+        source="compact",
+        status="ok",
+        details={"checkpoint": "copied-latest"},
     )
 
 

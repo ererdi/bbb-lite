@@ -26,6 +26,16 @@ class RoleParsingTestCase(unittest.TestCase):
 
 
 class AssistantAnswerTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        patches = [
+            mock.patch("assistant_server.mc.record_answer_quality", return_value=101),
+            mock.patch("assistant_server.mc.record_evidence", return_value=202),
+            mock.patch("assistant_server.mc.record_answer_receipt", return_value=303),
+        ]
+        self._ledger_patches = [patcher.start() for patcher in patches]
+        for patcher in patches:
+            self.addCleanup(patcher.stop)
+
     def _mock_context(self):
         return mock.patch(
             "assistant_server.collect_context",
@@ -54,7 +64,12 @@ class AssistantAnswerTestCase(unittest.TestCase):
             mock.patch("assistant_server.mc.record_event") as event:
             result = assistant_server.answer_message("hello", "web")
         self.assertEqual("claude-cli", result["engine"])
-        self.assertEqual("claude answer", result["answer"])
+        self.assertIn("Known:", result["answer"])
+        self.assertIn("claude answer", result["answer"])
+        self.assertIn("quality_score", result)
+        self.assertEqual(101, result["quality_score_id"])
+        self.assertEqual(202, result["evidence_id"])
+        self.assertEqual(303, result["answer_receipt_id"])
         claude.assert_called_once()
         ollama.assert_not_called()
         checkpoint.assert_called_once()
@@ -70,7 +85,7 @@ class AssistantAnswerTestCase(unittest.TestCase):
             mock.patch("assistant_server.mc.record_event"):
             result = assistant_server.answer_message("hello", "web")
         self.assertEqual("local-guarded", result["engine"])
-        self.assertIn("BBB-Lite context", result["answer"])
+        self.assertIn("Known:", result["answer"])
         ollama.assert_not_called()
 
     def test_ollama_is_opt_in_fallback(self) -> None:
@@ -83,7 +98,8 @@ class AssistantAnswerTestCase(unittest.TestCase):
             mock.patch("assistant_server.mc.record_event"):
             result = assistant_server.answer_message("hello", "web")
         self.assertEqual("ollama", result["engine"])
-        self.assertEqual("ollama answer", result["answer"])
+        self.assertIn("Known:", result["answer"])
+        self.assertIn("ollama answer", result["answer"])
 
     def test_unavailable_when_both_models_fail(self) -> None:
         with self._mock_context(), \
@@ -94,7 +110,7 @@ class AssistantAnswerTestCase(unittest.TestCase):
             mock.patch("assistant_server.mc.record_event"):
             result = assistant_server.answer_message("hello", "web")
         self.assertEqual("local-guarded", result["engine"])
-        self.assertIn("BBB-Lite context", result["answer"])
+        self.assertIn("Known:", result["answer"])
 
     def test_model_output_is_cleaned(self) -> None:
         dirty = "\x1b[?25lhello\x1b[0m\x08"
@@ -173,6 +189,9 @@ class BuildStateTestCase(unittest.TestCase):
             mock.patch("assistant_server.mc.list_agent_outputs", return_value=[]), \
             mock.patch("assistant_server.mc.list_events", return_value=[]), \
             mock.patch("assistant_server.mc.list_evidence", return_value=[]), \
+            mock.patch("assistant_server.mc.list_answer_quality_scores", return_value=[]), \
+            mock.patch("assistant_server.mc.list_answer_receipts", return_value=[]), \
+            mock.patch("assistant_server.mc.list_lifecycle_runs", return_value=[]), \
             mock.patch("assistant_server.mc.graph_stats", return_value={"nodes": 0, "edges": 0}), \
             mock.patch("assistant_server.shutil.which", return_value=r"C:\bin\claude.CMD"):
             state = assistant_server.build_state("web")

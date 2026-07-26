@@ -41,6 +41,7 @@ class McTestCase(unittest.TestCase):
                 "projects", "sprints", "roles", "turns", "decision_packets",
                 "dispatch_runs", "agent_outputs", "evidence", "events_log",
                 "capability_boundaries", "graph_nodes", "graph_edges",
+                "answer_quality_scores", "answer_receipts", "lifecycle_runs",
             },
             names,
         )
@@ -261,6 +262,16 @@ class McTestCase(unittest.TestCase):
         self.assertEqual(output_id, outputs[-1]["id"])
         self.assertEqual("architect", outputs[-1]["role"])
 
+    def test_complete_dispatch_run_closes_run(self) -> None:
+        run_id = mc.create_dispatch_run("s1", status="running", db_path=self.db_path)
+        mc.complete_dispatch_run(
+            run_id, status="completed", summary="builder finished", db_path=self.db_path
+        )
+        run = mc.list_dispatch_runs(db_path=self.db_path)[-1]
+        self.assertEqual("completed", run["status"])
+        self.assertEqual("builder finished", run["summary"])
+        self.assertIsNotNone(run["completed_at"])
+
     def test_record_and_list_evidence(self) -> None:
         evidence_id = mc.record_evidence(
             "tests",
@@ -272,6 +283,47 @@ class McTestCase(unittest.TestCase):
         evidence = mc.list_evidence(db_path=self.db_path)
         self.assertEqual(evidence_id, evidence[-1]["id"])
         self.assertEqual("passed", evidence[-1]["status"])
+
+    def test_answer_quality_receipt_and_lifecycle_are_listed(self) -> None:
+        score = mc.assess_answer_quality(
+            "decision: keep SQLite",
+            "Known:\n- MC memory checkpoint.\n\nRisk:\n- none.\n\nNext action:\n- create receipt.",
+            context={"checkpoint": {"risk": "low"}},
+            engine="local",
+            decision_packet_id="d1",
+        )
+        quality_id = mc.record_answer_quality("s1", score, db_path=self.db_path)
+        evidence_id = mc.record_evidence(
+            "answer", "reply", score["status"], details=score, db_path=self.db_path
+        )
+        receipt_id = mc.record_answer_receipt(
+            "s1",
+            "answer-1",
+            engine="local",
+            role="brozzer",
+            decision_packet_id="d1",
+            quality_score_id=quality_id,
+            evidence_id=evidence_id,
+            checkpoint_risk="low",
+            next_action="create receipt",
+            db_path=self.db_path,
+        )
+        lifecycle_id = mc.record_lifecycle_run(
+            "session_start", session_id="s1", source="test", db_path=self.db_path
+        )
+        self.assertEqual(quality_id, mc.list_answer_quality_scores("s1", db_path=self.db_path)[-1]["id"])
+        self.assertEqual(receipt_id, mc.list_answer_receipts("s1", db_path=self.db_path)[-1]["id"])
+        self.assertEqual(lifecycle_id, mc.list_lifecycle_runs("s1", db_path=self.db_path)[-1]["id"])
+        self.assertGreaterEqual(score["total_score"], 70)
+
+    def test_answer_quality_flags_unsupported_claim(self) -> None:
+        score = mc.assess_answer_quality(
+            "schedule a meeting",
+            "I scheduled it in calendar and sent email.",
+            engine="local",
+        )
+        self.assertEqual("needs_review", score["status"])
+        self.assertEqual(0, score["role_compliance"])
 
     def test_load_graph_edges_and_traverse_dependencies(self) -> None:
         edge_file = self.db_path.with_suffix(".jsonl")
@@ -289,6 +341,8 @@ class McTestCase(unittest.TestCase):
         self.assertEqual(2, result["loaded"])
         self.assertEqual(["mission-control", "guarded-sqlite"], [row["node"] for row in deps])
         self.assertEqual(["mission-control", "assistant"], [row["node"] for row in impact])
+        self.assertEqual("current", deps[0]["currentness"])
+        self.assertEqual("verified", deps[0]["confidence"])
 
     def test_graph_stats_counts_nodes_edges_and_authority(self) -> None:
         edge_file = self.db_path.with_suffix(".jsonl")
@@ -303,8 +357,35 @@ class McTestCase(unittest.TestCase):
         stats = mc.graph_stats(db_path=self.db_path)
         self.assertEqual(2, stats["nodes"])
         self.assertEqual(1, stats["edges"])
+        self.assertEqual(1, stats["curated_edges"])
         self.assertEqual(1, stats["by_type"]["depends-on"])
         self.assertEqual(1, stats["by_authority"]["trusted-typed"])
+        self.assertEqual(1, stats["by_currentness"]["current"])
+        self.assertEqual(1, stats["by_confidence"]["verified"])
+
+    def test_curate_graph_edge_updates_quality_fields(self) -> None:
+        edge_file = self.db_path.with_suffix(".jsonl")
+        edge_file.write_text(
+            '{"src":"a","dst":"b","type":"depends-on","evidence":"fixture"}\n',
+            encoding="utf-8",
+        )
+        try:
+            mc.load_graph_edges(edge_file, db_path=self.db_path)
+        finally:
+            edge_file.unlink(missing_ok=True)
+        mc.curate_graph_edge(
+            "a",
+            "b",
+            "depends-on",
+            currentness="stale",
+            confidence="review-needed",
+            reason="test",
+            db_path=self.db_path,
+        )
+        edge = mc.list_graph_edges(db_path=self.db_path)[-1]
+        self.assertEqual("stale", edge["currentness"])
+        self.assertEqual("review-needed", edge["confidence"])
+        self.assertEqual(1, edge["curated"])
 
     def test_add_task_with_done_status_refused(self) -> None:
         with self.assertRaises(mc.MCCompletionRefused):

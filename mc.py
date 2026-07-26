@@ -31,6 +31,30 @@ _embedding_model: Any = None
 _embedding_unavailable = False
 GRAPH_EDGE_TYPES = ("supersedes", "depends-on", "evidence-for", "contradicts", "derived-from")
 GRAPH_MAX_HOPS = 2
+UNSUPPORTED_CLAIM_TERMS = (
+    "hosni",
+    "voice",
+    "telegram",
+    "calendar",
+    "email",
+    "crm",
+    "production bridge",
+)
+UNSUPPORTED_ACTION_TERMS = (
+    "sent",
+    "created",
+    "scheduled",
+    "connected",
+    "accessed",
+    "gonderdim",
+    "gönderdim",
+    "olusturdum",
+    "oluşturdum",
+    "baglandim",
+    "bağlandım",
+    "eristim",
+    "eriştim",
+)
 
 DEFAULT_CAPABILITY_BOUNDARIES = {
     "hosni": "Local prototype only; HOSNI durable dispatch is not connected.",
@@ -503,9 +527,64 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 PRIMARY KEY (src, dst, type)
             )"""
         )
+        existing_graph_edge_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(graph_edges)").fetchall()
+        }
+        if "currentness" not in existing_graph_edge_columns:
+            conn.execute("ALTER TABLE graph_edges ADD COLUMN currentness TEXT NOT NULL DEFAULT 'unknown'")
+        if "confidence" not in existing_graph_edge_columns:
+            conn.execute("ALTER TABLE graph_edges ADD COLUMN confidence TEXT NOT NULL DEFAULT 'unknown'")
+        if "curated" not in existing_graph_edge_columns:
+            conn.execute("ALTER TABLE graph_edges ADD COLUMN curated INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS answer_quality_scores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                turn_id INTEGER,
+                total_score INTEGER NOT NULL,
+                groundedness INTEGER NOT NULL,
+                actionability INTEGER NOT NULL,
+                role_compliance INTEGER NOT NULL,
+                evidence_coverage INTEGER NOT NULL,
+                decision_discipline INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                details_json TEXT,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS answer_receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                answer_id TEXT NOT NULL,
+                engine TEXT NOT NULL,
+                role TEXT NOT NULL,
+                decision_packet_id TEXT,
+                quality_score_id INTEGER,
+                evidence_id INTEGER,
+                checkpoint_risk TEXT,
+                next_action TEXT,
+                details_json TEXT,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS lifecycle_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                hook_name TEXT NOT NULL,
+                source TEXT NOT NULL,
+                status TEXT NOT NULL,
+                details_json TEXT,
+                created_at TEXT NOT NULL
+            )"""
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS graph_edges_src ON graph_edges(src, type)")
         conn.execute("CREATE INDEX IF NOT EXISTS graph_edges_dst ON graph_edges(dst, type)")
         conn.execute("CREATE INDEX IF NOT EXISTS graph_nodes_type ON graph_nodes(node_type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS answer_quality_session ON answer_quality_scores(session_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS answer_receipts_session ON answer_receipts(session_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS lifecycle_runs_session ON lifecycle_runs(session_id, created_at)")
         for capability, reason in DEFAULT_CAPABILITY_BOUNDARIES.items():
             conn.execute(
                 """INSERT OR IGNORE INTO capability_boundaries
@@ -882,6 +961,27 @@ def create_dispatch_run(
     return run_id
 
 
+def complete_dispatch_run(
+    run_id: str,
+    *,
+    status: str = "completed",
+    summary: str | None = None,
+    db_path: Path = DB_PATH,
+) -> None:
+    """Close a local dispatch run so the Advisor/Architect/Builder path has proof."""
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        updated = conn.execute(
+            """UPDATE dispatch_runs
+               SET status = ?, completed_at = ?, summary = COALESCE(?, summary)
+               WHERE id = ?""",
+            (status, _now(), summary, run_id),
+        )
+        conn.commit()
+        if updated.rowcount == 0:
+            raise ValueError(f"unknown dispatch run: {run_id}")
+
+
 def list_dispatch_runs(limit: int = 20, db_path: Path = DB_PATH) -> list[dict]:
     with contextlib.closing(_connect(db_path)) as conn:
         rows = conn.execute(
@@ -958,6 +1058,234 @@ def list_evidence(limit: int = 20, db_path: Path = DB_PATH) -> list[dict]:
             "SELECT * FROM evidence ORDER BY created_at DESC, id DESC LIMIT ?",
             (limit,),
         ).fetchall()
+    return [dict(row) for row in reversed(rows)]
+
+
+def assess_answer_quality(
+    message: str,
+    answer: str,
+    *,
+    context: dict | None = None,
+    engine: str | None = None,
+    decision_packet_id: str | None = None,
+) -> dict:
+    """Deterministic answer rubric: BBB-Lite's local proof, not an LLM judge."""
+
+    context = context or {}
+    message_text = str(message or "")
+    answer_text = str(answer or "")
+    lower_answer = answer_text.lower()
+    lower_message = message_text.lower()
+    context_has_memory = bool(
+        context.get("keyword_memory")
+        or context.get("semantic_memory")
+        or context.get("graph_memory")
+        or context.get("checkpoint")
+        or context.get("open_tasks")
+    )
+    answer_sentences = re.split(r"[\n.;!?]+", lower_answer)
+    unsupported_claim = any(
+        any(term in sentence for term in UNSUPPORTED_CLAIM_TERMS)
+        and any(action in sentence for action in UNSUPPORTED_ACTION_TERMS)
+        for sentence in answer_sentences
+    )
+    mentions_context = any(
+        term in lower_answer
+        for term in (
+            "mission control",
+            "mc",
+            "memory",
+            "graph",
+            "checkpoint",
+            "role",
+            "kanit",
+            "kanıt",
+            "context",
+        )
+    )
+    has_next_action = bool(
+        re.search(r"\b(next|sonraki|adim|adım|plan|risk|1\.|2\.|3\.)\b", lower_answer)
+    )
+    names_evidence = any(
+        term in lower_answer
+        for term in ("evidence", "kanit", "kanıt", "test", "checkpoint", "memory", "graph")
+    )
+    decision_requested = "decision" in lower_message or "karar" in lower_message
+
+    groundedness = 25 if mentions_context else (18 if context_has_memory else 12)
+    actionability = 20 if has_next_action else 8
+    role_compliance = 0 if unsupported_claim else 20
+    evidence_coverage = 20 if names_evidence else (12 if context_has_memory else 6)
+    decision_discipline = 15 if decision_packet_id or not decision_requested else 5
+    total = groundedness + actionability + role_compliance + evidence_coverage + decision_discipline
+    status = "passed" if total >= 70 and not unsupported_claim else "needs_review"
+    return {
+        "total_score": total,
+        "groundedness": groundedness,
+        "actionability": actionability,
+        "role_compliance": role_compliance,
+        "evidence_coverage": evidence_coverage,
+        "decision_discipline": decision_discipline,
+        "status": status,
+        "unsupported_claim": unsupported_claim,
+        "engine": engine,
+        "reason": (
+            "answer is grounded enough for local demo"
+            if status == "passed"
+            else "answer needs review before being treated as BBB-quality output"
+        ),
+    }
+
+
+def record_answer_quality(
+    session_id: str,
+    score: dict,
+    *,
+    turn_id: int | None = None,
+    db_path: Path = DB_PATH,
+) -> int:
+    with contextlib.closing(_connect(db_path)) as conn:
+        cur = conn.execute(
+            """INSERT INTO answer_quality_scores
+               (session_id, turn_id, total_score, groundedness, actionability,
+                role_compliance, evidence_coverage, decision_discipline, status,
+                details_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                session_id,
+                turn_id,
+                int(score["total_score"]),
+                int(score["groundedness"]),
+                int(score["actionability"]),
+                int(score["role_compliance"]),
+                int(score["evidence_coverage"]),
+                int(score["decision_discipline"]),
+                str(score["status"]),
+                json.dumps(score, ensure_ascii=False, sort_keys=True),
+                _now(),
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def list_answer_quality_scores(
+    session_id: str | None = None, *, limit: int = 20, db_path: Path = DB_PATH
+) -> list[dict]:
+    with contextlib.closing(_connect(db_path)) as conn:
+        if session_id is None:
+            rows = conn.execute(
+                "SELECT * FROM answer_quality_scores ORDER BY created_at DESC, id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT * FROM answer_quality_scores WHERE session_id = ?
+                   ORDER BY created_at DESC, id DESC LIMIT ?""",
+                (session_id, limit),
+            ).fetchall()
+    return [dict(row) for row in reversed(rows)]
+
+
+def record_answer_receipt(
+    session_id: str,
+    answer_id: str,
+    *,
+    engine: str,
+    role: str,
+    decision_packet_id: str | None = None,
+    quality_score_id: int | None = None,
+    evidence_id: int | None = None,
+    checkpoint_risk: str | None = None,
+    next_action: str | None = None,
+    details: dict | None = None,
+    db_path: Path = DB_PATH,
+) -> int:
+    with contextlib.closing(_connect(db_path)) as conn:
+        cur = conn.execute(
+            """INSERT INTO answer_receipts
+               (session_id, answer_id, engine, role, decision_packet_id,
+                quality_score_id, evidence_id, checkpoint_risk, next_action,
+                details_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                session_id,
+                answer_id,
+                engine,
+                role,
+                decision_packet_id,
+                quality_score_id,
+                evidence_id,
+                checkpoint_risk,
+                next_action,
+                json.dumps(details or {}, ensure_ascii=False, sort_keys=True),
+                _now(),
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def list_answer_receipts(
+    session_id: str | None = None, *, limit: int = 20, db_path: Path = DB_PATH
+) -> list[dict]:
+    with contextlib.closing(_connect(db_path)) as conn:
+        if session_id is None:
+            rows = conn.execute(
+                "SELECT * FROM answer_receipts ORDER BY created_at DESC, id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT * FROM answer_receipts WHERE session_id = ?
+                   ORDER BY created_at DESC, id DESC LIMIT ?""",
+                (session_id, limit),
+            ).fetchall()
+    return [dict(row) for row in reversed(rows)]
+
+
+def record_lifecycle_run(
+    hook_name: str,
+    *,
+    session_id: str | None = None,
+    source: str = "hook",
+    status: str = "ok",
+    details: dict | None = None,
+    db_path: Path = DB_PATH,
+) -> int:
+    with contextlib.closing(_connect(db_path)) as conn:
+        cur = conn.execute(
+            """INSERT INTO lifecycle_runs
+               (session_id, hook_name, source, status, details_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                session_id,
+                hook_name,
+                source,
+                status,
+                json.dumps(details or {}, ensure_ascii=False, sort_keys=True),
+                _now(),
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def list_lifecycle_runs(
+    session_id: str | None = None, *, limit: int = 20, db_path: Path = DB_PATH
+) -> list[dict]:
+    with contextlib.closing(_connect(db_path)) as conn:
+        if session_id is None:
+            rows = conn.execute(
+                "SELECT * FROM lifecycle_runs ORDER BY created_at DESC, id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT * FROM lifecycle_runs WHERE session_id = ?
+                   ORDER BY created_at DESC, id DESC LIMIT ?""",
+                (session_id, limit),
+            ).fetchall()
     return [dict(row) for row in reversed(rows)]
 
 
@@ -1063,6 +1391,9 @@ def _upsert_graph_edge(
     weight: float = 1.0,
     source_ref: str | None = None,
     authority: str | None = None,
+    currentness: str = "unknown",
+    confidence: str = "unknown",
+    curated: bool = False,
 ) -> None:
     src, dst, edge_type = src.strip(), dst.strip(), edge_type.strip()
     if not src or not dst or not edge_type:
@@ -1070,15 +1401,31 @@ def _upsert_graph_edge(
     authority_class = _authority_class_for_edge(edge_type, authority)
     conn.execute(
         """INSERT INTO graph_edges
-           (src, dst, type, evidence, weight, source_ref, authority, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           (src, dst, type, evidence, weight, source_ref, authority, updated_at,
+            currentness, confidence, curated)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(src, dst, type) DO UPDATE SET
                evidence = excluded.evidence,
                weight = excluded.weight,
                source_ref = excluded.source_ref,
                authority = excluded.authority,
-               updated_at = excluded.updated_at""",
-        (src, dst, edge_type, evidence, float(weight), source_ref, authority_class, _now()),
+               updated_at = excluded.updated_at,
+               currentness = excluded.currentness,
+               confidence = excluded.confidence,
+               curated = excluded.curated""",
+        (
+            src,
+            dst,
+            edge_type,
+            evidence,
+            float(weight),
+            source_ref,
+            authority_class,
+            _now(),
+            currentness,
+            confidence,
+            int(curated),
+        ),
     )
 
 
@@ -1132,6 +1479,9 @@ def _upsert_memory_graph(
             weight=0.4,
             source_ref=source_file,
             authority="auto-keyword",
+            currentness="unknown",
+            confidence="inferred",
+            curated=False,
         )
     for label in _wiki_links(body):
         target_id = _graph_node_id("concept", label)
@@ -1152,6 +1502,9 @@ def _upsert_memory_graph(
             weight=0.6,
             source_ref=source_file,
             authority="low-trust-navigation",
+            currentness="unknown",
+            confidence="inferred",
+            curated=False,
         )
 
 
@@ -1209,6 +1562,9 @@ def load_graph_edges(
                 weight=float(edge.get("weight", 1.0)),
                 source_ref=edge.get("source_ref") or str(path.name),
                 authority="trusted-typed" if edge_type in GRAPH_EDGE_TYPES else None,
+                currentness=str(edge.get("currentness") or "current"),
+                confidence=str(edge.get("confidence") or "verified"),
+                curated=True,
             )
             loaded += 1
         conn.commit()
@@ -1249,10 +1605,48 @@ def list_graph_edges(
     return [dict(row) for row in reversed(rows)]
 
 
+def curate_graph_edge(
+    src: str,
+    dst: str,
+    edge_type: str,
+    *,
+    currentness: str = "current",
+    confidence: str = "verified",
+    reason: str | None = None,
+    db_path: Path = DB_PATH,
+) -> None:
+    with contextlib.closing(_connect(db_path)) as conn:
+        updated = conn.execute(
+            """UPDATE graph_edges
+               SET currentness = ?, confidence = ?, curated = 1, updated_at = ?
+               WHERE src = ? AND dst = ? AND type = ?""",
+            (currentness, confidence, _now(), src, dst, edge_type),
+        )
+        conn.commit()
+        if updated.rowcount == 0:
+            raise ValueError(f"unknown graph edge: {src} -> {dst} ({edge_type})")
+    record_event(
+        "graph_edge_curated",
+        source="mc",
+        details={
+            "src": src,
+            "dst": dst,
+            "type": edge_type,
+            "currentness": currentness,
+            "confidence": confidence,
+            "reason": reason,
+        },
+        db_path=db_path,
+    )
+
+
 def graph_stats(db_path: Path = DB_PATH) -> dict:
     with contextlib.closing(_connect(db_path)) as conn:
         node_count = conn.execute("SELECT COUNT(*) FROM graph_nodes").fetchone()[0]
         edge_count = conn.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0]
+        curated_edges = conn.execute(
+            "SELECT COUNT(*) FROM graph_edges WHERE curated = 1"
+        ).fetchone()[0]
         by_type = {
             row["type"]: row["count"]
             for row in conn.execute(
@@ -1265,11 +1659,26 @@ def graph_stats(db_path: Path = DB_PATH) -> dict:
                 "SELECT authority, COUNT(*) AS count FROM graph_edges GROUP BY authority ORDER BY count DESC"
             ).fetchall()
         }
+        by_currentness = {
+            row["currentness"]: row["count"]
+            for row in conn.execute(
+                "SELECT currentness, COUNT(*) AS count FROM graph_edges GROUP BY currentness ORDER BY count DESC"
+            ).fetchall()
+        }
+        by_confidence = {
+            row["confidence"]: row["count"]
+            for row in conn.execute(
+                "SELECT confidence, COUNT(*) AS count FROM graph_edges GROUP BY confidence ORDER BY count DESC"
+            ).fetchall()
+        }
     return {
         "nodes": node_count,
         "edges": edge_count,
+        "curated_edges": curated_edges,
         "by_type": by_type,
         "by_authority": by_authority,
+        "by_currentness": by_currentness,
+        "by_confidence": by_confidence,
     }
 
 
@@ -1295,7 +1704,8 @@ def traverse_graph(
                 continue
             col, want = ("src", "dst") if direction == "out" else ("dst", "src")
             sql = (
-                f"SELECT {want} AS node, type, evidence, weight, source_ref, authority, updated_at "
+                f"SELECT {want} AS node, type, evidence, weight, source_ref, authority, "
+                f"updated_at, currentness, confidence, curated "
                 f"FROM graph_edges WHERE {col} = ?"
             )
             params: list = [node]
