@@ -89,6 +89,12 @@ def main() -> None:
     open_tasks = mc.list_open_tasks()
     print(f"[bbb-lite] session {session_id} wrapped | {len(open_tasks)} open task(s) remain")
 
+    score = mc.session_score(session_id)
+    print(
+        f"[bbb-lite] session score: {score['score']}/100 "
+        f"({score['tasks_completed']}/{score['tasks_touched']} tasks completed)"
+    )
+
 
 if __name__ == "__main__":
     main()

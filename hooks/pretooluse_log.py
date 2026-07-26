@@ -1,10 +1,11 @@
-"""PreToolUse hook: general guard + log, the non-role-based counterpart to
-haroon-bbb-sync's role-guard.py.
+"""PreToolUse hook: general guard + log, plus (Stage N) real role enforcement.
 
-Haroon's role-guard.py checks the calling role's permissions; we don't have a
-role system, so this enforces one fixed rule instead (mc.db is never touched
-by Write/Edit — see memory/decisions.md, 2026-07-24) and logs every other
-write/edit attempt.
+Always enforces one fixed rule (mc.db is never touched by Write/Edit — see
+memory/decisions.md, 2026-07-24) and logs every other write/edit attempt.
+When the payload carries a session_id, it also checks mc.can_write_code() for
+that session's declared role (see hooks/role_declare.py) and denies the call
+if the role has no code-write permission — the counterpart to haroon-bbb-sync's
+role-guard.py, minus its persona/UUID machinery.
 """
 
 from __future__ import annotations
@@ -13,6 +14,10 @@ import datetime
 import json
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import mc
 
 LOG_FILE = Path(__file__).resolve().parent / "pretooluse.log"
 
@@ -38,8 +43,12 @@ def _log(file_path: str) -> None:
         pass  # fail-soft: never block a tool call over a logging error
 
 
-def check(tool_input: dict) -> dict | None:
-    """None means allow (no output needed); a dict is the block payload."""
+def check(tool_input: dict, session_id: str | None = None) -> dict | None:
+    """None means allow (no output needed); a dict is the block payload.
+
+    session_id is only present when the caller's payload had one; absent
+    (None), this falls back to the pre-role behavior — mc.db check only.
+    """
 
     file_path = tool_input.get("file_path")
     if not file_path:
@@ -52,13 +61,19 @@ def check(tool_input: dict) -> dict | None:
             "never the Write/Edit tool"
         )
 
+    if session_id is not None:
+        mc.init_db()
+        if not mc.can_write_code(session_id):
+            role = mc.get_role(session_id)
+            return _deny(f"role '{role}' has no code-write permission")
+
     _log(file_path)
     return None
 
 
 def main() -> None:
     payload = json.load(sys.stdin)
-    result = check(payload.get("tool_input", {}))
+    result = check(payload.get("tool_input", {}), payload.get("session_id"))
     if result is not None:
         json.dump(result, sys.stdout)
     sys.exit(0)

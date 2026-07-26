@@ -68,3 +68,16 @@
   kümesi (aynı SQLite + guard mantığı, CRM/bütçe/otomatik-sprint-geçişi gibi ek katmanlar
   yok). phases, docs, events_log bilinçli olarak kapsam dışı - zincirleme etkiyi (Canvas,
   dispatch, guard'ların hepsinin yeniden yazılması) sınırlı tutmak için.
+
+- **2026-07-24 - Skills sistemi 5 skill ile kuruldu (Haroon'un 36'sına karşı) - format
+  aynı, kapsam mc.py'deki gerçek fonksiyonlarla sınırlı, boş/sahte skill yok.**
+
+- **2026-07-24 - session_score() eklendi, Haroon'un context/exec/rules 3-eksenli
+  puanlamasının değil, tek-eksenli (görev tamamlama oranı) basit bir karşılığı - bizde
+  context-budget/rule-tracking altyapısı olmadığı için.**
+
+- **2026-07-24 - Gerçek rol sistemi kuruldu: roles tablosu, session'a kalıcı rol atama,
+  4 rol + izin matrisi, ve pretooluse_log.py üzerinden GERÇEK kod-yazma zorlaması.
+  Haroon'unkinden farkı: UUID yerine session_id kullanılıyor, persona metinleri yok
+  (sadece izin matrisi), architect/advisor'ın 'data=True, code=False' ayrımı
+  basitleştirilmiş durumda tutuluyor.**

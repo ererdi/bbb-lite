@@ -38,7 +38,7 @@ class McTestCase(unittest.TestCase):
         self.assertEqual(
             {
                 "sessions", "checkpoints", "tasks", "memory_index", "task_activity",
-                "projects", "sprints",
+                "projects", "sprints", "roles",
             },
             names,
         )
@@ -154,6 +154,30 @@ class McTestCase(unittest.TestCase):
             task for task in mc.list_tasks(db_path=self.db_path) if task["id"] == task_id
         )
         self.assertIsNone(task["sprint_id"])
+
+    def test_project_status_counts_open_and_done_tasks_across_sprints(self) -> None:
+        project_id = mc.add_project("bbb-lite", db_path=self.db_path)
+        sprint1 = mc.add_sprint(project_id, "sprint 1", db_path=self.db_path)
+        sprint2 = mc.add_sprint(project_id, "sprint 2", db_path=self.db_path)
+        other_project_id = mc.add_project("other", db_path=self.db_path)
+        other_sprint = mc.add_sprint(other_project_id, "other sprint", db_path=self.db_path)
+
+        mc.add_task("task a", sprint_id=sprint1, db_path=self.db_path)
+        done_id = mc.add_task("task b", sprint_id=sprint1, db_path=self.db_path)
+        mc.complete_task(done_id, db_path=self.db_path)
+        mc.add_task("task c", sprint_id=sprint2, db_path=self.db_path)
+        mc.add_task("task d", sprint_id=other_sprint, db_path=self.db_path)
+        mc.add_task("no sprint", db_path=self.db_path)
+
+        status = mc.project_status(project_id, db_path=self.db_path)
+        self.assertEqual("bbb-lite", status["name"])
+        self.assertEqual(2, status["sprint_count"])
+        self.assertEqual(2, status["open_task_count"])
+        self.assertEqual(1, status["done_task_count"])
+
+    def test_project_status_unknown_project_id_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            mc.project_status(999, db_path=self.db_path)
 
     def test_list_sessions_returns_all_sessions(self) -> None:
         mc.ensure_session("s1", db_path=self.db_path)
@@ -272,6 +296,45 @@ class McTestCase(unittest.TestCase):
         self.assertEqual(
             [], mc.tasks_touched_by_session("no-such-session", db_path=self.db_path)
         )
+
+    def test_session_score_no_tasks_touched_floors_at_100(self) -> None:
+        mc.ensure_session("s1", db_path=self.db_path)
+        score = mc.session_score("s1", db_path=self.db_path)
+        self.assertEqual(0, score["tasks_touched"])
+        self.assertEqual(0, score["tasks_completed"])
+        self.assertEqual(1.0, score["completion_rate"])
+        self.assertEqual(100, score["score"])
+
+    def test_session_score_half_completed_scores_50(self) -> None:
+        mc.ensure_session("s1", db_path=self.db_path)
+        done_id = mc.add_task("finish report", session_id="s1", db_path=self.db_path)
+        mc.add_task("review pr", session_id="s1", db_path=self.db_path)
+        mc.complete_task(done_id, session_id="s1", db_path=self.db_path)
+
+        score = mc.session_score("s1", db_path=self.db_path)
+        self.assertEqual(2, score["tasks_touched"])
+        self.assertEqual(1, score["tasks_completed"])
+        self.assertEqual(0.5, score["completion_rate"])
+        self.assertEqual(50, score["score"])
+
+    def test_session_score_all_completed_scores_100(self) -> None:
+        mc.ensure_session("s1", db_path=self.db_path)
+        first_id = mc.add_task("finish report", session_id="s1", db_path=self.db_path)
+        second_id = mc.add_task("review pr", session_id="s1", db_path=self.db_path)
+        mc.complete_task(first_id, session_id="s1", db_path=self.db_path)
+        mc.complete_task(second_id, session_id="s1", db_path=self.db_path)
+
+        score = mc.session_score("s1", db_path=self.db_path)
+        self.assertEqual(2, score["tasks_touched"])
+        self.assertEqual(2, score["tasks_completed"])
+        self.assertEqual(100, score["score"])
+
+    def test_session_score_counts_checkpoints_written(self) -> None:
+        mc.ensure_session("s1", db_path=self.db_path)
+        mc.write_checkpoint("s1", current_task="first", db_path=self.db_path)
+        mc.write_checkpoint("s1", current_task="second", db_path=self.db_path)
+        score = mc.session_score("s1", db_path=self.db_path)
+        self.assertEqual(2, score["checkpoints_written"])
 
     def test_mark_session_completed_updates_status(self) -> None:
         mc.ensure_session("s1", db_path=self.db_path)
@@ -794,6 +857,57 @@ class ClassifyTestCase(unittest.TestCase):
             self.assertEqual(
                 "needs-attention", mc.classify("task", ["normal", "needs-attention"])
             )
+
+
+class StageNTestCase(unittest.TestCase):
+    """Stage N: roles table, set_role/get_role, can_write_code/can_write_data."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        self.db_path = Path(tmp.name)
+        self.db_path.unlink()
+        mc.init_db(self.db_path)
+
+    def tearDown(self) -> None:
+        self.db_path.unlink(missing_ok=True)
+
+    def test_undeclared_session_defaults_to_brozzer(self) -> None:
+        self.assertEqual("brozzer", mc.get_role("s1", db_path=self.db_path))
+
+    def test_undeclared_session_has_no_code_or_data_permission(self) -> None:
+        self.assertFalse(mc.can_write_code("s1", db_path=self.db_path))
+        self.assertFalse(mc.can_write_data("s1", db_path=self.db_path))
+
+    def test_set_role_rejects_unknown_role(self) -> None:
+        with self.assertRaises(ValueError):
+            mc.set_role("s1", "wizard", db_path=self.db_path)
+
+    def test_set_role_then_get_role_roundtrips(self) -> None:
+        mc.set_role("s1", "builder", db_path=self.db_path)
+        self.assertEqual("builder", mc.get_role("s1", db_path=self.db_path))
+
+    def test_set_role_twice_replaces_the_previous_role(self) -> None:
+        mc.set_role("s1", "advisor", db_path=self.db_path)
+        mc.set_role("s1", "builder", db_path=self.db_path)
+        self.assertEqual("builder", mc.get_role("s1", db_path=self.db_path))
+
+    def test_builder_can_write_code_and_data(self) -> None:
+        mc.set_role("s1", "builder", db_path=self.db_path)
+        self.assertTrue(mc.can_write_code("s1", db_path=self.db_path))
+        self.assertTrue(mc.can_write_data("s1", db_path=self.db_path))
+
+    def test_advisor_and_architect_can_write_data_not_code(self) -> None:
+        for role in ("advisor", "architect"):
+            mc.set_role("s1", role, db_path=self.db_path)
+            self.assertFalse(mc.can_write_code("s1", db_path=self.db_path))
+            self.assertTrue(mc.can_write_data("s1", db_path=self.db_path))
+
+    def test_roles_are_independent_per_session(self) -> None:
+        mc.set_role("s1", "builder", db_path=self.db_path)
+        mc.set_role("s2", "advisor", db_path=self.db_path)
+        self.assertEqual("builder", mc.get_role("s1", db_path=self.db_path))
+        self.assertEqual("advisor", mc.get_role("s2", db_path=self.db_path))
 
 
 if __name__ == "__main__":

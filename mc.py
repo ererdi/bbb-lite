@@ -320,6 +320,13 @@ def init_db(db_path: Path = DB_PATH) -> None:
             )"""
         )
         conn.execute(
+            """CREATE TABLE IF NOT EXISTS roles (
+                session_id TEXT PRIMARY KEY,
+                role TEXT NOT NULL,
+                declared_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
             """CREATE TABLE IF NOT EXISTS checkpoints (
                 session_id TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -400,6 +407,45 @@ def ensure_session(session_id: str, db_path: Path = DB_PATH) -> str:
             )
             conn.commit()
     return session_id
+
+
+ROLE_PERMISSIONS = {
+    "brozzer": {"code": False, "data": False},
+    "advisor": {"code": False, "data": True},
+    "architect": {"code": False, "data": True},
+    "builder": {"code": True, "data": True},
+}
+
+
+def set_role(session_id: str, role: str, db_path: Path = DB_PATH) -> None:
+    """Declare a session's role. Raises ValueError for a role outside ROLE_PERMISSIONS."""
+
+    if role not in ROLE_PERMISSIONS:
+        raise ValueError(f"unknown role: {role}")
+    with contextlib.closing(_connect(db_path)) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO roles (session_id, role, declared_at) VALUES (?, ?, ?)",
+            (session_id, role, _now()),
+        )
+        conn.commit()
+
+
+def get_role(session_id: str, db_path: Path = DB_PATH) -> str:
+    """The session's declared role, or 'brozzer' if it never declared one."""
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        row = conn.execute(
+            "SELECT role FROM roles WHERE session_id = ?", (session_id,)
+        ).fetchone()
+    return row["role"] if row else "brozzer"
+
+
+def can_write_code(session_id: str, db_path: Path = DB_PATH) -> bool:
+    return ROLE_PERMISSIONS[get_role(session_id, db_path=db_path)]["code"]
+
+
+def can_write_data(session_id: str, db_path: Path = DB_PATH) -> bool:
+    return ROLE_PERMISSIONS[get_role(session_id, db_path=db_path)]["data"]
 
 
 def write_checkpoint(
@@ -524,6 +570,34 @@ def list_sprints(project_id: int | None = None, db_path: Path = DB_PATH) -> list
                 (project_id,),
             ).fetchall()
     return [dict(row) for row in rows]
+
+
+def project_status(project_id: int, db_path: Path = DB_PATH) -> dict:
+    """Summarize one project by combining list_projects(), list_sprints(), and
+    list_open_tasks()/list_tasks(): its name, sprint count, and open/done task
+    counts across all its sprints. Raises ValueError for an unknown project_id.
+    """
+
+    project = next(
+        (p for p in list_projects(db_path=db_path) if p["id"] == project_id), None
+    )
+    if project is None:
+        raise ValueError(f"unknown project_id: {project_id}")
+    sprint_ids = {sprint["id"] for sprint in list_sprints(project_id, db_path=db_path)}
+    open_task_count = sum(
+        1 for task in list_open_tasks(db_path=db_path) if task["sprint_id"] in sprint_ids
+    )
+    done_task_count = sum(
+        1 for task in list_tasks(db_path=db_path)
+        if task["status"] == "done" and task["sprint_id"] in sprint_ids
+    )
+    return {
+        "project_id": project_id,
+        "name": project["name"],
+        "sprint_count": len(sprint_ids),
+        "open_task_count": open_task_count,
+        "done_task_count": done_task_count,
+    }
 
 
 def list_sessions(db_path: Path = DB_PATH) -> list[dict]:
@@ -685,6 +759,34 @@ def tasks_touched_by_session(session_id: str, db_path: Path = DB_PATH) -> list[d
         {**dict(row), "completed_by_session": bool(row["completed_by_session"])}
         for row in rows
     ]
+
+
+def session_score(session_id: str, db_path: Path = DB_PATH) -> dict:
+    """Single-axis session score: task completion rate * 100, plus checkpoint count.
+
+    Not Haroon's 3-axis context/exec/rules score — bbb-lite has no context-budget
+    or rule-tracking infrastructure to feed those, so this is the one axis our
+    schema actually supports (see decisions.md, 2026-07-24).
+    """
+
+    touched = tasks_touched_by_session(session_id, db_path=db_path)
+    tasks_touched = len(touched)
+    tasks_completed = sum(1 for task in touched if task["completed_by_session"])
+    completion_rate = tasks_completed / tasks_touched if tasks_touched else 1.0
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        checkpoints_written = conn.execute(
+            "SELECT COUNT(*) FROM checkpoints WHERE session_id = ?", (session_id,)
+        ).fetchone()[0]
+
+    return {
+        "session_id": session_id,
+        "tasks_touched": tasks_touched,
+        "tasks_completed": tasks_completed,
+        "checkpoints_written": checkpoints_written,
+        "completion_rate": completion_rate,
+        "score": round(completion_rate * 100),
+    }
 
 
 def complete_task(

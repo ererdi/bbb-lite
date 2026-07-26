@@ -19,6 +19,12 @@ def main() -> None:
     mc.init_db()
     mc.ensure_session(session_id)
 
+    role = mc.get_role(session_id)
+    print(
+        f"[bbb-lite] role: {role} "
+        f"(code={mc.can_write_code(session_id)}, data={mc.can_write_data(session_id)})"
+    )
+
     if source == "compact":
         checkpoint = mc.latest_checkpoint(session_id)
         state = "checkpoint intact" if checkpoint else "no checkpoint found"
