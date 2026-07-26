@@ -12,9 +12,11 @@ tasks.status='done'; only complete_task() may do that.
 from __future__ import annotations
 
 import contextlib
+import json
 import re
 import sqlite3
 import subprocess
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,6 +27,17 @@ import numpy as np
 DB_PATH = Path(__file__).resolve().parent / "mc.db"
 _EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 _embedding_model: Any = None
+_embedding_unavailable = False
+
+DEFAULT_CAPABILITY_BOUNDARIES = {
+    "hosni": "Local prototype only; HOSNI durable dispatch is not connected.",
+    "voice": "Out of scope for this stage; needs STT/TTS, mic, latency, and voice harness work.",
+    "telegram": "No Telegram bridge in bbb-lite.",
+    "crm": "No CRM integration in bbb-lite.",
+    "production_bridge": "No production MC bridge; SQLite is the local source of truth.",
+    "calendar": "No calendar write integration in bbb-lite.",
+    "email": "No email integration in bbb-lite.",
+}
 
 
 class MCAccessError(RuntimeError):
@@ -392,6 +405,83 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 at TEXT NOT NULL
             )"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS turns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                speaker TEXT NOT NULL,
+                role TEXT,
+                message TEXT NOT NULL,
+                engine TEXT,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS decision_packets (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                context_gist TEXT,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS dispatch_runs (
+                id TEXT PRIMARY KEY,
+                decision_id TEXT,
+                session_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                summary TEXT
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS agent_outputs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dispatch_run_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                output TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                label TEXT NOT NULL,
+                status TEXT NOT NULL,
+                details_json TEXT,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS events_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                session_id TEXT,
+                source TEXT NOT NULL,
+                details_json TEXT,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS capability_boundaries (
+                capability TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        for capability, reason in DEFAULT_CAPABILITY_BOUNDARIES.items():
+            conn.execute(
+                """INSERT OR IGNORE INTO capability_boundaries
+                   (capability, enabled, reason, updated_at)
+                   VALUES (?, ?, ?, ?)""",
+                (capability, 0, reason, _now()),
+            )
         conn.commit()
 
 
@@ -612,6 +702,264 @@ def list_task_activity(db_path: Path = DB_PATH) -> list[dict]:
     with contextlib.closing(_connect(db_path)) as conn:
         rows = conn.execute("SELECT * FROM task_activity ORDER BY at").fetchall()
     return [dict(row) for row in rows]
+
+
+def record_turn(
+    session_id: str,
+    speaker: str,
+    message: str,
+    *,
+    role: str | None = None,
+    engine: str | None = None,
+    db_path: Path = DB_PATH,
+) -> int:
+    """Append one user/assistant turn to MC's active-turn trace."""
+
+    ensure_session(session_id, db_path=db_path)
+    with contextlib.closing(_connect(db_path)) as conn:
+        cur = conn.execute(
+            """INSERT INTO turns (session_id, speaker, role, message, engine, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (session_id, speaker, role, message, engine, _now()),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def list_turns(
+    session_id: str | None = None, *, limit: int = 20, db_path: Path = DB_PATH
+) -> list[dict]:
+    """Recent turns, optionally for one session, oldest-first within the limit."""
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        if session_id is None:
+            rows = conn.execute(
+                "SELECT * FROM turns ORDER BY created_at DESC, id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT * FROM turns WHERE session_id = ?
+                   ORDER BY created_at DESC, id DESC LIMIT ?""",
+                (session_id, limit),
+            ).fetchall()
+    return [dict(row) for row in reversed(rows)]
+
+
+def record_event(
+    event_type: str,
+    *,
+    session_id: str | None = None,
+    source: str = "system",
+    details: dict | None = None,
+    db_path: Path = DB_PATH,
+) -> int:
+    """Append one operational event; details are JSON so callers keep structure."""
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        cur = conn.execute(
+            """INSERT INTO events_log
+               (event_type, session_id, source, details_json, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                event_type,
+                session_id,
+                source,
+                json.dumps(details or {}, ensure_ascii=False, sort_keys=True),
+                _now(),
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def list_events(limit: int = 20, db_path: Path = DB_PATH) -> list[dict]:
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT * FROM events_log ORDER BY created_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in reversed(rows)]
+
+
+def create_decision_packet(
+    session_id: str,
+    decision: str,
+    *,
+    source: str = "chat",
+    context_gist: str | None = None,
+    status: str = "new",
+    db_path: Path = DB_PATH,
+) -> str:
+    """Local equivalent of Haroon's durable decision packet, before HOSNI dispatch."""
+
+    ensure_session(session_id, db_path=db_path)
+    packet_id = uuid.uuid4().hex
+    with contextlib.closing(_connect(db_path)) as conn:
+        conn.execute(
+            """INSERT INTO decision_packets
+               (id, session_id, source, decision, context_gist, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (packet_id, session_id, source, decision, context_gist, status, _now()),
+        )
+        conn.commit()
+    record_event(
+        "decision_packet_created",
+        session_id=session_id,
+        source=source,
+        details={"decision_id": packet_id, "status": status},
+        db_path=db_path,
+    )
+    return packet_id
+
+
+def list_decision_packets(limit: int = 20, db_path: Path = DB_PATH) -> list[dict]:
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT * FROM decision_packets ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in reversed(rows)]
+
+
+def create_dispatch_run(
+    session_id: str,
+    *,
+    decision_id: str | None = None,
+    status: str = "queued",
+    summary: str | None = None,
+    db_path: Path = DB_PATH,
+) -> str:
+    """Track a local Brozzer -> Architect/Builder dispatch simulation."""
+
+    run_id = uuid.uuid4().hex
+    with contextlib.closing(_connect(db_path)) as conn:
+        conn.execute(
+            """INSERT INTO dispatch_runs
+               (id, decision_id, session_id, status, started_at, completed_at, summary)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (run_id, decision_id, session_id, status, _now(), None, summary),
+        )
+        conn.commit()
+    record_event(
+        "dispatch_run_created",
+        session_id=session_id,
+        source="mc",
+        details={"dispatch_run_id": run_id, "decision_id": decision_id, "status": status},
+        db_path=db_path,
+    )
+    return run_id
+
+
+def list_dispatch_runs(limit: int = 20, db_path: Path = DB_PATH) -> list[dict]:
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT * FROM dispatch_runs ORDER BY started_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in reversed(rows)]
+
+
+def record_agent_output(
+    dispatch_run_id: str,
+    role: str,
+    output: str,
+    *,
+    db_path: Path = DB_PATH,
+) -> int:
+    with contextlib.closing(_connect(db_path)) as conn:
+        cur = conn.execute(
+            """INSERT INTO agent_outputs (dispatch_run_id, role, output, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (dispatch_run_id, role, output, _now()),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def list_agent_outputs(
+    dispatch_run_id: str | None = None, *, limit: int = 20, db_path: Path = DB_PATH
+) -> list[dict]:
+    with contextlib.closing(_connect(db_path)) as conn:
+        if dispatch_run_id is None:
+            rows = conn.execute(
+                "SELECT * FROM agent_outputs ORDER BY created_at DESC, id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT * FROM agent_outputs WHERE dispatch_run_id = ?
+                   ORDER BY created_at DESC, id DESC LIMIT ?""",
+                (dispatch_run_id, limit),
+            ).fetchall()
+    return [dict(row) for row in reversed(rows)]
+
+
+def record_evidence(
+    kind: str,
+    label: str,
+    status: str,
+    *,
+    details: dict | None = None,
+    db_path: Path = DB_PATH,
+) -> int:
+    """Store a receipt/proof row such as tests, demo checks, or health checks."""
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        cur = conn.execute(
+            """INSERT INTO evidence (kind, label, status, details_json, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                kind,
+                label,
+                status,
+                json.dumps(details or {}, ensure_ascii=False, sort_keys=True),
+                _now(),
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def list_evidence(limit: int = 20, db_path: Path = DB_PATH) -> list[dict]:
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT * FROM evidence ORDER BY created_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in reversed(rows)]
+
+
+def upsert_capability_boundary(
+    capability: str,
+    enabled: bool,
+    reason: str,
+    *,
+    db_path: Path = DB_PATH,
+) -> None:
+    with contextlib.closing(_connect(db_path)) as conn:
+        conn.execute(
+            """INSERT INTO capability_boundaries
+               (capability, enabled, reason, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(capability) DO UPDATE SET
+                   enabled = excluded.enabled,
+                   reason = excluded.reason,
+                   updated_at = excluded.updated_at""",
+            (capability, int(enabled), reason, _now()),
+        )
+        conn.commit()
+
+
+def list_capability_boundaries(db_path: Path = DB_PATH) -> list[dict]:
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT * FROM capability_boundaries ORDER BY capability"
+        ).fetchall()
+    return [
+        {**dict(row), "enabled": bool(row["enabled"])}
+        for row in rows
+    ]
 
 
 def pick_next_action(db_path: Path = DB_PATH) -> str | None:
@@ -873,11 +1221,17 @@ def _get_embedding_model() -> Any:
     (~/.cache/huggingface) has the model, later calls load from disk and need no network.
     """
 
-    global _embedding_model
+    global _embedding_model, _embedding_unavailable
+    if _embedding_unavailable:
+        raise RuntimeError("embedding model unavailable in this process")
     if _embedding_model is None:
         from sentence_transformers import SentenceTransformer
 
-        _embedding_model = SentenceTransformer(_EMBEDDING_MODEL_NAME)
+        try:
+            _embedding_model = SentenceTransformer(_EMBEDDING_MODEL_NAME)
+        except Exception:
+            _embedding_unavailable = True
+            raise
     return _embedding_model
 
 
@@ -886,6 +1240,19 @@ def _embed(text: str) -> bytes:
 
     vector = _get_embedding_model().encode(text, convert_to_numpy=True)
     return np.asarray(vector, dtype=np.float32).tobytes()
+
+
+def _embed_or_none(text: str) -> bytes | None:
+    """Best-effort embedding for indexing; keyword memory must survive offline."""
+
+    global _embedding_unavailable
+    if _embedding_unavailable:
+        return None
+    try:
+        return _embed(text)
+    except Exception:
+        _embedding_unavailable = True
+        return None
 
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -904,7 +1271,7 @@ def index_memory_files(db_path: Path = DB_PATH) -> int:
         for path in sorted(memory_dir.glob("*.md")):
             title, body = _parse_memory_file(path)
             keywords = _extract_keywords(f"{title} {body}")
-            embedding = _embed(f"{title}\n{body}")
+            embedding = _embed_or_none(f"{title}\n{body}")
             conn.execute(
                 """INSERT INTO memory_index (source_file, title, content, keywords, embedding)
                    VALUES (?, ?, ?, ?, ?)

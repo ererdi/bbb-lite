@@ -38,7 +38,9 @@ class McTestCase(unittest.TestCase):
         self.assertEqual(
             {
                 "sessions", "checkpoints", "tasks", "memory_index", "task_activity",
-                "projects", "sprints", "roles",
+                "projects", "sprints", "roles", "turns", "decision_packets",
+                "dispatch_runs", "agent_outputs", "evidence", "events_log",
+                "capability_boundaries",
             },
             names,
         )
@@ -191,6 +193,85 @@ class McTestCase(unittest.TestCase):
         mc.complete_task(task_id, session_id="s1", db_path=self.db_path)
         activities = [row["activity"] for row in mc.list_task_activity(db_path=self.db_path)]
         self.assertEqual(["created", "completed"], activities)
+
+    def test_capability_boundaries_are_seeded_disabled(self) -> None:
+        boundaries = {
+            row["capability"]: row for row in mc.list_capability_boundaries(db_path=self.db_path)
+        }
+        self.assertIn("voice", boundaries)
+        self.assertFalse(boundaries["voice"]["enabled"])
+        self.assertIn("out of scope", boundaries["voice"]["reason"].lower())
+
+    def test_upsert_capability_boundary_updates_existing_row(self) -> None:
+        mc.upsert_capability_boundary(
+            "voice", True, "local harness enabled", db_path=self.db_path
+        )
+        boundaries = {
+            row["capability"]: row for row in mc.list_capability_boundaries(db_path=self.db_path)
+        }
+        self.assertTrue(boundaries["voice"]["enabled"])
+        self.assertEqual("local harness enabled", boundaries["voice"]["reason"])
+
+    def test_record_and_list_turns_for_session(self) -> None:
+        mc.record_turn("s1", "user", "hello", role="brozzer", db_path=self.db_path)
+        mc.record_turn(
+            "s1", "assistant", "hi", role="brozzer", engine="local", db_path=self.db_path
+        )
+        mc.record_turn("s2", "user", "ignored", db_path=self.db_path)
+        turns = mc.list_turns("s1", db_path=self.db_path)
+        self.assertEqual(["user", "assistant"], [row["speaker"] for row in turns])
+        self.assertEqual("local", turns[-1]["engine"])
+
+    def test_record_and_list_events(self) -> None:
+        event_id = mc.record_event(
+            "assistant_reply",
+            session_id="s1",
+            source="assistant_console",
+            details={"engine": "local"},
+            db_path=self.db_path,
+        )
+        events = mc.list_events(db_path=self.db_path)
+        self.assertEqual(event_id, events[-1]["id"])
+        self.assertEqual("assistant_reply", events[-1]["event_type"])
+        self.assertIn('"engine": "local"', events[-1]["details_json"])
+
+    def test_create_decision_packet_records_event(self) -> None:
+        packet_id = mc.create_decision_packet(
+            "s1",
+            "Use local SQLite as MC source of truth.",
+            context_gist="HOSNI not connected",
+            db_path=self.db_path,
+        )
+        packets = mc.list_decision_packets(db_path=self.db_path)
+        events = mc.list_events(db_path=self.db_path)
+        self.assertEqual(packet_id, packets[-1]["id"])
+        self.assertEqual("new", packets[-1]["status"])
+        self.assertEqual("decision_packet_created", events[-1]["event_type"])
+
+    def test_dispatch_run_and_agent_outputs_are_listed(self) -> None:
+        run_id = mc.create_dispatch_run(
+            "s1", status="queued", summary="local architect dispatch", db_path=self.db_path
+        )
+        output_id = mc.record_agent_output(
+            run_id, "architect", "reviewed boundaries", db_path=self.db_path
+        )
+        runs = mc.list_dispatch_runs(db_path=self.db_path)
+        outputs = mc.list_agent_outputs(run_id, db_path=self.db_path)
+        self.assertEqual(run_id, runs[-1]["id"])
+        self.assertEqual(output_id, outputs[-1]["id"])
+        self.assertEqual("architect", outputs[-1]["role"])
+
+    def test_record_and_list_evidence(self) -> None:
+        evidence_id = mc.record_evidence(
+            "tests",
+            "unit suite",
+            "passed",
+            details={"passed": 1, "total": 1},
+            db_path=self.db_path,
+        )
+        evidence = mc.list_evidence(db_path=self.db_path)
+        self.assertEqual(evidence_id, evidence[-1]["id"])
+        self.assertEqual("passed", evidence[-1]["status"])
 
     def test_add_task_with_done_status_refused(self) -> None:
         with self.assertRaises(mc.MCCompletionRefused):

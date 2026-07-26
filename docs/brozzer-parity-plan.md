@@ -66,6 +66,28 @@ Missing compared with Haroon:
    Only after text behavior, decision capture, local dispatch, and logs are
    stable should voice be introduced as its own service.
 
+## Stage Q: Mission Control observability expansion
+
+This stage grows MC by copying Haroon's shape, not his infrastructure.
+
+Local equivalents added:
+- `turns` is the SQLite equivalent of Haroon's shared active-turn trace. It is
+  text-only for now; voice can later write to the same kind of ledger.
+- `decision_packets` is the local equivalent of `bbb-dispatch` packet capture.
+  It stores explicit chat decisions before any remote/HOSNI dispatch exists.
+- `dispatch_runs` and `agent_outputs` are the local equivalent of the org
+  ledger around CTO/advisor/architect/builder runs.
+- `events_log` is the local operational event stream.
+- `evidence` is the receipt/proof table for tests, health checks, and demo
+  proof.
+- `capability_boundaries` makes missing powers visible in MC instead of hiding
+  them in prose: HOSNI, voice, Telegram, CRM, production bridge, calendar, and
+  email are blocked unless a later stage explicitly enables them.
+
+The important boundary remains: BBB-Lite still does not connect to HOSNI. The
+same lifecycle idea is represented locally in SQLite so it can be demonstrated
+and tested on Erdi's machine.
+
 ## Demo wording
 
 "This is not full Haroon Brozzer yet. I intentionally skipped voice in this

@@ -48,19 +48,25 @@ class AssistantAnswerTestCase(unittest.TestCase):
         with self._mock_context(), \
             mock.patch("assistant_server.run_claude", return_value="claude answer") as claude, \
             mock.patch("assistant_server.mc.ask_ollama") as ollama, \
-            mock.patch("assistant_server.mc.write_checkpoint") as checkpoint:
+            mock.patch("assistant_server.mc.write_checkpoint") as checkpoint, \
+            mock.patch("assistant_server.mc.record_turn") as turn, \
+            mock.patch("assistant_server.mc.record_event") as event:
             result = assistant_server.answer_message("hello", "web")
         self.assertEqual("claude-cli", result["engine"])
         self.assertEqual("claude answer", result["answer"])
         claude.assert_called_once()
         ollama.assert_not_called()
         checkpoint.assert_called_once()
+        self.assertEqual(2, turn.call_count)
+        event.assert_called_once()
 
     def test_local_guarded_fallback_when_claude_unavailable(self) -> None:
         with self._mock_context(), \
             mock.patch("assistant_server.run_claude", return_value=None), \
             mock.patch("assistant_server.mc.ask_ollama") as ollama, \
-            mock.patch("assistant_server.mc.write_checkpoint"):
+            mock.patch("assistant_server.mc.write_checkpoint"), \
+            mock.patch("assistant_server.mc.record_turn"), \
+            mock.patch("assistant_server.mc.record_event"):
             result = assistant_server.answer_message("hello", "web")
         self.assertEqual("local-guarded", result["engine"])
         self.assertIn("BBB-Lite context", result["answer"])
@@ -71,7 +77,9 @@ class AssistantAnswerTestCase(unittest.TestCase):
             mock.patch.dict("assistant_server.os.environ", {"BBB_ASSISTANT_USE_OLLAMA": "1"}), \
             mock.patch("assistant_server.run_claude", return_value=None), \
             mock.patch("assistant_server.mc.ask_ollama", return_value="ollama answer"), \
-            mock.patch("assistant_server.mc.write_checkpoint"):
+            mock.patch("assistant_server.mc.write_checkpoint"), \
+            mock.patch("assistant_server.mc.record_turn"), \
+            mock.patch("assistant_server.mc.record_event"):
             result = assistant_server.answer_message("hello", "web")
         self.assertEqual("ollama", result["engine"])
         self.assertEqual("ollama answer", result["answer"])
@@ -80,7 +88,9 @@ class AssistantAnswerTestCase(unittest.TestCase):
         with self._mock_context(), \
             mock.patch("assistant_server.run_claude", return_value=None), \
             mock.patch("assistant_server.mc.ask_ollama", return_value=None), \
-            mock.patch("assistant_server.mc.write_checkpoint"):
+            mock.patch("assistant_server.mc.write_checkpoint"), \
+            mock.patch("assistant_server.mc.record_turn"), \
+            mock.patch("assistant_server.mc.record_event"):
             result = assistant_server.answer_message("hello", "web")
         self.assertEqual("local-guarded", result["engine"])
         self.assertIn("BBB-Lite context", result["answer"])
@@ -89,10 +99,26 @@ class AssistantAnswerTestCase(unittest.TestCase):
         dirty = "\x1b[?25lhello\x1b[0m\x08"
         self.assertEqual("hello", assistant_server._clean_model_output(dirty))
 
+    def test_explicit_decision_message_creates_packet(self) -> None:
+        with self._mock_context(), \
+            mock.patch("assistant_server.run_claude", return_value="stored"), \
+            mock.patch("assistant_server.mc.write_checkpoint"), \
+            mock.patch("assistant_server.mc.record_turn"), \
+            mock.patch("assistant_server.mc.record_event"), \
+            mock.patch(
+                "assistant_server.mc.create_decision_packet", return_value="packet-1"
+            ) as packet:
+            result = assistant_server.answer_message(
+                "decision: keep SQLite as local MC", "web"
+            )
+        self.assertEqual("packet-1", result["decision_packet_id"])
+        packet.assert_called_once()
+
 
 class CollectContextTestCase(unittest.TestCase):
     def test_collect_context_declares_role_and_reads_memory(self) -> None:
-        with mock.patch("assistant_server.mc.ensure_session") as ensure, \
+        with mock.patch("assistant_server.mc.init_db"), \
+            mock.patch("assistant_server.mc.ensure_session") as ensure, \
             mock.patch("assistant_server.mc.set_role") as set_role, \
             mock.patch("assistant_server.mc.get_role", return_value="builder"), \
             mock.patch("assistant_server.mc.search_memory", return_value=[{"title": "kw"}]), \
@@ -133,11 +159,22 @@ class BuildStateTestCase(unittest.TestCase):
             mock.patch("assistant_server.mc.get_role", return_value="brozzer"), \
             mock.patch("assistant_server.mc.list_tasks", return_value=[]), \
             mock.patch("assistant_server.mc.latest_checkpoint", return_value=None), \
+            mock.patch(
+                "assistant_server.mc.list_capability_boundaries",
+                return_value=[{"capability": "voice", "enabled": False, "reason": "not yet"}],
+            ), \
+            mock.patch("assistant_server.mc.list_turns", return_value=[]), \
+            mock.patch("assistant_server.mc.list_decision_packets", return_value=[]), \
+            mock.patch("assistant_server.mc.list_dispatch_runs", return_value=[]), \
+            mock.patch("assistant_server.mc.list_agent_outputs", return_value=[]), \
+            mock.patch("assistant_server.mc.list_events", return_value=[]), \
+            mock.patch("assistant_server.mc.list_evidence", return_value=[]), \
             mock.patch("assistant_server.shutil.which", return_value=r"C:\bin\claude.CMD"):
             state = assistant_server.build_state("web")
         self.assertTrue(state["claude_cli_available"])
         self.assertFalse(state["voice"]["enabled"])
         self.assertEqual("partial-local-brozzer", state["brozzer_parity"]["status"])
+        self.assertIn("mc_trace", state)
 
 
 class HandlerTestCase(unittest.TestCase):

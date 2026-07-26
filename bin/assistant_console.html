@@ -209,6 +209,10 @@
       <div id="state" class="kv"></div>
     </div>
     <div class="panel">
+      <h2>MC Trace</h2>
+      <div id="trace" class="empty">Loading...</div>
+    </div>
+    <div class="panel">
       <h2>Brozzer Parity</h2>
       <div id="parity" class="empty">Loading...</div>
     </div>
@@ -231,6 +235,7 @@ const messages = document.querySelector('#messages');
 const form = document.querySelector('#form');
 const input = document.querySelector('#input');
 const stateBox = document.querySelector('#state');
+const traceBox = document.querySelector('#trace');
 const parityBox = document.querySelector('#parity');
 const contextBox = document.querySelector('#context');
 const refreshButton = document.querySelector('#refresh');
@@ -268,7 +273,53 @@ function renderState(data) {
     else cell.textContent = value;
     stateBox.appendChild(cell);
   }
+  renderTrace(data);
   renderParity(data);
+}
+
+function compactRows(title, rows, mapRow) {
+  const box = el('div', 'item');
+  box.appendChild(el('strong', '', title));
+  if (!rows || !rows.length) {
+    box.appendChild(el('div', '', 'none'));
+    return box;
+  }
+  for (const row of rows.slice(-4)) box.appendChild(el('div', '', mapRow(row)));
+  return box;
+}
+
+function renderTrace(data) {
+  const trace = data.mc_trace || {};
+  traceBox.innerHTML = '';
+  traceBox.className = '';
+  const counts = el('div', 'item');
+  counts.appendChild(el('strong', '', 'Ledger counts'));
+  counts.appendChild(el(
+    'div',
+    '',
+    `turns ${trace.turns?.length || 0} / decisions ${trace.decision_packets?.length || 0} / dispatch ${trace.dispatch_runs?.length || 0} / evidence ${trace.evidence?.length || 0}`
+  ));
+  traceBox.appendChild(counts);
+  traceBox.appendChild(compactRows(
+    'Recent turns',
+    trace.turns,
+    row => `${row.speaker || '-'} / ${row.role || '-'}: ${(row.message || '').slice(0, 70)}`
+  ));
+  traceBox.appendChild(compactRows(
+    'Decision packets',
+    trace.decision_packets,
+    row => `${row.status || '-'}: ${(row.decision || '').slice(0, 80)}`
+  ));
+  traceBox.appendChild(compactRows(
+    'Events',
+    trace.events,
+    row => `${row.event_type || '-'} from ${row.source || '-'}`
+  ));
+  traceBox.appendChild(compactRows(
+    'Boundaries',
+    trace.capability_boundaries,
+    row => `${row.capability || '-'}: ${row.enabled ? 'enabled' : 'blocked'}`
+  ));
 }
 
 function smallList(title, items) {

@@ -58,6 +58,17 @@ BROZZER_PARITY = {
 
 _ROLE_EN_RE = re.compile(r"\byou are (?:the )?(brozzer|advisor|architect|builder)\b", re.I)
 _ROLE_TR_RE = re.compile(r"\b(brozzer|advisor|architect|builder|mimarsın|buildersın|builder'sın)\b", re.I)
+_DECISION_PREFIX_RE = re.compile(
+    r"\b(?:decision|karar)\s*[:=-]\s*(?P<decision>.+)",
+    re.I | re.S,
+)
+_DECISION_PHRASES = (
+    "karar olarak kaydet",
+    "bunu karar",
+    "decision olarak kaydet",
+    "log this decision",
+    "record this decision",
+)
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
@@ -103,6 +114,21 @@ def _declared_role(message: str) -> str | None:
     if raw.startswith("builder"):
         return "builder"
     return raw
+
+
+def _decision_text(message: str) -> str | None:
+    """Extract an explicit chat decision without guessing from ordinary text."""
+
+    message = str(message or "").strip()
+    if not message:
+        return None
+    match = _DECISION_PREFIX_RE.search(message)
+    if match:
+        return _clip(match.group("decision"), 500)
+    lower = message.lower()
+    if any(phrase in lower for phrase in _DECISION_PHRASES):
+        return _clip(message, 500)
+    return None
 
 
 def run_claude(prompt: str, *, timeout: int = CLAUDE_TIMEOUT_SECONDS) -> str | None:
@@ -287,6 +313,15 @@ def answer_message(message: str, session_id: str = DEFAULT_SESSION_ID, *, db_pat
         return {"error": "message is required"}
 
     context = collect_context(message, session_id, db_path=db_path)
+    _safe_call(
+        None,
+        mc.record_turn,
+        session_id,
+        "user",
+        message,
+        role=context["role"],
+        db_path=db_path,
+    )
     prompt = build_prompt(message, context)
     answer = run_claude(prompt)
     engine = "claude-cli"
@@ -316,11 +351,43 @@ def answer_message(message: str, session_id: str = DEFAULT_SESSION_ID, *, db_pat
         risk="low" if engine != "unavailable" else "model_unavailable",
         db_path=db_path,
     )
+    _safe_call(
+        None,
+        mc.record_turn,
+        session_id,
+        "assistant",
+        answer,
+        role=context["role"],
+        engine=engine,
+        db_path=db_path,
+    )
+    _safe_call(
+        None,
+        mc.record_event,
+        "assistant_reply",
+        session_id=session_id,
+        source="assistant_console",
+        details={"engine": engine, "role": context["role"]},
+        db_path=db_path,
+    )
+    decision_packet_id = None
+    decision = _decision_text(message)
+    if decision:
+        decision_packet_id = _safe_call(
+            None,
+            mc.create_decision_packet,
+            session_id,
+            decision,
+            source="chat",
+            context_gist=_clip(answer, 240),
+            db_path=db_path,
+        )
 
     return {
         "id": uuid.uuid4().hex,
         "answer": answer,
         "engine": engine,
+        "decision_packet_id": decision_packet_id,
         "context": _json_safe(context),
     }
 
@@ -330,6 +397,12 @@ def build_state(session_id: str = DEFAULT_SESSION_ID, *, db_path: Path = mc.DB_P
     mc.ensure_session(session_id, db_path=db_path)
     role = mc.get_role(session_id, db_path=db_path)
     tasks = _safe_call([], mc.list_tasks, db_path=db_path)
+    boundaries = _safe_call([], mc.list_capability_boundaries, db_path=db_path)
+    boundaries_by_name = {item.get("capability"): item for item in boundaries}
+    voice_boundary = boundaries_by_name.get("voice") or {
+        "enabled": False,
+        "reason": VOICE_OMISSION_REASON,
+    }
     return {
         "session_id": session_id,
         "role": role,
@@ -338,8 +411,17 @@ def build_state(session_id: str = DEFAULT_SESSION_ID, *, db_path: Path = mc.DB_P
         "done_tasks": sum(1 for task in tasks if task.get("status") == "done"),
         "checkpoint": _safe_call(None, mc.latest_checkpoint, session_id, db_path=db_path),
         "claude_cli_available": shutil.which("claude") is not None,
-        "voice": {"enabled": False, "reason": VOICE_OMISSION_REASON},
+        "voice": {"enabled": voice_boundary["enabled"], "reason": voice_boundary["reason"]},
         "brozzer_parity": BROZZER_PARITY,
+        "mc_trace": {
+            "turns": _safe_call([], mc.list_turns, session_id, limit=8, db_path=db_path),
+            "decision_packets": _safe_call([], mc.list_decision_packets, limit=5, db_path=db_path),
+            "dispatch_runs": _safe_call([], mc.list_dispatch_runs, limit=5, db_path=db_path),
+            "agent_outputs": _safe_call([], mc.list_agent_outputs, limit=5, db_path=db_path),
+            "events": _safe_call([], mc.list_events, limit=8, db_path=db_path),
+            "evidence": _safe_call([], mc.list_evidence, limit=5, db_path=db_path),
+            "capability_boundaries": boundaries,
+        },
     }
 
 

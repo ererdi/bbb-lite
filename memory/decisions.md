@@ -126,6 +126,14 @@
   checkpoint, açık görevler, keyword memory ve semantic memory context'i toplar;
   cevap sonrası lifecycle checkpoint yazar.**
 
+- **2026-07-26 - Stage Q MC observability expansion eklendi:** Haroon referansi
+  disina cikmadan `turns`, `decision_packets`, `dispatch_runs`, `agent_outputs`,
+  `events_log`, `evidence`, `capability_boundaries` tablolarinin lokal SQLite
+  karsiliklari kuruldu. Bunlar Haroon'daki active-turn trace, bbb-dispatch
+  packet, agent_runs ledger, receipt/proof ve explicit service-boundary
+  fikirlerinin HOSNI'siz yerel esdegeridir. Voice yine bilincli kapsam disi:
+  once text assistant + MC izleri kanitlanacak.
+
 - **2026-07-24 - Voice bilinçli olarak bu stage dışında bırakıldı; Brozzer parity
   planı eklendi (docs/brozzer-parity-plan.md). Gerekçe: voice ayrı bir ürün
   yüzeyi; STT/TTS, mic izinleri, latency, barge-in, port izolasyonu ve ayrı
