@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BBB-Lite Assistant</title>
+<style>
+  :root {
+    --bg: #08111f;
+    --panel: #111c2f;
+    --panel-2: #15243b;
+    --line: #253754;
+    --text: #eef5ff;
+    --muted: #9fb1ca;
+    --accent: #69d2a5;
+    --blue: #78a6ff;
+    --warn: #ffd166;
+    --danger: #ff7b7b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--text);
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  header {
+    height: 64px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 22px;
+    border-bottom: 1px solid var(--line);
+    background: rgba(8, 17, 31, 0.96);
+  }
+  h1 {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 750;
+    letter-spacing: 0;
+  }
+  .sub {
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: 3px;
+  }
+  .links {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+  a, button {
+    border: 1px solid var(--line);
+    background: var(--panel-2);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 9px 11px;
+    text-decoration: none;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button.primary {
+    border-color: rgba(105, 210, 165, 0.55);
+    background: #143629;
+  }
+  main {
+    height: calc(100vh - 64px);
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 360px;
+  }
+  .chat {
+    display: grid;
+    grid-template-rows: 1fr auto;
+    min-width: 0;
+  }
+  #messages {
+    padding: 18px;
+    overflow: auto;
+  }
+  .msg {
+    max-width: 840px;
+    margin: 0 0 14px;
+    display: grid;
+    gap: 6px;
+  }
+  .msg.user { margin-left: auto; }
+  .bubble {
+    border: 1px solid var(--line);
+    background: var(--panel);
+    border-radius: 8px;
+    padding: 12px 13px;
+    white-space: pre-wrap;
+    line-height: 1.45;
+    font-size: 14px;
+  }
+  .user .bubble {
+    background: #183255;
+    border-color: #2f5288;
+  }
+  .meta {
+    color: var(--muted);
+    font-size: 12px;
+  }
+  form {
+    border-top: 1px solid var(--line);
+    padding: 14px;
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 10px;
+    background: rgba(8, 17, 31, 0.96);
+  }
+  textarea {
+    width: 100%;
+    resize: none;
+    min-height: 48px;
+    max-height: 160px;
+    border: 1px solid var(--line);
+    background: #0d1829;
+    color: var(--text);
+    border-radius: 7px;
+    padding: 12px;
+    font: inherit;
+    line-height: 1.35;
+  }
+  aside {
+    border-left: 1px solid var(--line);
+    background: #0b1627;
+    padding: 14px;
+    overflow: auto;
+  }
+  .panel {
+    border: 1px solid var(--line);
+    background: var(--panel);
+    border-radius: 8px;
+    padding: 13px;
+    margin-bottom: 12px;
+  }
+  .panel h2 {
+    margin: 0 0 10px;
+    font-size: 13px;
+    color: var(--muted);
+    font-weight: 750;
+    text-transform: uppercase;
+  }
+  .kv {
+    display: grid;
+    grid-template-columns: 92px 1fr;
+    gap: 7px 10px;
+    font-size: 13px;
+  }
+  .key { color: var(--muted); }
+  .value { overflow-wrap: anywhere; }
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 3px 8px;
+    font-size: 12px;
+    color: var(--accent);
+    background: rgba(105, 210, 165, 0.08);
+  }
+  .item {
+    border-top: 1px solid var(--line);
+    padding-top: 9px;
+    margin-top: 9px;
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .item strong {
+    display: block;
+    color: var(--text);
+    margin-bottom: 3px;
+  }
+  .empty { color: var(--muted); font-size: 13px; }
+  .error { color: var(--danger); }
+  @media (max-width: 900px) {
+    header { height: auto; min-height: 64px; align-items: flex-start; flex-direction: column; gap: 10px; padding: 14px; }
+    main { height: auto; min-height: calc(100vh - 92px); grid-template-columns: 1fr; }
+    aside { border-left: 0; border-top: 1px solid var(--line); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>BBB-Lite Assistant</h1>
+    <div class="sub">Local chat surface: Claude CLI first, Ollama fallback, SQLite memory context.</div>
+  </div>
+  <div class="links">
+    <a href="http://127.0.0.1:8090/" target="_blank">Demo Console</a>
+    <a href="http://localhost:5173" target="_blank">Canvas</a>
+    <button id="refresh" type="button">Refresh State</button>
+  </div>
+</header>
+<main>
+  <section class="chat">
+    <div id="messages"></div>
+    <form id="form">
+      <textarea id="input" placeholder="BBB-Lite ile konuş... Örn: Bu sistem Haroon'unkine göre neyi kanıtlıyor?" autofocus></textarea>
+      <button class="primary" type="submit">Send</button>
+    </form>
+  </section>
+  <aside>
+    <div class="panel">
+      <h2>Session</h2>
+      <div id="state" class="kv"></div>
+    </div>
+    <div class="panel">
+      <h2>Last Context</h2>
+      <div id="context" class="empty">Henüz mesaj yok.</div>
+    </div>
+    <div class="panel">
+      <h2>How It Answers</h2>
+      <div class="item"><strong>1. Role</strong>Session role is read from Mission Control.</div>
+      <div class="item"><strong>2. Memory</strong>Keyword and semantic memory are searched before the model call.</div>
+      <div class="item"><strong>3. Model</strong>Backend calls your authenticated Claude CLI; Ollama is fallback.</div>
+      <div class="item"><strong>4. Checkpoint</strong>Each reply writes a lifecycle checkpoint.</div>
+    </div>
+  </aside>
+</main>
+<script>
+const SESSION_ID = 'web-assistant';
+const messages = document.querySelector('#messages');
+const form = document.querySelector('#form');
+const input = document.querySelector('#input');
+const stateBox = document.querySelector('#state');
+const contextBox = document.querySelector('#context');
+const refreshButton = document.querySelector('#refresh');
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function addMessage(kind, text, meta) {
+  const wrap = el('div', `msg ${kind}`);
+  wrap.appendChild(el('div', 'bubble', text));
+  if (meta) wrap.appendChild(el('div', 'meta', meta));
+  messages.appendChild(wrap);
+  messages.scrollTop = messages.scrollHeight;
+}
+
+function renderState(data) {
+  stateBox.innerHTML = '';
+  const rows = [
+    ['session', data.session_id || '-'],
+    ['role', data.role || '-'],
+    ['code', data.permissions?.code ? 'allowed' : 'blocked'],
+    ['data', data.permissions?.data ? 'allowed' : 'blocked'],
+    ['claude', data.claude_cli_available ? 'available' : 'missing'],
+    ['open', String(data.open_tasks ?? '-')],
+    ['done', String(data.done_tasks ?? '-')]
+  ];
+  for (const [key, value] of rows) {
+    stateBox.appendChild(el('div', 'key', key));
+    const cell = el('div', 'value');
+    if (key === 'role') cell.appendChild(el('span', 'pill', value));
+    else cell.textContent = value;
+    stateBox.appendChild(cell);
+  }
+}
+
+function memoryList(title, items) {
+  const box = el('div', 'item');
+  box.appendChild(el('strong', '', title));
+  if (!items || !items.length) {
+    box.appendChild(el('div', '', 'none'));
+    return box;
+  }
+  for (const item of items.slice(0, 3)) {
+    const sim = typeof item.similarity === 'number' ? ` · ${item.similarity.toFixed(3)}` : '';
+    box.appendChild(el('div', '', `${item.title || item.source_file}${sim}`));
+  }
+  return box;
+}
+
+function renderContext(result) {
+  const ctx = result.context || {};
+  contextBox.innerHTML = '';
+  contextBox.className = '';
+  const engine = el('div', 'item');
+  engine.appendChild(el('strong', '', 'Engine'));
+  engine.appendChild(el('div', '', result.engine || 'unknown'));
+  contextBox.appendChild(engine);
+  contextBox.appendChild(memoryList('Keyword memory', ctx.keyword_memory));
+  contextBox.appendChild(memoryList('Semantic memory', ctx.semantic_memory));
+  const checkpoint = el('div', 'item');
+  checkpoint.appendChild(el('strong', '', 'Checkpoint'));
+  checkpoint.appendChild(el('div', '', ctx.checkpoint ? (ctx.checkpoint.next_action || ctx.checkpoint.last_decision || 'available') : 'none'));
+  contextBox.appendChild(checkpoint);
+}
+
+async function loadState() {
+  try {
+    const res = await fetch('/api/state');
+    renderState(await res.json());
+  } catch (err) {
+    stateBox.innerHTML = '';
+    stateBox.appendChild(el('div', 'error', err.message));
+  }
+}
+
+async function sendMessage(text) {
+  addMessage('user', text, 'you');
+  addMessage('assistant', 'Thinking...', 'BBB-Lite');
+  const pending = messages.lastChild;
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: SESSION_ID, message: text })
+    });
+    const data = await res.json();
+    pending.querySelector('.bubble').textContent = data.answer || data.error || 'No response';
+    pending.querySelector('.meta').textContent = `BBB-Lite · ${data.engine || 'unknown'}`;
+    renderContext(data);
+    await loadState();
+  } catch (err) {
+    pending.querySelector('.bubble').textContent = err.message;
+    pending.querySelector('.meta').textContent = 'error';
+  }
+}
+
+form.addEventListener('submit', (event) => {
+  event.preventDefault();
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  sendMessage(text);
+});
+
+input.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && !event.shiftKey) {
+    event.preventDefault();
+    form.requestSubmit();
+  }
+});
+
+refreshButton.addEventListener('click', loadState);
+addMessage('assistant', 'Merhaba. Ben BBB-Lite Assistant Console. Memory, role, Mission Control ve checkpoint bağlamıyla cevap veririm.', 'BBB-Lite');
+loadState();
+</script>
+</body>
+</html>

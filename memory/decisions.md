@@ -118,3 +118,10 @@
   (port 8080+5173) ayrı tutuldu - Codex'in önerisi: Canvas ilişki-görselleştirme,
   Demo Console durum/kanıt gösterimi, farklı amaçlar. HOSNI yerine yerel SQLite
   okuyan aynı 'local eşdeğer' mantığı.**
+
+- **2026-07-24 - Assistant Console eklendi (bin/assistant_server.py, port 8100):
+  bu artık dashboard değil, BBB-Lite ile konuşulan gerçek web yüzeyi. Tarayıcı
+  Claude hesabına doğrudan bağlanmaz; backend mevcut Claude Code CLI oturumunu
+  (`claude -p`) kullanır, yoksa Ollama'ya fail-soft düşer. Her cevap önce rol,
+  checkpoint, açık görevler, keyword memory ve semantic memory context'i toplar;
+  cevap sonrası lifecycle checkpoint yazar.**
