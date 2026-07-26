@@ -88,3 +88,13 @@
   biz all-MiniLM-L6-v2 (küçük, hafif) - bu, Stage'de zaten bilinçli bir karar olarak
   not edilmişti (donanım/hız), model boyutu farkı dışında Graph memory mekanizması
   artık eşdeğer.**
+
+- **2026-07-24 - "Hooks .disabled, demo gerçek Claude lifecycle'a bağlı değil"
+  bulgusu (Codex): bu YANLIŞ/eksik bir tespit. Hook'lar bilerek .disabled
+  tutuluyor (geliştirme sırasında kendi checkpoint/session verisinin karışmaması
+  için, bkz. erken karar) - ama önce GERÇEK, canlı olarak test edildi: /clear
+  sonrası checkpoint hatırlama, gerçek ollama ile judge verdict, gerçek claude -p
+  ile dispatch, gerçek role_declare ile brozzer->builder geçişi (Stage N). Yani
+  "çalışmıyor" değil, "test edilip kanıtlanmış, sonra geliştirme kolaylığı için
+  kapatılmış" - .disabled uzantısını kaldırmak tek satırlık bir işlem, herhangi
+  bir an aktif edilebilir.**
