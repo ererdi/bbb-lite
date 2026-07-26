@@ -37,6 +37,7 @@ class AssistantAnswerTestCase(unittest.TestCase):
                 "checkpoint": None,
                 "keyword_memory": [],
                 "semantic_memory": [],
+                "graph_memory": [],
                 "open_tasks": [],
             },
         )
@@ -123,6 +124,7 @@ class CollectContextTestCase(unittest.TestCase):
             mock.patch("assistant_server.mc.get_role", return_value="builder"), \
             mock.patch("assistant_server.mc.search_memory", return_value=[{"title": "kw"}]), \
             mock.patch("assistant_server.mc.semantic_search", return_value=[{"title": "sem"}]), \
+            mock.patch("assistant_server.mc.graph_memory_search", return_value=[{"title": "graph"}]), \
             mock.patch("assistant_server.mc.list_tasks", return_value=[{"id": 1, "status": "todo"}]), \
             mock.patch("assistant_server.mc.latest_checkpoint", return_value={"risk": "low"}):
             context = assistant_server.collect_context("you are the builder", "web")
@@ -131,6 +133,7 @@ class CollectContextTestCase(unittest.TestCase):
         self.assertEqual("builder", context["role"])
         self.assertEqual([{"title": "kw"}], context["keyword_memory"])
         self.assertEqual([{"title": "sem"}], context["semantic_memory"])
+        self.assertEqual([{"title": "graph"}], context["graph_memory"])
 
 
 class PromptTestCase(unittest.TestCase):
@@ -144,6 +147,7 @@ class PromptTestCase(unittest.TestCase):
                 "checkpoint": None,
                 "keyword_memory": [],
                 "semantic_memory": [],
+                "graph_memory": [],
                 "open_tasks": [],
             },
         )
@@ -169,6 +173,7 @@ class BuildStateTestCase(unittest.TestCase):
             mock.patch("assistant_server.mc.list_agent_outputs", return_value=[]), \
             mock.patch("assistant_server.mc.list_events", return_value=[]), \
             mock.patch("assistant_server.mc.list_evidence", return_value=[]), \
+            mock.patch("assistant_server.mc.graph_stats", return_value={"nodes": 0, "edges": 0}), \
             mock.patch("assistant_server.shutil.which", return_value=r"C:\bin\claude.CMD"):
             state = assistant_server.build_state("web")
         self.assertTrue(state["claude_cli_available"])

@@ -134,6 +134,13 @@
   fikirlerinin HOSNI'siz yerel esdegeridir. Voice yine bilincli kapsam disi:
   once text assistant + MC izleri kanitlanacak.
 
+- **2026-07-26 - Stage R graph memory eklendi:** Stage E semantic_search sadece
+  "benzer dokuman bulma" idi; artik `graph_nodes` + `graph_edges` ile gercek
+  typed-edge graph katmani var. Haroon'daki `graph/edges.jsonl`,
+  `graph_edges`, hop-capped traversal ve trusted edge vocabulary mantiginin
+  lokal SQLite karsiligi kuruldu. HOSNI graph service yok; ayni fikir yerel
+  `mc.db` icinde calisiyor.
+
 - **2026-07-24 - Voice bilinçli olarak bu stage dışında bırakıldı; Brozzer parity
   planı eklendi (docs/brozzer-parity-plan.md). Gerekçe: voice ayrı bir ürün
   yüzeyi; STT/TTS, mic izinleri, latency, barge-in, port izolasyonu ve ayrı

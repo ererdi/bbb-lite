@@ -88,6 +88,25 @@ The important boundary remains: BBB-Lite still does not connect to HOSNI. The
 same lifecycle idea is represented locally in SQLite so it can be demonstrated
 and tested on Erdi's machine.
 
+## Stage R: Graph memory
+
+Stage E semantic search was not a full graph. It answered "what is similar?"
+using embeddings stored in `memory_index`.
+
+Stage R adds the missing relation layer:
+- `graph_nodes` stores memory docs, concepts, and explicit architecture
+  components.
+- `graph_edges` stores typed relationships, using Haroon's trusted vocabulary:
+  `depends-on`, `evidence-for`, `supersedes`, `contradicts`, `derived-from`.
+- Memory indexing creates doc/concept nodes and auto edges for keywords and
+  wikilinks.
+- `graph/edges.jsonl` is the local explicit edge source, mirroring Haroon's
+  synced `graph/edges.jsonl`.
+- Traversal is hop-capped at 2, like Haroon's v1 traversal boundary.
+
+This is still local and HOSNI-free, but it is no longer only vector recall. It
+can answer dependency and impact questions from explicit typed edges.
+
 ## Demo wording
 
 "This is not full Haroon Brozzer yet. I intentionally skipped voice in this

@@ -12,6 +12,7 @@ tasks.status='done'; only complete_task() may do that.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import re
 import sqlite3
@@ -28,6 +29,8 @@ DB_PATH = Path(__file__).resolve().parent / "mc.db"
 _EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 _embedding_model: Any = None
 _embedding_unavailable = False
+GRAPH_EDGE_TYPES = ("supersedes", "depends-on", "evidence-for", "contradicts", "derived-from")
+GRAPH_MAX_HOPS = 2
 
 DEFAULT_CAPABILITY_BOUNDARIES = {
     "hosni": "Local prototype only; HOSNI durable dispatch is not connected.",
@@ -475,6 +478,34 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 updated_at TEXT NOT NULL
             )"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS graph_nodes (
+                node_id TEXT PRIMARY KEY,
+                node_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                source_ref TEXT,
+                content_hash TEXT,
+                metadata_json TEXT,
+                updated_at TEXT NOT NULL,
+                indexed_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS graph_edges (
+                src TEXT NOT NULL,
+                dst TEXT NOT NULL,
+                type TEXT NOT NULL,
+                evidence TEXT,
+                weight REAL NOT NULL DEFAULT 1.0,
+                source_ref TEXT,
+                authority TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (src, dst, type)
+            )"""
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS graph_edges_src ON graph_edges(src, type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS graph_edges_dst ON graph_edges(dst, type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS graph_nodes_type ON graph_nodes(node_type)")
         for capability, reason in DEFAULT_CAPABILITY_BOUNDARIES.items():
             conn.execute(
                 """INSERT OR IGNORE INTO capability_boundaries
@@ -962,6 +993,360 @@ def list_capability_boundaries(db_path: Path = DB_PATH) -> list[dict]:
     ]
 
 
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _slug(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+    return slug or "unknown"
+
+
+def _graph_node_id(node_type: str, ref: str) -> str:
+    return f"{node_type}:{_slug(ref)}"
+
+
+def _authority_class_for_edge(edge_type: str, authority: str | None = None) -> str:
+    if authority:
+        return authority
+    if edge_type in GRAPH_EDGE_TYPES:
+        return "trusted-typed"
+    if edge_type == "links-to":
+        return "low-trust-navigation"
+    if edge_type == "mentions":
+        return "auto-keyword"
+    return "unclassified"
+
+
+def _upsert_graph_node(
+    conn: sqlite3.Connection,
+    node_id: str,
+    node_type: str,
+    title: str,
+    *,
+    source_ref: str | None = None,
+    content_hash: str | None = None,
+    metadata: dict | None = None,
+) -> None:
+    now = _now()
+    conn.execute(
+        """INSERT INTO graph_nodes
+           (node_id, node_type, title, source_ref, content_hash, metadata_json, updated_at, indexed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(node_id) DO UPDATE SET
+               node_type = excluded.node_type,
+               title = excluded.title,
+               source_ref = excluded.source_ref,
+               content_hash = excluded.content_hash,
+               metadata_json = excluded.metadata_json,
+               updated_at = excluded.updated_at""",
+        (
+            node_id,
+            node_type,
+            title,
+            source_ref,
+            content_hash,
+            json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True),
+            now,
+            now,
+        ),
+    )
+
+
+def _upsert_graph_edge(
+    conn: sqlite3.Connection,
+    src: str,
+    dst: str,
+    edge_type: str,
+    *,
+    evidence: str | None = None,
+    weight: float = 1.0,
+    source_ref: str | None = None,
+    authority: str | None = None,
+) -> None:
+    src, dst, edge_type = src.strip(), dst.strip(), edge_type.strip()
+    if not src or not dst or not edge_type:
+        raise ValueError("graph edge needs non-empty src, dst, and type")
+    authority_class = _authority_class_for_edge(edge_type, authority)
+    conn.execute(
+        """INSERT INTO graph_edges
+           (src, dst, type, evidence, weight, source_ref, authority, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(src, dst, type) DO UPDATE SET
+               evidence = excluded.evidence,
+               weight = excluded.weight,
+               source_ref = excluded.source_ref,
+               authority = excluded.authority,
+               updated_at = excluded.updated_at""",
+        (src, dst, edge_type, evidence, float(weight), source_ref, authority_class, _now()),
+    )
+
+
+def _wiki_links(text: str) -> list[str]:
+    links = []
+    for raw in re.findall(r"\[\[([^\]]+)\]\]", text):
+        label = raw.split("|", 1)[0].strip()
+        if label:
+            links.append(label)
+    return list(dict.fromkeys(links))
+
+
+def _upsert_memory_graph(
+    conn: sqlite3.Connection,
+    source_file: str,
+    title: str,
+    body: str,
+    keywords: str,
+) -> None:
+    doc_id = _graph_node_id("doc", source_file)
+    content_hash = _sha256_text(f"{title}\n{body}")
+    _upsert_graph_node(
+        conn,
+        doc_id,
+        "doc",
+        title,
+        source_ref=source_file,
+        content_hash=content_hash,
+        metadata={"source": "memory"},
+    )
+    conn.execute(
+        "DELETE FROM graph_edges WHERE source_ref = ? AND authority IN ('auto-keyword', 'low-trust-navigation')",
+        (source_file,),
+    )
+    for keyword in [part.strip() for part in keywords.split(",") if part.strip()]:
+        concept_id = _graph_node_id("concept", keyword)
+        _upsert_graph_node(
+            conn,
+            concept_id,
+            "concept",
+            keyword,
+            source_ref=f"keyword:{keyword}",
+            metadata={"source": "memory-keyword"},
+        )
+        _upsert_graph_edge(
+            conn,
+            doc_id,
+            concept_id,
+            "mentions",
+            evidence=f"keyword extracted from {source_file}",
+            weight=0.4,
+            source_ref=source_file,
+            authority="auto-keyword",
+        )
+    for label in _wiki_links(body):
+        target_id = _graph_node_id("concept", label)
+        _upsert_graph_node(
+            conn,
+            target_id,
+            "concept",
+            label,
+            source_ref=f"wikilink:{label}",
+            metadata={"source": "memory-wikilink"},
+        )
+        _upsert_graph_edge(
+            conn,
+            doc_id,
+            target_id,
+            "links-to",
+            evidence=f"wikilink in {source_file}",
+            weight=0.6,
+            source_ref=source_file,
+            authority="low-trust-navigation",
+        )
+
+
+def load_graph_edges(
+    edge_path: Path | None = None, *, db_path: Path = DB_PATH
+) -> dict:
+    """Load explicit graph/edges.jsonl edges, mirroring Haroon's synced edge source."""
+
+    init_db(db_path)
+    path = edge_path or (Path(__file__).resolve().parent / "graph" / "edges.jsonl")
+    if not path.exists():
+        return {"loaded": 0, "skipped": 0, "unknown_types": [], "source_missing": True}
+    loaded = skipped = 0
+    unknown: set[str] = set()
+    with contextlib.closing(_connect(db_path)) as conn:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                edge = json.loads(line)
+            except json.JSONDecodeError:
+                skipped += 1
+                continue
+            src = str(edge.get("src") or "").strip()
+            dst = str(edge.get("dst") or "").strip()
+            edge_type = str(edge.get("type") or "").strip()
+            if not src or not dst or not edge_type:
+                skipped += 1
+                continue
+            if edge_type not in GRAPH_EDGE_TYPES:
+                unknown.add(edge_type)
+            _upsert_graph_node(
+                conn,
+                src,
+                "component",
+                src,
+                source_ref=edge.get("source_ref") or str(path.name),
+                metadata={"source": "explicit-edge"},
+            )
+            _upsert_graph_node(
+                conn,
+                dst,
+                "component",
+                dst,
+                source_ref=edge.get("source_ref") or str(path.name),
+                metadata={"source": "explicit-edge"},
+            )
+            _upsert_graph_edge(
+                conn,
+                src,
+                dst,
+                edge_type,
+                evidence=edge.get("evidence"),
+                weight=float(edge.get("weight", 1.0)),
+                source_ref=edge.get("source_ref") or str(path.name),
+                authority="trusted-typed" if edge_type in GRAPH_EDGE_TYPES else None,
+            )
+            loaded += 1
+        conn.commit()
+    return {"loaded": loaded, "skipped": skipped, "unknown_types": sorted(unknown)}
+
+
+def list_graph_nodes(
+    node_type: str | None = None, *, limit: int = 100, db_path: Path = DB_PATH
+) -> list[dict]:
+    with contextlib.closing(_connect(db_path)) as conn:
+        if node_type is None:
+            rows = conn.execute(
+                "SELECT * FROM graph_nodes ORDER BY node_type, title LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM graph_nodes WHERE node_type = ? ORDER BY title LIMIT ?",
+                (node_type, limit),
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_graph_edges(
+    edge_type: str | None = None, *, limit: int = 100, db_path: Path = DB_PATH
+) -> list[dict]:
+    with contextlib.closing(_connect(db_path)) as conn:
+        if edge_type is None:
+            rows = conn.execute(
+                "SELECT * FROM graph_edges ORDER BY updated_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM graph_edges WHERE type = ? ORDER BY updated_at DESC LIMIT ?",
+                (edge_type, limit),
+            ).fetchall()
+    return [dict(row) for row in reversed(rows)]
+
+
+def graph_stats(db_path: Path = DB_PATH) -> dict:
+    with contextlib.closing(_connect(db_path)) as conn:
+        node_count = conn.execute("SELECT COUNT(*) FROM graph_nodes").fetchone()[0]
+        edge_count = conn.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0]
+        by_type = {
+            row["type"]: row["count"]
+            for row in conn.execute(
+                "SELECT type, COUNT(*) AS count FROM graph_edges GROUP BY type ORDER BY count DESC"
+            ).fetchall()
+        }
+        by_authority = {
+            row["authority"]: row["count"]
+            for row in conn.execute(
+                "SELECT authority, COUNT(*) AS count FROM graph_edges GROUP BY authority ORDER BY count DESC"
+            ).fetchall()
+        }
+    return {
+        "nodes": node_count,
+        "edges": edge_count,
+        "by_type": by_type,
+        "by_authority": by_authority,
+    }
+
+
+def traverse_graph(
+    start: str,
+    *,
+    edge_types: Iterable[str] | None = None,
+    direction: str = "out",
+    hops: int = GRAPH_MAX_HOPS,
+    db_path: Path = DB_PATH,
+) -> list[dict]:
+    """Breadth-first typed-edge traversal, capped like Haroon's graph v2."""
+
+    hops = max(1, min(int(hops), GRAPH_MAX_HOPS))
+    selected_types = list(edge_types or [])
+    result: list[dict] = []
+    frontier: list[tuple[str, int]] = [(start, 0)]
+    seen: set[tuple[str, str, str, int]] = set()
+    with contextlib.closing(_connect(db_path)) as conn:
+        while frontier:
+            node, depth = frontier.pop(0)
+            if depth >= hops:
+                continue
+            col, want = ("src", "dst") if direction == "out" else ("dst", "src")
+            sql = (
+                f"SELECT {want} AS node, type, evidence, weight, source_ref, authority, updated_at "
+                f"FROM graph_edges WHERE {col} = ?"
+            )
+            params: list = [node]
+            if selected_types:
+                sql += " AND type IN (%s)" % ",".join("?" * len(selected_types))
+                params.extend(selected_types)
+            for row in conn.execute(sql, params).fetchall():
+                if row["node"] == start:
+                    continue
+                key = (row["node"], node, row["type"], depth + 1)
+                if key in seen:
+                    continue
+                seen.add(key)
+                item = dict(row)
+                item["hop"] = depth + 1
+                item["via"] = node
+                result.append(item)
+                frontier.append((row["node"], depth + 1))
+    result.sort(key=lambda row: (-(row["weight"] or 0.0), row["hop"], row["node"]))
+    return result
+
+
+def graph_depends_on(node: str, *, hops: int = GRAPH_MAX_HOPS, db_path: Path = DB_PATH) -> list[dict]:
+    return traverse_graph(node, edge_types=["depends-on"], direction="out", hops=hops, db_path=db_path)
+
+
+def graph_impact(node: str, *, hops: int = GRAPH_MAX_HOPS, db_path: Path = DB_PATH) -> list[dict]:
+    return traverse_graph(node, edge_types=["depends-on"], direction="in", hops=hops, db_path=db_path)
+
+
+def graph_memory_search(query: str, *, limit: int = 3, hops: int = 1, db_path: Path = DB_PATH) -> list[dict]:
+    """Recall memory hits plus their graph neighborhood."""
+
+    hits = search_memory(query, limit=limit, db_path=db_path)
+    if len(hits) < limit:
+        with contextlib.suppress(Exception):
+            for hit in semantic_search(query, limit=limit, db_path=db_path):
+                if not any(existing["source_file"] == hit["source_file"] for existing in hits):
+                    hits.append(hit)
+                if len(hits) >= limit:
+                    break
+    enriched = []
+    for hit in hits[:limit]:
+        node_id = _graph_node_id("doc", hit["source_file"])
+        item = dict(hit)
+        item["node_id"] = node_id
+        item["related"] = traverse_graph(node_id, hops=hops, db_path=db_path)
+        enriched.append(item)
+    return enriched
+
+
 def pick_next_action(db_path: Path = DB_PATH) -> str | None:
     """"Next: <title>" for the oldest open task, or None if there isn't one."""
 
@@ -1282,6 +1667,7 @@ def index_memory_files(db_path: Path = DB_PATH) -> int:
                        embedding = excluded.embedding""",
                 (path.name, title, body, keywords, embedding),
             )
+            _upsert_memory_graph(conn, path.name, title, body, keywords)
             count += 1
         conn.commit()
     return count

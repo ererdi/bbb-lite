@@ -1,0 +1,10 @@
+{"src":"bbb-lite-assistant","dst":"mission-control","type":"depends-on","evidence":"Assistant Console reads role, tasks, checkpoints, memory, and trace from local SQLite MC."}
+{"src":"bbb-lite-assistant","dst":"claude-cli","type":"depends-on","evidence":"Assistant backend calls the user's authenticated Claude CLI first."}
+{"src":"bbb-lite-assistant","dst":"ollama-fallback","type":"depends-on","evidence":"Ollama remains opt-in fallback when Claude CLI is unavailable."}
+{"src":"mission-control","dst":"guarded-sqlite","type":"depends-on","evidence":"tasks.status='done' is guarded and only complete_task() may complete work."}
+{"src":"memory-system","dst":"memory-index","type":"depends-on","evidence":"Keyword and semantic recall are served from memory_index."}
+{"src":"graph-memory","dst":"memory-system","type":"depends-on","evidence":"Memory files become graph doc nodes and concept edges during index_memory_files()."}
+{"src":"graph-memory","dst":"graph-nodes","type":"depends-on","evidence":"graph_nodes stores doc, concept, and component nodes in local SQLite."}
+{"src":"graph-memory","dst":"graph-edges","type":"depends-on","evidence":"graph_edges stores typed relations and traversal evidence in local SQLite."}
+{"src":"assistant-console","dst":"graph-memory","type":"depends-on","evidence":"Assistant state can show graph stats and graph-backed memory context."}
+{"src":"demo-console","dst":"evidence-ledger","type":"depends-on","evidence":"Demo Console shows tests, lifecycle, MC state, and proof rows."}

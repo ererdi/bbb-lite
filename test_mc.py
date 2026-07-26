@@ -40,7 +40,7 @@ class McTestCase(unittest.TestCase):
                 "sessions", "checkpoints", "tasks", "memory_index", "task_activity",
                 "projects", "sprints", "roles", "turns", "decision_packets",
                 "dispatch_runs", "agent_outputs", "evidence", "events_log",
-                "capability_boundaries",
+                "capability_boundaries", "graph_nodes", "graph_edges",
             },
             names,
         )
@@ -272,6 +272,39 @@ class McTestCase(unittest.TestCase):
         evidence = mc.list_evidence(db_path=self.db_path)
         self.assertEqual(evidence_id, evidence[-1]["id"])
         self.assertEqual("passed", evidence[-1]["status"])
+
+    def test_load_graph_edges_and_traverse_dependencies(self) -> None:
+        edge_file = self.db_path.with_suffix(".jsonl")
+        edge_file.write_text(
+            '{"src":"assistant","dst":"mission-control","type":"depends-on","evidence":"reads MC"}\n'
+            '{"src":"mission-control","dst":"guarded-sqlite","type":"depends-on","evidence":"guarded writes"}\n',
+            encoding="utf-8",
+        )
+        try:
+            result = mc.load_graph_edges(edge_file, db_path=self.db_path)
+            deps = mc.graph_depends_on("assistant", db_path=self.db_path)
+            impact = mc.graph_impact("guarded-sqlite", db_path=self.db_path)
+        finally:
+            edge_file.unlink(missing_ok=True)
+        self.assertEqual(2, result["loaded"])
+        self.assertEqual(["mission-control", "guarded-sqlite"], [row["node"] for row in deps])
+        self.assertEqual(["mission-control", "assistant"], [row["node"] for row in impact])
+
+    def test_graph_stats_counts_nodes_edges_and_authority(self) -> None:
+        edge_file = self.db_path.with_suffix(".jsonl")
+        edge_file.write_text(
+            '{"src":"a","dst":"b","type":"depends-on","evidence":"fixture"}\n',
+            encoding="utf-8",
+        )
+        try:
+            mc.load_graph_edges(edge_file, db_path=self.db_path)
+        finally:
+            edge_file.unlink(missing_ok=True)
+        stats = mc.graph_stats(db_path=self.db_path)
+        self.assertEqual(2, stats["nodes"])
+        self.assertEqual(1, stats["edges"])
+        self.assertEqual(1, stats["by_type"]["depends-on"])
+        self.assertEqual(1, stats["by_authority"]["trusted-typed"])
 
     def test_add_task_with_done_status_refused(self) -> None:
         with self.assertRaises(mc.MCCompletionRefused):
@@ -664,6 +697,29 @@ class MemoryIndexTestCase(unittest.TestCase):
         self.assertEqual(
             {"a.md", "b.md"}, {row["source_file"] for row in rows}
         )
+
+    def test_index_memory_files_populates_graph_nodes_and_edges(self) -> None:
+        self._write_note(
+            "guard.md",
+            "Guard note",
+            "The guard blocks raw done writes and links to [[Mission Control]].",
+        )
+        mc.index_memory_files(db_path=self.db_path)
+        nodes = {row["node_id"]: row for row in mc.list_graph_nodes(db_path=self.db_path)}
+        edges = mc.list_graph_edges(db_path=self.db_path)
+        self.assertIn("doc:guard-md", nodes)
+        self.assertIn("concept:guard", nodes)
+        self.assertIn("concept:mission-control", nodes)
+        self.assertIn("mentions", {row["type"] for row in edges})
+        self.assertIn("links-to", {row["type"] for row in edges})
+
+    def test_graph_memory_search_returns_related_nodes(self) -> None:
+        self._write_note("guard.md", "Guard note", "The guard blocks raw done writes.")
+        mc.index_memory_files(db_path=self.db_path)
+        results = mc.graph_memory_search("guard", db_path=self.db_path)
+        self.assertEqual("guard.md", results[0]["source_file"])
+        self.assertTrue(results[0]["related"])
+        self.assertEqual("doc:guard-md", results[0]["node_id"])
 
     def test_index_memory_files_upserts_without_duplicating_on_rerun(self) -> None:
         self._write_note("a.md", "Guard note", "The guard blocks raw done writes.")

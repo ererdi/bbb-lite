@@ -168,6 +168,7 @@ def collect_context(message: str, session_id: str, *, db_path: Path = mc.DB_PATH
     role = mc.get_role(session_id, db_path=db_path)
     keyword_hits = _safe_call([], mc.search_memory, message, limit=3, db_path=db_path)
     semantic_hits = _safe_call([], mc.semantic_search, message, limit=3, db_path=db_path)
+    graph_hits = _safe_call([], mc.graph_memory_search, message, limit=2, db_path=db_path)
     tasks = _safe_call([], mc.list_tasks, db_path=db_path)
     open_tasks = [task for task in tasks if task.get("status") != "done"][:5]
 
@@ -179,6 +180,7 @@ def collect_context(message: str, session_id: str, *, db_path: Path = mc.DB_PATH
         "checkpoint": _safe_call(None, mc.latest_checkpoint, session_id, db_path=db_path),
         "keyword_memory": keyword_hits,
         "semantic_memory": semantic_hits,
+        "graph_memory": graph_hits,
         "open_tasks": open_tasks,
     }
 
@@ -238,6 +240,9 @@ Keyword memory:
 
 Semantic memory:
 {_memory_lines(context['semantic_memory'])}
+
+Graph memory:
+{_memory_lines(context['graph_memory'])}
 
 User message:
 {message}
@@ -421,6 +426,7 @@ def build_state(session_id: str = DEFAULT_SESSION_ID, *, db_path: Path = mc.DB_P
             "events": _safe_call([], mc.list_events, limit=8, db_path=db_path),
             "evidence": _safe_call([], mc.list_evidence, limit=5, db_path=db_path),
             "capability_boundaries": boundaries,
+            "graph_stats": _safe_call({}, mc.graph_stats, db_path=db_path),
         },
     }
 

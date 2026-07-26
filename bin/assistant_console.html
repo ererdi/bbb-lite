@@ -299,6 +299,12 @@ function renderTrace(data) {
     '',
     `turns ${trace.turns?.length || 0} / decisions ${trace.decision_packets?.length || 0} / dispatch ${trace.dispatch_runs?.length || 0} / evidence ${trace.evidence?.length || 0}`
   ));
+  const graph = trace.graph_stats || {};
+  counts.appendChild(el(
+    'div',
+    '',
+    `graph nodes ${graph.nodes ?? 0} / graph edges ${graph.edges ?? 0}`
+  ));
   traceBox.appendChild(counts);
   traceBox.appendChild(compactRows(
     'Recent turns',
@@ -374,6 +380,7 @@ function renderContext(result) {
   contextBox.appendChild(engine);
   contextBox.appendChild(memoryList('Keyword memory', ctx.keyword_memory));
   contextBox.appendChild(memoryList('Semantic memory', ctx.semantic_memory));
+  contextBox.appendChild(memoryList('Graph memory', ctx.graph_memory));
   const checkpoint = el('div', 'item');
   checkpoint.appendChild(el('strong', '', 'Checkpoint'));
   checkpoint.appendChild(el('div', '', ctx.checkpoint ? (ctx.checkpoint.next_action || ctx.checkpoint.last_decision || 'available') : 'none'));
