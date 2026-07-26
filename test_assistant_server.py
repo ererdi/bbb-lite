@@ -56,8 +56,19 @@ class AssistantAnswerTestCase(unittest.TestCase):
         ollama.assert_not_called()
         checkpoint.assert_called_once()
 
-    def test_ollama_fallback_when_claude_unavailable(self) -> None:
+    def test_local_guarded_fallback_when_claude_unavailable(self) -> None:
         with self._mock_context(), \
+            mock.patch("assistant_server.run_claude", return_value=None), \
+            mock.patch("assistant_server.mc.ask_ollama") as ollama, \
+            mock.patch("assistant_server.mc.write_checkpoint"):
+            result = assistant_server.answer_message("hello", "web")
+        self.assertEqual("local-guarded", result["engine"])
+        self.assertIn("BBB-Lite context", result["answer"])
+        ollama.assert_not_called()
+
+    def test_ollama_is_opt_in_fallback(self) -> None:
+        with self._mock_context(), \
+            mock.patch.dict("assistant_server.os.environ", {"BBB_ASSISTANT_USE_OLLAMA": "1"}), \
             mock.patch("assistant_server.run_claude", return_value=None), \
             mock.patch("assistant_server.mc.ask_ollama", return_value="ollama answer"), \
             mock.patch("assistant_server.mc.write_checkpoint"):
@@ -71,8 +82,12 @@ class AssistantAnswerTestCase(unittest.TestCase):
             mock.patch("assistant_server.mc.ask_ollama", return_value=None), \
             mock.patch("assistant_server.mc.write_checkpoint"):
             result = assistant_server.answer_message("hello", "web")
-        self.assertEqual("unavailable", result["engine"])
-        self.assertIn("Cevap motoruna ulaşamadım", result["answer"])
+        self.assertEqual("local-guarded", result["engine"])
+        self.assertIn("BBB-Lite context", result["answer"])
+
+    def test_model_output_is_cleaned(self) -> None:
+        dirty = "\x1b[?25lhello\x1b[0m\x08"
+        self.assertEqual("hello", assistant_server._clean_model_output(dirty))
 
 
 class CollectContextTestCase(unittest.TestCase):
@@ -106,7 +121,7 @@ class PromptTestCase(unittest.TestCase):
                 "open_tasks": [],
             },
         )
-        self.assertIn("You do not have HOSNI, voice", prompt)
+        self.assertIn("You cannot access HOSNI, voice", prompt)
         self.assertIn("User message:", prompt)
 
 
