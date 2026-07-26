@@ -22,6 +22,7 @@ import mc
 
 HOST = "127.0.0.1"
 PORT = 8090
+EVIDENCE_TIMEOUT_SECONDS = 45
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MEMORY_DIR = REPO_ROOT / "memory"
 CONSOLE_HTML_PATH = Path(__file__).resolve().parent / "demo_console.html"
@@ -131,7 +132,7 @@ def _build_evidence() -> dict:
             capture_output=True,
             encoding="utf-8",
             errors="replace",
-            timeout=15,
+            timeout=EVIDENCE_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError):
         return {"tests": "unavailable"}
