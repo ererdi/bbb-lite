@@ -81,3 +81,10 @@
   Haroon'unkinden farkı: UUID yerine session_id kullanılıyor, persona metinleri yok
   (sadece izin matrisi), architect/advisor'ın 'data=True, code=False' ayrımı
   basitleştirilmiş durumda tutuluyor.**
+
+- **2026-07-24 - "Graph memory derinliği" bulgusu (Codex): bu büyük ölçüde ZATEN
+  ÇÖZÜLDÜ (Stage E, semantic_search() - gerçek sentence-transformers embedding'i,
+  anlam bazlı arama). Kalan tek fark: Haroon bge-m3 (büyük, özel model) kullanıyor,
+  biz all-MiniLM-L6-v2 (küçük, hafif) - bu, Stage'de zaten bilinçli bir karar olarak
+  not edilmişti (donanım/hız), model boyutu farkı dışında Graph memory mekanizması
+  artık eşdeğer.**
