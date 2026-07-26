@@ -98,3 +98,18 @@
   "çalışmıyor" değil, "test edilip kanıtlanmış, sonra geliştirme kolaylığı için
   kapatılmış" - .disabled uzantısını kaldırmak tek satırlık bir işlem, herhangi
   bir an aktif edilebilir.**
+
+- **2026-07-24 - "MC schema genişliği" bulgusu (Codex): bu bir kullanım eksikliği
+  değil, ölçek farkı. Haroon'un ~180 tablosuna karşı bizde 7 tablo var (sessions,
+  checkpoints, tasks, memory_index, task_activity, projects, sprints, roles).
+  Kalan tablolar (docs, events_log, inbox, bbb_completion_authority, CRM benzeri
+  yapılar) bilinçli olarak kapsam dışı - bunlar Haroon'un production sisteminin
+  aylarca birikmiş, çok daha büyük ihtiyaçlarına ait, bu projenin öğrenme/demo
+  amacına ek bir şey katmıyorlar.**
+
+- **2026-07-24 - "Canvas, Haroon'daki context-map/voice-sync seviyesinde değil"
+  bulgusu (Codex): doğru, iki sebepten - (a) voice-sync mümkün değil çünkü ses
+  altyapısı bilerek kapsam dışı bırakıldı, (b) context-map derinliği (curated
+  node/edge ilişkileri) Haroon'da elle onaylanan bir süreç - bizim Canvas'ımız
+  (Stage H) sessions/tasks/task_activity'yi otomatik gösteriyor, bu haliyle
+  amacına uygun ama Haroon'unki kadar zengin bir ilişki modeli yok.**
