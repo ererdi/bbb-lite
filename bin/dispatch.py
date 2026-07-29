@@ -1,15 +1,19 @@
-"""CLI: run a task through a two-role (architect/builder) headless simulation.
+"""CLI: run a task through a CTO -> architect/builder headless simulation.
 
-`classify()` (mc.py, Ollama-backed) decides whether the task needs an architect
-step first; if it can't decide, the task falls back to builder-only. Each role's
-turn is a fail-soft call to the Claude Agent SDK's `query()` — see
-memory/decisions.md for the move off `claude -p` (Claude Code CLI print-mode).
+The CTO step (Stage U) titles the task, opens it as a real mc.add_task(), and
+decides if it needs an architect first — the missing link in Haroon's
+Brozzer -> CTO -> architect -> builder chain. If the CTO doesn't answer or its
+reply doesn't parse, dispatch() falls back to the old classify()-based
+architect/builder split and never opens a task. Each role's turn is a
+fail-soft call to the Claude Agent SDK's `query()` — see memory/decisions.md
+for the move off `claude -p` (Claude Code CLI print-mode).
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import sys
 from pathlib import Path
 
@@ -19,6 +23,12 @@ import mc
 
 from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock, query
 
+CTO_SYSTEM_PROMPT = (
+    "You are the CTO. Given this task request, write a short task title (one "
+    "line) and decide if it needs an architect step first or can go straight "
+    "to a builder. Respond in this exact format: TITLE: <title>\n"
+    "NEEDS_ARCHITECT: yes|no"
+)
 ARCHITECT_SYSTEM_PROMPT = (
     "You are the architect in a two-role dev workflow. In 3-4 sentences, give a "
     "short plan for the following task. Do not write code."
@@ -28,6 +38,27 @@ BUILDER_SYSTEM_PROMPT = (
     "the code change you would make for the following task.{plan_context}"
 )
 DISPATCH_SESSION_ID = "dispatch-cli"
+
+_CTO_TITLE_RE = re.compile(r"^\s*TITLE:\s*(.+?)\s*$", re.I | re.M)
+_CTO_NEEDS_ARCHITECT_RE = re.compile(r"^\s*NEEDS_ARCHITECT:\s*(yes|no)\s*$", re.I | re.M)
+
+
+def _parse_cto_response(text: str) -> tuple[str, bool] | None:
+    """Parse the CTO's 'TITLE: ...\\nNEEDS_ARCHITECT: yes|no' reply.
+
+    None on anything that doesn't cleanly match both lines (or gives an empty
+    title) — dispatch() must fall back to classify() rather than guess at a
+    malformed CTO answer or open a task with a blank title.
+    """
+
+    title_match = _CTO_TITLE_RE.search(text)
+    needs_match = _CTO_NEEDS_ARCHITECT_RE.search(text)
+    if not title_match or not needs_match:
+        return None
+    title = title_match.group(1).strip()
+    if not title:
+        return None
+    return title, needs_match.group(1).lower() == "yes"
 
 
 def _safe_mc(default, func, *args, **kwargs):
@@ -68,16 +99,32 @@ async def dispatch(task: str) -> None:
         status="running",
         summary=task,
     )
-    role_needed = mc.classify(
-        f"Task: {task}\nDoes this task need an architect to plan it first, or can "
-        "a builder just implement it directly?",
-        ["architect", "builder"],
-    )
-    if role_needed is None:
-        role_needed = "builder"
-    print(f"[dispatch] role=classify -> {role_needed}")
-    if run_id:
-        _safe_mc(None, mc.record_agent_output, run_id, "classifier", role_needed)
+    task_id = None
+    cto_reply = await run_claude(f"Task: {task}", system_prompt=CTO_SYSTEM_PROMPT)
+    parsed_cto = _parse_cto_response(cto_reply) if cto_reply is not None else None
+
+    if parsed_cto is not None:
+        title, needs_architect = parsed_cto
+        print(
+            f"[dispatch] role=cto -> {title} "
+            f"(architect: {'yes' if needs_architect else 'no'})"
+        )
+        if run_id:
+            _safe_mc(None, mc.record_agent_output, run_id, "cto", cto_reply)
+        task_id = _safe_mc(None, mc.add_task, title, session_id=DISPATCH_SESSION_ID)
+        role_needed = "architect" if needs_architect else "builder"
+    else:
+        print("[dispatch] role=cto -> unavailable, falling back to classify()")
+        role_needed = mc.classify(
+            f"Task: {task}\nDoes this task need an architect to plan it first, or can "
+            "a builder just implement it directly?",
+            ["architect", "builder"],
+        )
+        if role_needed is None:
+            role_needed = "builder"
+        print(f"[dispatch] role=classify -> {role_needed}")
+        if run_id:
+            _safe_mc(None, mc.record_agent_output, run_id, "classifier", role_needed)
 
     plan_context = ""
     if role_needed == "architect":
@@ -104,6 +151,8 @@ async def dispatch(task: str) -> None:
         print(f"[dispatch] role=builder -> {change}")
         if run_id:
             _safe_mc(None, mc.record_agent_output, run_id, "builder", change)
+        if task_id is not None:
+            _safe_mc(None, mc.complete_task, task_id, session_id=DISPATCH_SESSION_ID)
 
     if run_id:
         status = "completed" if change is not None else "needs_attention"

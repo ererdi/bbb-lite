@@ -176,3 +176,8 @@
   mimarinin gerçek bir sınırlaması olarak açıkça not ediliyor - eğer proje
   çok kullanıcılı hale gelirse, bu loop'un merkezi bir sunucuya taşınması
   gerekir.
+
+- **2026-07-29 - dispatch.py'ye CTO katmanı eklendi (Stage U)** -
+  Brozzer->CTO->architect->builder zincirinin eksik halkasıydı. CTO artık
+  gerçek bir MC task açıyor, builder onu tamamlayınca kapatıyor - "doğar,
+  MC'ye yazar, ölür" döngüsü artık tam.
