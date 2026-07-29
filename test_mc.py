@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import subprocess
 import tempfile
 import unittest
@@ -42,6 +43,7 @@ class McTestCase(unittest.TestCase):
                 "dispatch_runs", "agent_outputs", "evidence", "events_log",
                 "capability_boundaries", "graph_nodes", "graph_edges",
                 "answer_quality_scores", "answer_receipts", "lifecycle_runs",
+                "decisions", "compact_snapshots",
             },
             names,
         )
@@ -1126,6 +1128,100 @@ class StageNTestCase(unittest.TestCase):
         mc.set_role("s2", "advisor", db_path=self.db_path)
         self.assertEqual("builder", mc.get_role("s1", db_path=self.db_path))
         self.assertEqual("advisor", mc.get_role("s2", db_path=self.db_path))
+
+
+def _seed_20_tracked_items(db_path: Path, session_id: str) -> None:
+    """5 open tasks + 10 decisions + role declared (1) + 4 checklist items = 20."""
+
+    for i in range(5):
+        mc.add_task(f"task {i}", db_path=db_path)
+    for i in range(10):
+        mc.add_decision(
+            f"decision {i}", session_id=session_id, db_path=db_path,
+            md_path=db_path.parent / f"{db_path.stem}-decisions.md",
+        )
+    mc.set_role(session_id, "builder", db_path=db_path)
+    mc.write_checkpoint(
+        session_id, open_queue=json.dumps(["a", "b", "c", "d"]), db_path=db_path,
+    )
+
+
+class StageRTestCase(unittest.TestCase):
+    """Stage R: decisions table, compact_snapshot/save_snapshot/compare_snapshots.
+
+    NOT fail-soft on purpose (unlike most of this project) — a missing
+    snapshot must surface as a finding, never pass silently. See
+    memory/decisions.md, 2026-07-27.
+    """
+
+    def setUp(self) -> None:
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        self.db_path = Path(tmp.name)
+        self.db_path.unlink()
+        mc.init_db(self.db_path)
+        self.md_path = self.db_path.parent / f"{self.db_path.stem}-decisions.md"
+        self.session_id = "s-stage-r"
+        mc.ensure_session(self.session_id, db_path=self.db_path)
+
+    def tearDown(self) -> None:
+        self.db_path.unlink(missing_ok=True)
+        self.md_path.unlink(missing_ok=True)
+
+    def test_add_decision_writes_row_and_md_file(self) -> None:
+        mc.add_decision(
+            "chose SQLite", session_id=self.session_id,
+            db_path=self.db_path, md_path=self.md_path,
+        )
+        rows = mc.list_decisions(self.session_id, db_path=self.db_path)
+        self.assertEqual(1, len(rows))
+        self.assertEqual("chose SQLite", rows[0]["text"])
+        self.assertIn("chose SQLite", self.md_path.read_text(encoding="utf-8"))
+
+    def test_compact_snapshot_counts_20_tracked_items(self) -> None:
+        _seed_20_tracked_items(self.db_path, self.session_id)
+        snapshot = mc.compact_snapshot(self.session_id, db_path=self.db_path)
+        total = (
+            len(snapshot["tasks"]) + snapshot["decisions"]
+            + snapshot["checklist_items"] + (1 if snapshot["role_declared"] else 0)
+        )
+        self.assertEqual(20, total)
+        self.assertTrue(snapshot["role_declared"])
+
+    def test_save_snapshot_rejects_unknown_phase(self) -> None:
+        with self.assertRaises(ValueError):
+            mc.save_snapshot(self.session_id, "during", db_path=self.db_path)
+
+    def test_compare_snapshots_20_of_20_no_loss(self) -> None:
+        _seed_20_tracked_items(self.db_path, self.session_id)
+        mc.save_snapshot(self.session_id, "pre", db_path=self.db_path)
+        mc.save_snapshot(self.session_id, "post", db_path=self.db_path)
+        self.assertEqual([], mc.compare_snapshots(self.session_id, db_path=self.db_path))
+
+    def test_compare_snapshots_detects_one_missing_task(self) -> None:
+        _seed_20_tracked_items(self.db_path, self.session_id)
+        task_ids = [t["id"] for t in mc.list_open_tasks(db_path=self.db_path)]
+        mc.save_snapshot(self.session_id, "pre", db_path=self.db_path)
+        mc.complete_task(task_ids[0], db_path=self.db_path)  # the "loss"
+        mc.save_snapshot(self.session_id, "post", db_path=self.db_path)
+        findings = mc.compare_snapshots(self.session_id, db_path=self.db_path)
+        self.assertEqual(1, len(findings))
+        self.assertIn("tasks: 5 -> 4", findings[0])
+        self.assertIn(str(task_ids[0]), findings[0])
+
+    def test_compare_snapshots_missing_pre_snapshot_is_itself_a_finding(self) -> None:
+        mc.save_snapshot(self.session_id, "post", db_path=self.db_path)
+        findings = mc.compare_snapshots(self.session_id, db_path=self.db_path)
+        self.assertEqual(1, len(findings))
+        self.assertIn("no 'pre'", findings[0])
+
+    def test_mark_session_degraded_sets_status(self) -> None:
+        mc.mark_session_degraded(self.session_id, db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            status = conn.execute(
+                "SELECT status FROM sessions WHERE session_id = ?", (self.session_id,)
+            ).fetchone()[0]
+        self.assertEqual("degraded", status)
 
 
 if __name__ == "__main__":

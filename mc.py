@@ -26,6 +26,7 @@ from typing import Any, Iterable
 import numpy as np
 
 DB_PATH = Path(__file__).resolve().parent / "mc.db"
+DECISIONS_MD_PATH = Path(__file__).resolve().parent / "memory" / "decisions.md"
 _EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 _embedding_model: Any = None
 _embedding_unavailable = False
@@ -579,12 +580,31 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 created_at TEXT NOT NULL
             )"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                text TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS compact_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                phase TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                taken_at TEXT NOT NULL
+            )"""
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS graph_edges_src ON graph_edges(src, type)")
         conn.execute("CREATE INDEX IF NOT EXISTS graph_edges_dst ON graph_edges(dst, type)")
         conn.execute("CREATE INDEX IF NOT EXISTS graph_nodes_type ON graph_nodes(node_type)")
         conn.execute("CREATE INDEX IF NOT EXISTS answer_quality_session ON answer_quality_scores(session_id, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS answer_receipts_session ON answer_receipts(session_id, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS lifecycle_runs_session ON lifecycle_runs(session_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS decisions_session ON decisions(session_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS compact_snapshots_session ON compact_snapshots(session_id, phase, taken_at)")
         for capability, reason in DEFAULT_CAPABILITY_BOUNDARIES.items():
             conn.execute(
                 """INSERT OR IGNORE INTO capability_boundaries
@@ -1289,6 +1309,53 @@ def list_lifecycle_runs(
     return [dict(row) for row in reversed(rows)]
 
 
+def _append_decision_md(text: str, path: Path = DECISIONS_MD_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(f"\n- {text}\n")
+
+
+def add_decision(
+    text: str,
+    session_id: str | None = None,
+    db_path: Path = DB_PATH,
+    md_path: Path = DECISIONS_MD_PATH,
+) -> int:
+    """Record a decision both as a queryable row and as a decisions.md bullet.
+
+    The table gives stable IDs to query/diff against (see compact_snapshot());
+    decisions.md stays the human-readable log. Neither write is best-effort —
+    if either fails, the caller sees the exception. md_path is parameterized
+    like db_path so tests can redirect it instead of touching the real file.
+    """
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        cur = conn.execute(
+            "INSERT INTO decisions (session_id, text, created_at) VALUES (?, ?, ?)",
+            (session_id, text, _now()),
+        )
+        conn.commit()
+        decision_id = cur.lastrowid
+    _append_decision_md(text, md_path)
+    return decision_id
+
+
+def list_decisions(session_id: str | None = None, *, limit: int = 20, db_path: Path = DB_PATH) -> list[dict]:
+    with contextlib.closing(_connect(db_path)) as conn:
+        if session_id is None:
+            rows = conn.execute(
+                "SELECT * FROM decisions ORDER BY created_at DESC, id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT * FROM decisions WHERE session_id = ?
+                   ORDER BY created_at DESC, id DESC LIMIT ?""",
+                (session_id, limit),
+            ).fetchall()
+    return [dict(row) for row in reversed(rows)]
+
+
 def upsert_capability_boundary(
     capability: str,
     enabled: bool,
@@ -1878,6 +1945,22 @@ def mark_session_completed(session_id: str, db_path: Path = DB_PATH) -> None:
         conn.commit()
 
 
+def mark_session_degraded(session_id: str, db_path: Path = DB_PATH) -> None:
+    """Flag a session whose compact recovery could not be verified intact.
+
+    Deliberately the opposite of this project's usual fail-soft default: a
+    session that ends up here must stay visibly flagged, not silently
+    continue as if nothing happened (see decisions.md, 2026-07-27).
+    """
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        conn.execute(
+            "UPDATE sessions SET status = 'degraded' WHERE session_id = ?",
+            (session_id,),
+        )
+        conn.commit()
+
+
 def tasks_touched_by_session(session_id: str, db_path: Path = DB_PATH) -> list[dict]:
     """Distinct tasks this session touched (via add_task/complete_task's session_id).
 
@@ -1930,6 +2013,113 @@ def session_score(session_id: str, db_path: Path = DB_PATH) -> dict:
         "completion_rate": completion_rate,
         "score": round(completion_rate * 100),
     }
+
+
+def compact_snapshot(session_id: str, db_path: Path = DB_PATH) -> dict:
+    """A small, stable-keyed count of state a /compact should not lose.
+
+    tasks/decisions are project-wide totals, not session-scoped — tasks and
+    decisions carry no session-ownership column, so "did the count drop"
+    is the only comparison the schema supports (mirrors session_score()'s
+    single-axis compromise, see decisions.md 2026-07-24). role_declared and
+    checklist_items ARE session-scoped, since roles/checkpoints key on
+    session_id directly.
+    """
+
+    open_tasks = [task["id"] for task in list_open_tasks(db_path=db_path)]
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        decision_count = conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
+        role_row = conn.execute(
+            "SELECT 1 FROM roles WHERE session_id = ?", (session_id,)
+        ).fetchone()
+
+    checkpoint = latest_checkpoint(session_id, db_path=db_path)
+    checklist_items = 0
+    if checkpoint and checkpoint.get("open_queue"):
+        try:
+            parsed = json.loads(checkpoint["open_queue"])
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+        if isinstance(parsed, list):
+            checklist_items = len(parsed)
+
+    return {
+        "tasks": open_tasks,
+        "decisions": decision_count,
+        "role_declared": role_row is not None,
+        "checklist_items": checklist_items,
+    }
+
+
+def save_snapshot(session_id: str, phase: str, db_path: Path = DB_PATH) -> int:
+    """Persist compact_snapshot(session_id) as JSON, tagged 'pre' or 'post'."""
+
+    if phase not in ("pre", "post"):
+        raise ValueError(f"phase must be 'pre' or 'post', got: {phase!r}")
+    snapshot = compact_snapshot(session_id, db_path=db_path)
+    with contextlib.closing(_connect(db_path)) as conn:
+        cur = conn.execute(
+            """INSERT INTO compact_snapshots (session_id, phase, snapshot_json, taken_at)
+               VALUES (?, ?, ?, ?)""",
+            (session_id, phase, json.dumps(snapshot, ensure_ascii=False, sort_keys=True), _now()),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def compare_snapshots(session_id: str, db_path: Path = DB_PATH) -> list[str]:
+    """Diff the latest 'pre' and 'post' compact snapshots for missing state.
+
+    NOT fail-soft, on purpose: a missing snapshot row is itself reported as a
+    finding rather than treated as "nothing to compare" (see decisions.md,
+    2026-07-27) — the whole point of this function is that Compact must not
+    be treated as a successful recovery when persistence can't be verified.
+    """
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        pre_row = conn.execute(
+            """SELECT snapshot_json FROM compact_snapshots
+               WHERE session_id = ? AND phase = 'pre'
+               ORDER BY taken_at DESC, id DESC LIMIT 1""",
+            (session_id,),
+        ).fetchone()
+        post_row = conn.execute(
+            """SELECT snapshot_json FROM compact_snapshots
+               WHERE session_id = ? AND phase = 'post'
+               ORDER BY taken_at DESC, id DESC LIMIT 1""",
+            (session_id,),
+        ).fetchone()
+
+    if pre_row is None or post_row is None:
+        missing_phase = "pre" if pre_row is None else "post"
+        return [f"no '{missing_phase}' compact snapshot found for session {session_id}"]
+
+    pre = json.loads(pre_row["snapshot_json"])
+    post = json.loads(post_row["snapshot_json"])
+
+    findings: list[str] = []
+
+    pre_tasks, post_tasks = set(pre["tasks"]), set(post["tasks"])
+    missing_tasks = sorted(pre_tasks - post_tasks)
+    if missing_tasks:
+        findings.append(
+            f"tasks: {len(pre_tasks)} -> {len(post_tasks)}, "
+            f"{len(missing_tasks)} missing (ids: {missing_tasks})"
+        )
+
+    if post["decisions"] < pre["decisions"]:
+        findings.append(f"decisions: {pre['decisions']} -> {post['decisions']}")
+
+    if post["checklist_items"] < pre["checklist_items"]:
+        findings.append(
+            f"checklist_items: {pre['checklist_items']} -> {post['checklist_items']}"
+        )
+
+    if pre["role_declared"] and not post["role_declared"]:
+        findings.append("role_declared: True -> False")
+
+    return findings
 
 
 def complete_task(
@@ -2249,6 +2439,111 @@ def log_lesson(
     )
     index_memory_files(db_path)
     return path
+
+
+def find_similar_lesson_groups(
+    threshold: float = 0.85, db_path: Path = DB_PATH
+) -> list[list[dict]]:
+    """Group lesson files whose embeddings are pairwise similar at/above `threshold`.
+
+    MEMORY.md and decisions.md are structural index files, not lessons, so
+    they're excluded from consideration. Similarity is transitive here: if A~B
+    and B~C both clear the threshold, A/B/C come back as one group of three,
+    not two overlapping pairs (Union-Find over the pairwise-similarity graph).
+    Groups of size 1 (nothing similar enough) are dropped from the result.
+    """
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            """SELECT source_file, title, content, keywords, embedding FROM memory_index
+               WHERE embedding IS NOT NULL AND source_file NOT IN ('MEMORY.md', 'decisions.md')
+               ORDER BY source_file"""
+        ).fetchall()
+
+    items = [{key: row[key] for key in row.keys() if key != "embedding"} for row in rows]
+    vectors = [np.frombuffer(row["embedding"], dtype=np.float32) for row in rows]
+
+    parent = list(range(len(items)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        root_i, root_j = find(i), find(j)
+        if root_i != root_j:
+            parent[root_i] = root_j
+
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            if _cosine_similarity(vectors[i], vectors[j]) >= threshold:
+                union(i, j)
+
+    groups: dict[int, list[dict]] = {}
+    for i, item in enumerate(items):
+        groups.setdefault(find(i), []).append(item)
+
+    return [group for group in groups.values() if len(group) > 1]
+
+
+def heal_memory(db_path: Path = DB_PATH) -> dict:
+    """Auto-merge lesson files ask_ollama judges to be about the same fact.
+
+    Mirrors haroon-bbb-sync's memory/_archived-healed/ pattern: merged-away
+    notes are moved there, never deleted (see decisions.md, 2026-07-27). Each
+    group is independent and fail-soft — an unavailable ollama or a "no"
+    verdict just leaves that group's files untouched; it doesn't stop the
+    rest of the sweep.
+    """
+
+    memory_dir = Path(__file__).resolve().parent / "memory"
+    archived_dir = memory_dir / "_archived-healed"
+
+    groups = find_similar_lesson_groups(db_path=db_path)
+    merged = 0
+
+    for group in groups:
+        notes_text = "\n".join(f"- {item['title']}: {item['content']}" for item in group)
+        verdict = ask_ollama(
+            f"these notes:\n{notes_text}\n"
+            "are they about the same underlying fact? Answer only yes or no."
+        )
+        if not verdict or "yes" not in verdict.strip().lower():
+            continue
+
+        title = group[0]["title"]
+        content = "\n\n".join(item["content"].strip() for item in group)
+        slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-") or "lesson"
+        date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        path = memory_dir / f"lesson-{date}-{slug}-healed.md"
+        suffix = 2
+        while path.exists():
+            path = memory_dir / f"lesson-{date}-{slug}-healed-{suffix}.md"
+            suffix += 1
+        path.write_text(
+            f"---\ntitle: {title}\ndate: {date}\nconfidence: medium\n---\n\n{content}\n",
+            encoding="utf-8",
+        )
+
+        with contextlib.closing(_connect(db_path)) as conn:
+            for item in group:
+                conn.execute(
+                    "DELETE FROM memory_index WHERE source_file = ?", (item["source_file"],)
+                )
+            conn.commit()
+
+        archived_dir.mkdir(exist_ok=True)
+        for item in group:
+            old_path = memory_dir / item["source_file"]
+            if old_path.exists():
+                old_path.rename(archived_dir / item["source_file"])
+
+        index_memory_files(db_path)
+        merged += 1
+
+    return {"groups_found": len(groups), "merged": merged}
 
 
 if __name__ == "__main__":

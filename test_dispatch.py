@@ -1,9 +1,9 @@
-"""Tests for bin/dispatch.py — must never shell out to the real `claude` CLI."""
+"""Tests for bin/dispatch.py — must never make a real Claude Agent SDK call."""
 
 from __future__ import annotations
 
+import asyncio
 import io
-import subprocess
 import sys
 import unittest
 from contextlib import redirect_stdout
@@ -13,6 +13,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent / "bin"))
 
 import dispatch
+from claude_agent_sdk import AssistantMessage, TextBlock
 
 
 class DispatchTestCase(unittest.TestCase):
@@ -32,7 +33,7 @@ class DispatchTestCase(unittest.TestCase):
     def _run(self, task: str = "add a hello world function") -> str:
         buffer = io.StringIO()
         with redirect_stdout(buffer):
-            dispatch.dispatch(task)
+            asyncio.run(dispatch.dispatch(task))
         return buffer.getvalue()
 
     def test_builder_only_path(self) -> None:
@@ -81,24 +82,39 @@ class DispatchTestCase(unittest.TestCase):
         self.assertIn("[dispatch] builder unavailable, skipping", output)
         self.assertIn("[dispatch] baton: done", output)
 
-    def test_run_claude_is_fail_soft_on_missing_binary(self) -> None:
-        with mock.patch("dispatch.subprocess.run", side_effect=FileNotFoundError()):
-            self.assertIsNone(dispatch.run_claude("hello"))
+    def test_run_claude_is_fail_soft_when_query_raises(self) -> None:
+        async def _boom(*, prompt, options):
+            raise RuntimeError("ANTHROPIC_API_KEY set, auth mismatch")
+            yield  # pragma: no cover - makes this an async generator function
 
-    def test_run_claude_uses_shutil_which_resolved_path(self) -> None:
-        completed = subprocess.CompletedProcess(args=["claude"], returncode=0, stdout="ok")
-        with mock.patch("dispatch.shutil.which", return_value=r"C:\npm\claude.CMD"), \
-            mock.patch("dispatch.subprocess.run", return_value=completed) as mocked:
-            self.assertEqual("ok", dispatch.run_claude("hello"))
-        args, kwargs = mocked.call_args
-        self.assertEqual([r"C:\npm\claude.CMD", "-p", "hello"], args[0])
+        with mock.patch("dispatch.query", side_effect=_boom):
+            result = asyncio.run(
+                dispatch.run_claude("hello", system_prompt="be terse")
+            )
+        self.assertIsNone(result)
 
     def test_run_claude_is_fail_soft_on_timeout(self) -> None:
-        with mock.patch(
-            "dispatch.subprocess.run",
-            side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=120),
-        ):
-            self.assertIsNone(dispatch.run_claude("hello"))
+        async def _hangs(*, prompt, options):
+            await asyncio.sleep(10)
+            yield  # pragma: no cover - unreachable, query never yields in time
+
+        with mock.patch("dispatch.query", side_effect=_hangs):
+            result = asyncio.run(
+                dispatch.run_claude("hello", system_prompt="be terse", timeout=0.01)
+            )
+        self.assertIsNone(result)
+
+    def test_run_claude_extracts_text_from_assistant_message(self) -> None:
+        async def _stream(*, prompt, options):
+            yield AssistantMessage(
+                content=[TextBlock(text="I'd add a function.")], model="test-model"
+            )
+
+        with mock.patch("dispatch.query", side_effect=_stream):
+            result = asyncio.run(
+                dispatch.run_claude("hello", system_prompt="be terse")
+            )
+        self.assertEqual("I'd add a function.", result)
 
 
 if __name__ == "__main__":

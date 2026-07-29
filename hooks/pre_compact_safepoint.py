@@ -26,23 +26,26 @@ def main() -> None:
             status="ok",
             details={"checkpoint": "created-empty"},
         )
-        return
+    else:
+        mc.write_checkpoint(
+            session_id,
+            current_task=checkpoint["current_task"],
+            last_decision=checkpoint["last_decision"],
+            next_action=checkpoint["next_action"],
+            open_queue=checkpoint["open_queue"],
+            risk=checkpoint["risk"],
+        )
+        mc.record_lifecycle_run(
+            "pre_compact_safepoint",
+            session_id=session_id,
+            source="compact",
+            status="ok",
+            details={"checkpoint": "copied-latest"},
+        )
 
-    mc.write_checkpoint(
-        session_id,
-        current_task=checkpoint["current_task"],
-        last_decision=checkpoint["last_decision"],
-        next_action=checkpoint["next_action"],
-        open_queue=checkpoint["open_queue"],
-        risk=checkpoint["risk"],
-    )
-    mc.record_lifecycle_run(
-        "pre_compact_safepoint",
-        session_id=session_id,
-        source="compact",
-        status="ok",
-        details={"checkpoint": "copied-latest"},
-    )
+    # Stage R: the before-side of compact recovery validation — see
+    # session_start.py's source=="compact" branch for the after-side compare.
+    mc.save_snapshot(session_id, "pre")
 
 
 if __name__ == "__main__":

@@ -147,3 +147,32 @@
   red/green harness ister. Bu stage text assistant brain'i kanıtlıyor. Brozzer
   şu an partial-local-brozzer: MC/memory/lifecycle var; HOSNI durable dispatch,
   voice mouth, shared active-turns log, Rider veto ve production bridge yok.**
+
+- **2026-07-27 - dispatch.py, claude -p'den Claude Agent SDK'ya taşındı.** Not:
+  Anthropic'in Haziran 2026'da duyurduğu ayrı "Agent SDK credit" sistemi 15
+  Haziran'da uygulamaya konulmadan durduruldu - hem CLI hem SDK hâlâ normal
+  abonelik kotasından düşüyor, bu yönden maliyet farkı hiç olmadı/olmayacak.
+  SDK'ya geçiş sebebi: Haroon'un CLI'nin ileride kısıtlanabileceği uyarısı ve
+  SDK'nın daha resmi/uzun-vadeli desteklenen yol olması. Bu, 2026-07-24
+  tarihli "SDK ayrı API key + pay-per-token gerektiriyor" kararını geçersiz
+  kılar.
+
+- **2026-07-27 - Compact recovery validation eklendi (Stage R).** Bilerek
+  fail-soft DEĞİL: eksik kayıt varsa session 'degraded' işaretlenir ve
+  görünür şekilde bildirilir - Haroon'un ekip şablonundaki "prevent Compact
+  from being treated as successful if persistence fails" gereksinimine
+  uygun, projenin genel fail-soft felsefesinden bilinçli bir sapma.
+
+- **2026-07-27 - Memory self-healing eklendi (Stage T), Haroon'un kendi
+  _archived-healed/ deseninden ilham alındı - eski notlar silinmiyor,
+  arşivleniyor.
+
+- **2026-07-27 - Bilinen bir çelişki:** Haroon'un net kuralı "workstation'da
+  asla kalıcı loop/cron çalışmaz, sadece HOSNI'de" - ama daily_check.py
+  (check_floor, heal_memory dahil) Windows Task Scheduler ile WORKSTATION'da
+  çalışıyor. Sebep: bizde HOSNI/server yok, tek kullanıcı/tek makine
+  mimarisi. Risk (Haroon'un endişe ettiği "birden fazla kişi aynı anda
+  çakışır" senaryosu) bizde gerçekleşmiyor çünkü tek kullanıcı var. Ama bu,
+  mimarinin gerçek bir sınırlaması olarak açıkça not ediliyor - eğer proje
+  çok kullanıcılı hale gelirse, bu loop'un merkezi bir sunucuya taşınması
+  gerekir.

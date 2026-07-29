@@ -26,6 +26,15 @@ def daily_check() -> None:
     print(f"[daily-check] indexed {indexed_count} memory file(s)")
 
     findings = mc.check_floor()
+
+    try:
+        heal_result = mc.heal_memory()
+        print(
+            f"[daily-check] healed {heal_result['merged']} of "
+            f"{heal_result['groups_found']} similar group(s)"
+        )
+    except Exception:
+        print("[daily-check] memory healing skipped (error)")
     if not findings:
         print("[daily-check] floor clean, no judge call needed")
         return
