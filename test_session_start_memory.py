@@ -39,6 +39,9 @@ _BOUND_FUNCS = (
     "list_open_tasks",
     "latest_checkpoint",
     "semantic_search",
+    "list_sessions",
+    "recent_decisions",
+    "recovery_package_size",
 )
 
 
@@ -98,7 +101,9 @@ class SessionStartRelatedMemoryTestCase(unittest.TestCase):
         )
         with _bind_to_test_db(self.db_path):
             output = _run_session_start(self.session_id)
-        self.assertIn("[bbb-lite] related memory: Guard blocks writes (guard.md)", output)
+        self.assertIn(
+            "[bbb-lite] related memory: Guard blocks writes (guard.md, confidence=0.5)", output
+        )
 
     def test_empty_current_task_prints_nothing_and_skips_search(self) -> None:
         mc.write_checkpoint(self.session_id, current_task=None, db_path=self.db_path)

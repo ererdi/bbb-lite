@@ -1444,6 +1444,22 @@ def list_decisions(session_id: str | None = None, *, limit: int = 20, db_path: P
     return [dict(row) for row in reversed(rows)]
 
 
+def recent_decisions(limit: int = 2, db_path: Path = DB_PATH) -> list[str]:
+    """The most recent N decision texts, newest first, across all sessions.
+
+    Project-wide like list_decisions(session_id=None) — decisions carry a
+    session_id column but aren't scoped to it (see decisions.md, 2026-07-24).
+    Used by session_start.py's recovery package (Stage AA).
+    """
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT text FROM decisions ORDER BY created_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [row["text"] for row in rows]
+
+
 def upsert_capability_boundary(
     capability: str,
     enabled: bool,
@@ -2256,6 +2272,74 @@ def compare_snapshots(session_id: str, db_path: Path = DB_PATH) -> list[str]:
         findings.append("role_declared: True -> False")
 
     return findings
+
+
+def recovery_package_size(session_id: str, db_path: Path = DB_PATH) -> int:
+    """Character count of the recovery package session_start.py prints on a normal start.
+
+    A simple proxy measurement (not a byte-exact echo of session_start.py's own
+    output) meant to back the "bounded package" claim from Stage AA: it
+    re-derives the same facts session_start.py prints — role, checkpoint,
+    risk, degraded warning, recent decisions, related memory — via the same
+    mc functions, and mirrors their format strings. If session_start.py's
+    formatting changes, keep this in sync (see decisions.md, 2026-07-29).
+    """
+
+    lines: list[str] = []
+
+    role = get_role(session_id, db_path=db_path)
+    lines.append(
+        f"[bbb-lite] role: {role} "
+        f"(code={can_write_code(session_id, db_path=db_path)}, "
+        f"data={can_write_data(session_id, db_path=db_path)})"
+    )
+
+    checkpoint = latest_checkpoint(session_id, db_path=db_path)
+    last_task = (
+        checkpoint["current_task"] if checkpoint and checkpoint["current_task"] else "none"
+    )
+    open_tasks = list_open_tasks(db_path=db_path)
+    lines.append(
+        f"[bbb-lite] session {session_id} (startup) | "
+        f"last task: {last_task} | {len(open_tasks)} open task(s)"
+    )
+
+    if checkpoint and checkpoint["next_action"]:
+        lines.append(f"[bbb-lite] {checkpoint['next_action']}")
+
+    if checkpoint and checkpoint["risk"]:
+        lines.append(f"[bbb-lite] risk: {checkpoint['risk']}")
+
+    if checkpoint:
+        owner_status = next(
+            (
+                row["status"]
+                for row in list_sessions(db_path=db_path)
+                if row["session_id"] == checkpoint["session_id"]
+            ),
+            None,
+        )
+        if owner_status == "degraded":
+            lines.append(
+                "[bbb-lite] WARNING: last session's recovery was degraded - "
+                "some info may be missing"
+            )
+
+    for text in recent_decisions(limit=2, db_path=db_path):
+        lines.append(f"[bbb-lite] recent decision: {text}")
+
+    if checkpoint and checkpoint["current_task"]:
+        try:
+            hits = semantic_search(checkpoint["current_task"], limit=2, db_path=db_path)
+        except Exception:
+            hits = []
+        for hit in hits:
+            lines.append(
+                f"[bbb-lite] related memory: {hit['title']} "
+                f"({hit['source_file']}, confidence={hit['confidence']})"
+            )
+
+    return sum(len(line) for line in lines)
 
 
 def complete_task(

@@ -75,6 +75,31 @@ def main() -> None:
     if checkpoint and checkpoint["next_action"]:
         print(f"[bbb-lite] {checkpoint['next_action']}")
 
+    if checkpoint and checkpoint["risk"]:
+        print(f"[bbb-lite] risk: {checkpoint['risk']}")
+
+    # Stage AA: warn if the session that owns the last checkpoint (possibly a
+    # different, earlier session — latest_checkpoint() falls back across
+    # sessions) never got a clean compact recovery (see mark_session_degraded,
+    # Stage R).
+    if checkpoint:
+        owner_status = next(
+            (
+                row["status"]
+                for row in mc.list_sessions()
+                if row["session_id"] == checkpoint["session_id"]
+            ),
+            None,
+        )
+        if owner_status == "degraded":
+            print(
+                "[bbb-lite] WARNING: last session's recovery was degraded - "
+                "some info may be missing"
+            )
+
+    for text in mc.recent_decisions(limit=2):
+        print(f"[bbb-lite] recent decision: {text}")
+
     # Stage S: surface memory related to the last known task. Fail-soft on
     # purpose (unlike Stage R) — this is a convenience nudge, not a proof of
     # recovery, so a broken embedding model should just skip the line.
@@ -84,7 +109,15 @@ def main() -> None:
         except Exception:
             hits = []
         for hit in hits:
-            print(f"[bbb-lite] related memory: {hit['title']} ({hit['source_file']})")
+            print(
+                f"[bbb-lite] related memory: {hit['title']} "
+                f"({hit['source_file']}, confidence={hit['confidence']})"
+            )
+
+    # Stage AA: a bounded-package proof — total chars of the recovery info
+    # above, so "this is a small nudge, not a context dump" is measured, not
+    # just asserted.
+    print(f"[bbb-lite] recovery package: {mc.recovery_package_size(session_id)} chars")
 
 
 if __name__ == "__main__":

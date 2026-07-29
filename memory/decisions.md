@@ -211,3 +211,9 @@
   node/edge ilişki grafiğinin küçük karşılığı. En önemli kısıt korundu: bir
   edge, HER İKİ node onaylanmadan oluşturulamıyor - kürasyon zorunlu,
   otomatik büyüme yok.
+
+- **2026-07-29 - Session recovery paketi tamamlandı (Stage AA)** - risk,
+  recent decisions, confidence bilgisi, degraded-uyarısı, ve paket boyutu
+  ölçümü eklendi. On-demand genişletme (ek sorgu ile daha fazla hafıza
+  çekme) HÂLÂ yok - bu, ayrı bir skill olarak eklenebilir, şimdilik kapsam
+  dışı.
