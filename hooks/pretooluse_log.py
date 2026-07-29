@@ -43,6 +43,16 @@ def _log(file_path: str) -> None:
         pass  # fail-soft: never block a tool call over a logging error
 
 
+def _log_denied(session_id: str, reason: str) -> None:
+    """Record a denied write attempt, session_id included (mc.session_score reads this)."""
+    try:
+        timestamp = datetime.datetime.now().isoformat(timespec="seconds")
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(f"{timestamp} denied session={session_id}: {reason}\n")
+    except OSError:
+        pass  # fail-soft: never block a tool call over a logging error
+
+
 def check(tool_input: dict, session_id: str | None = None) -> dict | None:
     """None means allow (no output needed); a dict is the block payload.
 
@@ -65,7 +75,9 @@ def check(tool_input: dict, session_id: str | None = None) -> dict | None:
         mc.init_db()
         if not mc.can_write_code(session_id):
             role = mc.get_role(session_id)
-            return _deny(f"role '{role}' has no code-write permission")
+            reason = f"role '{role}' has no code-write permission"
+            _log_denied(session_id, reason)
+            return _deny(reason)
 
     _log(file_path)
     return None

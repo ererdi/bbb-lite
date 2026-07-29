@@ -27,6 +27,7 @@ import numpy as np
 
 DB_PATH = Path(__file__).resolve().parent / "mc.db"
 DECISIONS_MD_PATH = Path(__file__).resolve().parent / "memory" / "decisions.md"
+PRETOOLUSE_LOG_PATH = Path(__file__).resolve().parent / "hooks" / "pretooluse.log"
 _EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 _embedding_model: Any = None
 _embedding_unavailable = False
@@ -2056,23 +2057,66 @@ def tasks_touched_by_session(session_id: str, db_path: Path = DB_PATH) -> list[d
     ]
 
 
-def session_score(session_id: str, db_path: Path = DB_PATH) -> dict:
-    """Single-axis session score: task completion rate * 100, plus checkpoint count.
+def _rules_denied_count(session_id: str, log_path: Path = PRETOOLUSE_LOG_PATH) -> int:
+    """Count this session's "no code-write permission" denials in pretooluse.log.
 
-    Not Haroon's 3-axis context/exec/rules score — bbb-lite has no context-budget
-    or rule-tracking infrastructure to feed those, so this is the one axis our
-    schema actually supports (see decisions.md, 2026-07-24).
+    Fail-soft on purpose: the log is a plain-text line format, not a structured
+    record, so a missing file, unreadable file, or a session_id that never shows
+    up just means zero denials found, not an error (see decisions.md, 2026-07-29,
+    Stage Y).
+    """
+
+    if not log_path.exists():
+        return 0
+    pattern = re.compile(
+        r"denied session=" + re.escape(session_id) + r":.*no code-write permission"
+    )
+    try:
+        count = 0
+        with log_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if pattern.search(line):
+                    count += 1
+        return count
+    except OSError:
+        return 0
+
+
+def session_score(
+    session_id: str, db_path: Path = DB_PATH, log_path: Path = PRETOOLUSE_LOG_PATH
+) -> dict:
+    """3-axis session score: exec/context/rules, a small counterpart to Haroon's split.
+
+    - exec_score: the original single-axis metric (task completion rate * 100,
+      100 if nothing was touched).
+    - context_score: crude proxy for context-budget tracking, which this project
+      doesn't have — 100 if the session wrote at least one checkpoint, else 50.
+    - rules_score: 100 minus 20 per PreToolUse write attempt denied for lacking
+      code-write permission (see _rules_denied_count), read from
+      hooks/pretooluse.log; fails soft to 100 if the log can't be read.
+
+    None of these are Haroon's real context-budget/rule-tracking infrastructure —
+    just the closest proxy our schema and hooks actually support (see
+    decisions.md, 2026-07-29, Stage Y).
     """
 
     touched = tasks_touched_by_session(session_id, db_path=db_path)
     tasks_touched = len(touched)
     tasks_completed = sum(1 for task in touched if task["completed_by_session"])
     completion_rate = tasks_completed / tasks_touched if tasks_touched else 1.0
+    exec_score = round(completion_rate * 100)
 
     with contextlib.closing(_connect(db_path)) as conn:
         checkpoints_written = conn.execute(
             "SELECT COUNT(*) FROM checkpoints WHERE session_id = ?", (session_id,)
         ).fetchone()[0]
+
+    context_score = 100 if checkpoints_written >= 1 else 50
+
+    denied_attempts = _rules_denied_count(session_id, log_path=log_path)
+    rules_score = max(0, 100 - denied_attempts * 20)
+
+    overall_score = round((exec_score + context_score + rules_score) / 3)
 
     return {
         "session_id": session_id,
@@ -2080,7 +2124,12 @@ def session_score(session_id: str, db_path: Path = DB_PATH) -> dict:
         "tasks_completed": tasks_completed,
         "checkpoints_written": checkpoints_written,
         "completion_rate": completion_rate,
-        "score": round(completion_rate * 100),
+        "score": exec_score,
+        "exec_score": exec_score,
+        "context_score": context_score,
+        "rules_score": rules_score,
+        "denied_write_attempts": denied_attempts,
+        "overall_score": overall_score,
     }
 
 

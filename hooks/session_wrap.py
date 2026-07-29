@@ -98,8 +98,9 @@ def main() -> None:
 
     score = mc.session_score(session_id)
     print(
-        f"[bbb-lite] session score: {score['score']}/100 "
-        f"({score['tasks_completed']}/{score['tasks_touched']} tasks completed)"
+        f"[bbb-lite] session score: {score['overall_score']}/100 "
+        f"(exec={score['exec_score']}, context={score['context_score']}, "
+        f"rules={score['rules_score']})"
     )
 
 

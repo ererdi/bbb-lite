@@ -197,3 +197,12 @@
   ayrılıyor. Haroon'un sisteminde bu metrik neredeyse hep aynı değerde
   kümelenmiş ("ölü metrik") bulunmuştu - bizim sistemimizde en azından
   gerçekten okunuyor ve kullanılıyor.
+
+- **2026-07-29 - session_score 3 eksenli hale getirildi (Stage Y)** -
+  Haroon'un context/exec/rules ayrımının küçük karşılığı. context_score
+  gerçek bir context-budget takibi değil (checkpoint varlığına dayalı basit
+  bir proxy), rules_score pretooluse.log'a dayanıyor. Bunun için
+  pretooluse_log.py'nin deny yolu da değişti: önceden reddedilen yazma
+  denemeleri hiç loglanmıyordu (sadece izin verilenler), şimdi
+  "denied session=<id>: <reason>" satırı olarak session_id ile birlikte
+  yazılıyor - yoksa rules_score'un okuyacağı hiçbir veri olmazdı.

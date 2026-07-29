@@ -567,6 +567,63 @@ class McTestCase(unittest.TestCase):
         score = mc.session_score("s1", db_path=self.db_path)
         self.assertEqual(2, score["checkpoints_written"])
 
+    def test_session_score_context_axis_needs_a_checkpoint(self) -> None:
+        mc.ensure_session("s1", db_path=self.db_path)
+        no_checkpoint = mc.session_score("s1", db_path=self.db_path)
+        self.assertEqual(50, no_checkpoint["context_score"])
+
+        mc.write_checkpoint("s1", current_task="first", db_path=self.db_path)
+        with_checkpoint = mc.session_score("s1", db_path=self.db_path)
+        self.assertEqual(100, with_checkpoint["context_score"])
+
+    def test_session_score_rules_axis_counts_denied_attempts_for_this_session(
+        self,
+    ) -> None:
+        mc.ensure_session("s1", db_path=self.db_path)
+        mc.ensure_session("s2", db_path=self.db_path)
+        log_path = Path(tempfile.mktemp(suffix=".log"))
+        log_path.write_text(
+            "2026-07-29T10:00:00 denied session=s1: role 'advisor' has no code-write permission\n"
+            "2026-07-29T10:00:01 denied session=s2: role 'advisor' has no code-write permission\n"
+            "2026-07-29T10:00:02 about to write: foo.py\n",
+            encoding="utf-8",
+        )
+        try:
+            score = mc.session_score("s1", db_path=self.db_path, log_path=log_path)
+        finally:
+            log_path.unlink(missing_ok=True)
+        self.assertEqual(1, score["denied_write_attempts"])
+        self.assertEqual(80, score["rules_score"])
+
+    def test_session_score_rules_axis_defaults_to_100_when_log_missing(self) -> None:
+        mc.ensure_session("s1", db_path=self.db_path)
+        score = mc.session_score(
+            "s1", db_path=self.db_path, log_path=Path(tempfile.mktemp(suffix=".log"))
+        )
+        self.assertEqual(0, score["denied_write_attempts"])
+        self.assertEqual(100, score["rules_score"])
+
+    def test_session_score_overall_averages_the_three_axes(self) -> None:
+        mc.ensure_session("s1", db_path=self.db_path)
+        done_id = mc.add_task("finish report", session_id="s1", db_path=self.db_path)
+        mc.add_task("review pr", session_id="s1", db_path=self.db_path)
+        mc.complete_task(done_id, session_id="s1", db_path=self.db_path)
+        mc.write_checkpoint("s1", current_task="first", db_path=self.db_path)
+        log_path = Path(tempfile.mktemp(suffix=".log"))
+        log_path.write_text(
+            "2026-07-29T10:00:00 denied session=s1: role 'advisor' has no code-write permission\n",
+            encoding="utf-8",
+        )
+        try:
+            score = mc.session_score("s1", db_path=self.db_path, log_path=log_path)
+        finally:
+            log_path.unlink(missing_ok=True)
+
+        self.assertEqual(50, score["exec_score"])
+        self.assertEqual(100, score["context_score"])
+        self.assertEqual(80, score["rules_score"])
+        self.assertEqual(77, score["overall_score"])
+
     def test_mark_session_completed_updates_status(self) -> None:
         mc.ensure_session("s1", db_path=self.db_path)
         mc.mark_session_completed("s1", db_path=self.db_path)
