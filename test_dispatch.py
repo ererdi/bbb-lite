@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import subprocess
 import sys
 import unittest
 from contextlib import redirect_stdout
@@ -37,6 +38,54 @@ class ParseCtoResponseTestCase(unittest.TestCase):
                 self.assertIsNone(dispatch._parse_cto_response(text))
 
 
+class WorktreeTestCase(unittest.TestCase):
+    """Stage V: create_worktree()/remove_worktree() — real git commands must
+    never run in a test, so subprocess.run itself is mocked here."""
+
+    def test_create_worktree_calls_git_with_correct_args_and_returns_path(self) -> None:
+        repo_root = Path(dispatch.__file__).resolve().parent.parent
+        completed = subprocess.CompletedProcess(args=["git"], returncode=0)
+        with mock.patch("dispatch.subprocess.run", return_value=completed) as run_mock:
+            result = dispatch.create_worktree(5)
+        args, kwargs = run_mock.call_args
+        self.assertEqual(
+            ["git", "worktree", "add", "../bbb-lite-work-5", "-b", "work/5"], args[0]
+        )
+        self.assertEqual(repo_root, kwargs["cwd"])
+        self.assertEqual((repo_root / "../bbb-lite-work-5").resolve(), result)
+
+    def test_create_worktree_returns_none_on_failure(self) -> None:
+        completed = subprocess.CompletedProcess(args=["git"], returncode=1)
+        with mock.patch("dispatch.subprocess.run", return_value=completed):
+            self.assertIsNone(dispatch.create_worktree(6))  # branch/worktree already exists
+
+        with mock.patch("dispatch.subprocess.run", side_effect=FileNotFoundError()):
+            self.assertIsNone(dispatch.create_worktree(7))  # git not installed
+
+    def test_remove_worktree_calls_git_with_correct_args(self) -> None:
+        worktree_path = Path("/tmp/bbb-lite-work-5")
+        completed = subprocess.CompletedProcess(args=["git"], returncode=0)
+        with mock.patch("dispatch.subprocess.run", return_value=completed) as run_mock:
+            dispatch.remove_worktree(worktree_path, 5)
+        calls = [call.args[0] for call in run_mock.call_args_list]
+        self.assertIn(
+            ["git", "worktree", "remove", str(worktree_path), "--force"], calls
+        )
+        self.assertIn(["git", "branch", "-D", "work/5"], calls)
+
+        with mock.patch("dispatch.subprocess.run", side_effect=OSError("no git")):
+            dispatch.remove_worktree(worktree_path, 5)  # must not raise
+
+    def test_remove_worktree_deletes_branch_independently_of_worktree_result(self) -> None:
+        # Worktree removal fails (non-zero exit) but the branch delete must
+        # still be attempted — the two cleanup steps are independent.
+        completed = subprocess.CompletedProcess(args=["git"], returncode=1)
+        with mock.patch("dispatch.subprocess.run", return_value=completed) as run_mock:
+            dispatch.remove_worktree(Path("/tmp/bbb-lite-work-9"), 9)
+        calls = [call.args[0] for call in run_mock.call_args_list]
+        self.assertIn(["git", "branch", "-D", "work/9"], calls)
+
+
 class DispatchTestCase(unittest.TestCase):
     def setUp(self) -> None:
         patches = [
@@ -48,6 +97,8 @@ class DispatchTestCase(unittest.TestCase):
             mock.patch("dispatch.mc.record_evidence"),
             mock.patch("dispatch.mc.add_task", return_value=None),
             mock.patch("dispatch.mc.complete_task"),
+            mock.patch("dispatch.create_worktree", return_value=None),
+            mock.patch("dispatch.remove_worktree"),
         ]
         self._ledger_patches = [patcher.start() for patcher in patches]
         for patcher in patches:
@@ -161,6 +212,38 @@ class DispatchTestCase(unittest.TestCase):
         add_task_mock.assert_not_called()
         complete_task_mock.assert_not_called()
         self.assertIn("[dispatch] role=cto -> unavailable, falling back to classify()", output)
+
+    def test_dispatch_falls_back_to_main_folder_when_worktree_unavailable(self) -> None:
+        # create_worktree defaults to returning None per setUp — i.e. "couldn't
+        # create one" — so the builder call must run with cwd=None.
+        with mock.patch("dispatch.mc.add_task", return_value=42), \
+            mock.patch("dispatch.remove_worktree") as remove_mock, \
+            mock.patch(
+                "dispatch.run_claude",
+                side_effect=["TITLE: Add a helper\nNEEDS_ARCHITECT: no", "a change"],
+            ) as claude_mock:
+            self._run()
+        builder_call = claude_mock.call_args_list[-1]
+        self.assertIsNone(builder_call.kwargs["cwd"])
+        remove_mock.assert_not_called()
+
+    def test_dispatch_creates_and_always_removes_worktree_for_builder(self) -> None:
+        fake_worktree = Path("/tmp/bbb-lite-work-42")
+        # Builder turn fails (None) here on purpose: cleanup must still happen
+        # "task tamamlansın ya da tamamlanmasın" (succeed or fail alike).
+        with mock.patch("dispatch.mc.add_task", return_value=42), \
+            mock.patch("dispatch.create_worktree", return_value=fake_worktree), \
+            mock.patch("dispatch.remove_worktree") as remove_mock, \
+            mock.patch(
+                "dispatch.run_claude",
+                side_effect=["TITLE: Add a helper\nNEEDS_ARCHITECT: no", None],
+            ) as claude_mock:
+            output = self._run()
+        builder_call = claude_mock.call_args_list[-1]
+        self.assertEqual(str(fake_worktree), builder_call.kwargs["cwd"])
+        remove_mock.assert_called_once_with(fake_worktree, 42)
+        self.assertIn(f"[dispatch] builder worktree: {fake_worktree}", output)
+        self.assertIn("[dispatch] builder unavailable, skipping", output)
 
     def test_run_claude_is_fail_soft_when_query_raises(self) -> None:
         async def _boom(*, prompt, options):

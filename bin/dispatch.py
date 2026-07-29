@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -68,17 +69,81 @@ def _safe_mc(default, func, *args, **kwargs):
         return default
 
 
-async def run_claude(prompt: str, *, system_prompt: str, timeout: int = 120) -> str | None:
+def create_worktree(task_id: int | str) -> Path | None:
+    """Fail-soft: create an isolated git worktree for the builder to work in.
+
+    None if git is missing, a worktree/branch for this task_id already
+    exists, or anything else goes wrong — worktree isolation is an optional
+    improvement (see decisions.md, 2026-07-29), never a requirement for
+    dispatch to run.
+    """
+
+    repo_root = Path(__file__).resolve().parent.parent
+    relative = f"../bbb-lite-work-{task_id}"
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "add", relative, "-b", f"work/{task_id}"],
+            cwd=repo_root,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return (repo_root / relative).resolve()
+
+
+def remove_worktree(worktree_path: Path, task_id: int | str) -> None:
+    """Fail-soft cleanup of a builder worktree and its work/<task_id> branch.
+
+    Two independent fail-soft steps, not one: a branch that's gone or can't
+    be deleted (e.g. still checked out somewhere) must not stop the worktree
+    itself from being removed, or vice versa.
+    """
+
+    repo_root = Path(__file__).resolve().parent.parent
+    try:
+        subprocess.run(
+            ["git", "worktree", "remove", str(worktree_path), "--force"],
+            cwd=repo_root,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        subprocess.run(
+            ["git", "branch", "-D", f"work/{task_id}"],
+            cwd=repo_root,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+async def run_claude(
+    prompt: str, *, system_prompt: str, cwd: str | None = None, timeout: int = 120
+) -> str | None:
     """Fail-soft call to the Claude Agent SDK; None if unavailable/errors/times out."""
 
     try:
-        return await asyncio.wait_for(_collect_text(prompt, system_prompt), timeout=timeout)
+        return await asyncio.wait_for(
+            _collect_text(prompt, system_prompt, cwd), timeout=timeout
+        )
     except Exception:
         return None
 
 
-async def _collect_text(prompt: str, system_prompt: str) -> str | None:
-    options = ClaudeAgentOptions(system_prompt=system_prompt)
+async def _collect_text(prompt: str, system_prompt: str, cwd: str | None = None) -> str | None:
+    options = ClaudeAgentOptions(system_prompt=system_prompt, cwd=cwd)
     text_parts: list[str] = []
     async for message in query(prompt=prompt, options=options):
         if isinstance(message, AssistantMessage):
@@ -139,10 +204,22 @@ async def dispatch(task: str) -> None:
                 _safe_mc(None, mc.record_agent_output, run_id, "architect", plan)
             plan_context = f" The architect's plan was: {plan}"
 
-    change = await run_claude(
-        f"Task: {task}",
-        system_prompt=BUILDER_SYSTEM_PROMPT.format(plan_context=plan_context),
-    )
+    # Stage V: give the builder an isolated worktree when there's a real task
+    # to isolate for; if it can't be created, fail-soft to the main folder.
+    worktree_path = create_worktree(task_id) if task_id is not None else None
+    if worktree_path is not None:
+        print(f"[dispatch] builder worktree: {worktree_path}")
+
+    try:
+        change = await run_claude(
+            f"Task: {task}",
+            system_prompt=BUILDER_SYSTEM_PROMPT.format(plan_context=plan_context),
+            cwd=str(worktree_path) if worktree_path is not None else None,
+        )
+    finally:
+        if worktree_path is not None:
+            remove_worktree(worktree_path, task_id)
+
     if change is None:
         print("[dispatch] builder unavailable, skipping")
         if run_id:

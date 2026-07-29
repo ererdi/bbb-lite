@@ -181,3 +181,8 @@
   Brozzer->CTO->architect->builder zincirinin eksik halkasıydı. CTO artık
   gerçek bir MC task açıyor, builder onu tamamlayınca kapatıyor - "doğar,
   MC'ye yazar, ölür" döngüsü artık tam.
+
+- **2026-07-29 - Builder artık izole bir git worktree'de çalışıyor (Stage
+  V)** - Haroon'un sistemindeki AYNI mekanizma (git worktree, sunucu
+  gerektirmeyen gerçek bir git özelliği). Worktree oluşturulamazsa fail-soft
+  olarak ana klasöre düşer.
