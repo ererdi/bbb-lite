@@ -43,7 +43,7 @@ class McTestCase(unittest.TestCase):
                 "dispatch_runs", "agent_outputs", "evidence", "events_log",
                 "capability_boundaries", "graph_nodes", "graph_edges",
                 "answer_quality_scores", "answer_receipts", "lifecycle_runs",
-                "decisions", "compact_snapshots",
+                "decisions", "compact_snapshots", "documents",
             },
             names,
         )
@@ -183,6 +183,40 @@ class McTestCase(unittest.TestCase):
     def test_project_status_unknown_project_id_raises(self) -> None:
         with self.assertRaises(ValueError):
             mc.project_status(999, db_path=self.db_path)
+
+    def test_add_and_get_document_returns_most_recent_of_type(self) -> None:
+        project_id = mc.add_project("bbb-lite", db_path=self.db_path)
+        mc.add_document(project_id, "northstar", "v1", "first draft", db_path=self.db_path)
+        mc.add_document(project_id, "northstar", "v2", "second draft", db_path=self.db_path)
+        doc = mc.get_document(project_id, "northstar", db_path=self.db_path)
+        self.assertEqual("v2", doc["title"])
+
+    def test_add_document_unknown_project_id_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            mc.add_document(999, "northstar", "v1", "content", db_path=self.db_path)
+
+    def test_update_document_changes_content_in_place(self) -> None:
+        project_id = mc.add_project("bbb-lite", db_path=self.db_path)
+        doc_id = mc.add_document(project_id, "note", "n1", "old content", db_path=self.db_path)
+        mc.update_document(doc_id, "new content", db_path=self.db_path)
+        docs = mc.list_documents(project_id, db_path=self.db_path)
+        self.assertEqual(1, len(docs))
+        self.assertEqual("new content", docs[0]["content"])
+
+    def test_list_documents_returns_all_types_for_project(self) -> None:
+        project_id = mc.add_project("bbb-lite", db_path=self.db_path)
+        other_project_id = mc.add_project("other", db_path=self.db_path)
+        mc.add_document(project_id, "northstar", "north", "n", db_path=self.db_path)
+        mc.add_document(project_id, "plan", "plan a", "p", db_path=self.db_path)
+        mc.add_document(other_project_id, "note", "irrelevant", "x", db_path=self.db_path)
+        titles = {doc["title"] for doc in mc.list_documents(project_id, db_path=self.db_path)}
+        self.assertEqual({"north", "plan a"}, titles)
+
+    def test_project_status_has_northstar_reflects_document_presence(self) -> None:
+        project_id = mc.add_project("bbb-lite", db_path=self.db_path)
+        self.assertFalse(mc.project_status(project_id, db_path=self.db_path)["has_northstar"])
+        mc.add_document(project_id, "northstar", "north", "n", db_path=self.db_path)
+        self.assertTrue(mc.project_status(project_id, db_path=self.db_path)["has_northstar"])
 
     def test_list_sessions_returns_all_sessions(self) -> None:
         mc.ensure_session("s1", db_path=self.db_path)

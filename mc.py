@@ -597,6 +597,17 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 taken_at TEXT NOT NULL
             )"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                doc_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS graph_edges_src ON graph_edges(src, type)")
         conn.execute("CREATE INDEX IF NOT EXISTS graph_edges_dst ON graph_edges(dst, type)")
         conn.execute("CREATE INDEX IF NOT EXISTS graph_nodes_type ON graph_nodes(node_type)")
@@ -817,7 +828,63 @@ def project_status(project_id: int, db_path: Path = DB_PATH) -> dict:
         "sprint_count": len(sprint_ids),
         "open_task_count": open_task_count,
         "done_task_count": done_task_count,
+        "has_northstar": get_document(project_id, "northstar", db_path=db_path) is not None,
     }
+
+
+def add_document(
+    project_id: int, doc_type: str, title: str, content: str, db_path: Path = DB_PATH
+) -> int:
+    """Attach a document (e.g. northstar/plan/note) to a project.
+
+    Raises ValueError if project_id doesn't exist.
+    """
+
+    if not any(p["id"] == project_id for p in list_projects(db_path=db_path)):
+        raise ValueError(f"unknown project_id: {project_id}")
+    with contextlib.closing(_connect(db_path)) as conn:
+        cur = conn.execute(
+            """INSERT INTO documents
+               (project_id, doc_type, title, content, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (project_id, doc_type, title, content, _now(), _now()),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def get_document(project_id: int, doc_type: str, db_path: Path = DB_PATH) -> dict | None:
+    """The most recently updated document of doc_type for a project, or None."""
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        row = conn.execute(
+            """SELECT * FROM documents WHERE project_id = ? AND doc_type = ?
+               ORDER BY updated_at DESC, id DESC LIMIT 1""",
+            (project_id, doc_type),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def update_document(document_id: int, content: str, db_path: Path = DB_PATH) -> None:
+    """Update an existing document's content in place (not a new row)."""
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        updated = conn.execute(
+            "UPDATE documents SET content = ?, updated_at = ? WHERE id = ?",
+            (content, _now(), document_id),
+        )
+        conn.commit()
+        if updated.rowcount == 0:
+            raise ValueError(f"unknown document_id: {document_id}")
+
+
+def list_documents(project_id: int, db_path: Path = DB_PATH) -> list[dict]:
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT * FROM documents WHERE project_id = ? ORDER BY created_at",
+            (project_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def list_sessions(db_path: Path = DB_PATH) -> list[dict]:

@@ -186,3 +186,8 @@
   V)** - Haroon'un sistemindeki AYNI mekanizma (git worktree, sunucu
   gerektirmeyen gerçek bir git özelliği). Worktree oluşturulamazsa fail-soft
   olarak ana klasöre düşer.
+
+- **2026-07-29 - documents tablosu eklendi (Stage W)** - Haroon'un "proje
+  dokümanlarını (northstar.md gibi) dosya olarak değil MC'de tutuyoruz"
+  fikrinin karşılığı. Şimdilik sadece northstar/plan/note tipleri var,
+  gerçek sistemdeki gibi zengin bir doküman kategorisi yok.
