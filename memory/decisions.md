@@ -206,3 +206,8 @@
   denemeleri hiç loglanmıyordu (sadece izin verilenler), şimdi
   "denied session=<id>: <reason>" satırı olarak session_id ile birlikte
   yazılıyor - yoksa rules_score'un okuyacağı hiçbir veri olmazdı.
+
+- **2026-07-29 - context-map eklendi (Stage Z)** - Haroon'un elle-onaylanan
+  node/edge ilişki grafiğinin küçük karşılığı. En önemli kısıt korundu: bir
+  edge, HER İKİ node onaylanmadan oluşturulamıyor - kürasyon zorunlu,
+  otomatik büyüme yok.

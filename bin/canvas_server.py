@@ -31,6 +31,12 @@ def build_canvas_data(db_path: Path = mc.DB_PATH) -> dict:
     }
 
 
+def build_context_map_data(db_path: Path = mc.DB_PATH) -> dict:
+    """Stage Z: curated node/edge graph — approved-only, unlike /api/canvas-data."""
+
+    return mc.list_context_map(only_approved=True, db_path=db_path)
+
+
 class CanvasRequestHandler(BaseHTTPRequestHandler):
     def _send_json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -48,11 +54,15 @@ class CanvasRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:
-        if self.path != "/api/canvas-data":
+        if self.path == "/api/canvas-data":
+            builder = build_canvas_data
+        elif self.path == "/api/context-map":
+            builder = build_context_map_data
+        else:
             self._send_json(404, {"error": "not found"})
             return
         try:
-            data = build_canvas_data()
+            data = builder()
         except Exception as exc:  # fail-soft: db unreachable, keep the server up
             self._send_json(500, {"error": str(exc)})
             return

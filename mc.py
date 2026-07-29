@@ -611,6 +611,24 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 updated_at TEXT NOT NULL
             )"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS context_nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_type TEXT NOT NULL,
+                label TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'proposed',
+                created_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS context_edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_node_id INTEGER NOT NULL,
+                to_node_id INTEGER NOT NULL,
+                relation TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )"""
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS graph_edges_src ON graph_edges(src, type)")
         conn.execute("CREATE INDEX IF NOT EXISTS graph_edges_dst ON graph_edges(dst, type)")
         conn.execute("CREATE INDEX IF NOT EXISTS graph_nodes_type ON graph_nodes(node_type)")
@@ -2741,6 +2759,79 @@ def retire_low_confidence_lessons(threshold: float = 0.3, db_path: Path = DB_PAT
                 old_path.rename(archived_dir / source_file)
 
     return len(retired)
+
+
+def propose_node(node_type: str, label: str, db_path: Path = DB_PATH) -> int:
+    """Add a context-map node with status='proposed'.
+
+    A proposed node cannot be linked by add_edge() until approve_node()
+    curates it — see decisions.md, Stage Z.
+    """
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        cur = conn.execute(
+            "INSERT INTO context_nodes (node_type, label, status, created_at) "
+            "VALUES (?, ?, 'proposed', ?)",
+            (node_type, label, _now()),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def approve_node(node_id: int, db_path: Path = DB_PATH) -> None:
+    with contextlib.closing(_connect(db_path)) as conn:
+        conn.execute(
+            "UPDATE context_nodes SET status = 'approved' WHERE id = ?", (node_id,)
+        )
+        conn.commit()
+
+
+def add_edge(from_node_id: int, to_node_id: int, relation: str, db_path: Path = DB_PATH) -> int:
+    """Link two curated nodes. Raises ValueError unless both are 'approved'.
+
+    This is the project's most important rule: the context map only grows
+    by human-curated approval, never automatically (see decisions.md, Stage Z).
+    """
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT id, status FROM context_nodes WHERE id IN (?, ?)",
+            (from_node_id, to_node_id),
+        ).fetchall()
+        statuses = {row["id"]: row["status"] for row in rows}
+        if statuses.get(from_node_id) != "approved" or statuses.get(to_node_id) != "approved":
+            raise ValueError(
+                "add_edge requires both nodes to be status='approved'; "
+                "approve_node() them first"
+            )
+        cur = conn.execute(
+            "INSERT INTO context_edges (from_node_id, to_node_id, relation, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (from_node_id, to_node_id, relation, _now()),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def list_context_map(only_approved: bool = True, db_path: Path = DB_PATH) -> dict:
+    """{"nodes": [...], "edges": [...]} — approved-only by default.
+
+    An edge can only exist between two approved nodes (add_edge() enforces
+    that), so filtering edges never needs to check node status separately.
+    """
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        if only_approved:
+            nodes = conn.execute(
+                "SELECT * FROM context_nodes WHERE status = 'approved' ORDER BY id"
+            ).fetchall()
+        else:
+            nodes = conn.execute("SELECT * FROM context_nodes ORDER BY id").fetchall()
+        edges = conn.execute("SELECT * FROM context_edges ORDER BY id").fetchall()
+    return {
+        "nodes": [dict(row) for row in nodes],
+        "edges": [dict(row) for row in edges],
+    }
 
 
 if __name__ == "__main__":

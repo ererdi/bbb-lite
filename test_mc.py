@@ -44,6 +44,7 @@ class McTestCase(unittest.TestCase):
                 "capability_boundaries", "graph_nodes", "graph_edges",
                 "answer_quality_scores", "answer_receipts", "lifecycle_runs",
                 "decisions", "compact_snapshots", "documents",
+                "context_nodes", "context_edges",
             },
             names,
         )
@@ -1410,6 +1411,52 @@ class StageRTestCase(unittest.TestCase):
                 "SELECT status FROM sessions WHERE session_id = ?", (self.session_id,)
             ).fetchone()[0]
         self.assertEqual("degraded", status)
+
+
+class StageZTestCase(McTestCase):
+    """Stage Z: context-map — a curated node/edge graph, not auto-grown."""
+
+    def test_add_edge_refuses_when_a_node_is_still_proposed(self) -> None:
+        idea = mc.propose_node("idea", "use SQLite", db_path=self.db_path)
+        decision = mc.propose_node("decision", "chose SQLite", db_path=self.db_path)
+        mc.approve_node(decision, db_path=self.db_path)  # idea stays proposed
+        with self.assertRaises(ValueError):
+            mc.add_edge(idea, decision, "supports", db_path=self.db_path)
+
+    def test_add_edge_succeeds_once_both_nodes_are_approved(self) -> None:
+        idea = mc.propose_node("idea", "use SQLite", db_path=self.db_path)
+        decision = mc.propose_node("decision", "chose SQLite", db_path=self.db_path)
+        mc.approve_node(idea, db_path=self.db_path)
+        mc.approve_node(decision, db_path=self.db_path)
+        edge_id = mc.add_edge(idea, decision, "supports", db_path=self.db_path)
+        self.assertIsInstance(edge_id, int)
+
+    def test_list_context_map_only_returns_approved_nodes_by_default(self) -> None:
+        approved = mc.propose_node("project", "bbb-lite", db_path=self.db_path)
+        proposed = mc.propose_node("idea", "unreviewed idea", db_path=self.db_path)
+        mc.approve_node(approved, db_path=self.db_path)
+        result = mc.list_context_map(db_path=self.db_path)
+        node_ids = {node["id"] for node in result["nodes"]}
+        self.assertIn(approved, node_ids)
+        self.assertNotIn(proposed, node_ids)
+
+    def test_list_context_map_only_approved_false_returns_all_nodes(self) -> None:
+        approved = mc.propose_node("project", "bbb-lite", db_path=self.db_path)
+        proposed = mc.propose_node("idea", "unreviewed idea", db_path=self.db_path)
+        mc.approve_node(approved, db_path=self.db_path)
+        result = mc.list_context_map(only_approved=False, db_path=self.db_path)
+        node_ids = {node["id"] for node in result["nodes"]}
+        self.assertEqual({approved, proposed}, node_ids)
+
+    def test_list_context_map_includes_approved_edges(self) -> None:
+        idea = mc.propose_node("idea", "use SQLite", db_path=self.db_path)
+        decision = mc.propose_node("decision", "chose SQLite", db_path=self.db_path)
+        mc.approve_node(idea, db_path=self.db_path)
+        mc.approve_node(decision, db_path=self.db_path)
+        mc.add_edge(idea, decision, "supports", db_path=self.db_path)
+        result = mc.list_context_map(db_path=self.db_path)
+        self.assertEqual(1, len(result["edges"]))
+        self.assertEqual("supports", result["edges"][0]["relation"])
 
 
 if __name__ == "__main__":
