@@ -35,6 +35,13 @@ def daily_check() -> None:
         )
     except Exception:
         print("[daily-check] memory healing skipped (error)")
+
+    try:
+        retired_count = mc.retire_low_confidence_lessons()
+        print(f"[daily-check] retired {retired_count} low-confidence lesson(s)")
+    except Exception:
+        print("[daily-check] confidence retirement skipped (error)")
+
     if not findings:
         print("[daily-check] floor clean, no judge call needed")
         return

@@ -424,6 +424,8 @@ def init_db(db_path: Path = DB_PATH) -> None:
         }
         if "embedding" not in existing_columns:
             conn.execute("ALTER TABLE memory_index ADD COLUMN embedding BLOB")
+        if "confidence" not in existing_columns:
+            conn.execute("ALTER TABLE memory_index ADD COLUMN confidence REAL DEFAULT 0.5")
         conn.execute(
             """CREATE TABLE IF NOT EXISTS task_activity (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2252,17 +2254,47 @@ def _extract_keywords(text: str, *, limit: int = 20) -> str:
     return ", ".join(seen)
 
 
-def _parse_memory_file(path: Path) -> tuple[str, str]:
-    """Return (title, body) — title from frontmatter if present, else the filename."""
+_CONFIDENCE_LEVELS = {"high": 0.9, "medium": 0.5, "low": 0.2}
+_DEFAULT_CONFIDENCE = 0.5
+
+
+def _parse_confidence_value(raw: str) -> float:
+    """Map a frontmatter confidence label (high/medium/low) or bare number to a float.
+
+    Falls back to _DEFAULT_CONFIDENCE for anything unrecognized, so a typo'd or
+    missing confidence never breaks indexing.
+    """
+
+    raw = raw.strip().lower()
+    if raw in _CONFIDENCE_LEVELS:
+        return _CONFIDENCE_LEVELS[raw]
+    try:
+        return float(raw)
+    except ValueError:
+        return _DEFAULT_CONFIDENCE
+
+
+def _parse_memory_file(path: Path) -> tuple[str, str, float]:
+    """Return (title, body, confidence) — title/confidence from frontmatter if present.
+
+    Title falls back to the filename and confidence to _DEFAULT_CONFIDENCE when
+    frontmatter is absent or doesn't declare them.
+    """
 
     text = path.read_text(encoding="utf-8")
     match = re.match(r"^---\n(.*?)\n---\n(.*)$", text, re.S)
     if not match:
-        return path.stem, text.strip()
+        return path.stem, text.strip(), _DEFAULT_CONFIDENCE
     frontmatter, body = match.group(1), match.group(2)
     title_match = re.search(r"^title:\s*(.+)$", frontmatter, re.M)
     title = title_match.group(1).strip() if title_match else path.stem
-    return title, body.strip()
+    confidence_match = re.search(r"^confidence:\s*(.+)$", frontmatter, re.M)
+    confidence = (
+        _parse_confidence_value(confidence_match.group(1))
+        if confidence_match
+        else _DEFAULT_CONFIDENCE
+    )
+    return title, body.strip(), confidence
 
 
 def _get_embedding_model() -> Any:
@@ -2321,18 +2353,20 @@ def index_memory_files(db_path: Path = DB_PATH) -> int:
     count = 0
     with contextlib.closing(_connect(db_path)) as conn:
         for path in sorted(memory_dir.glob("*.md")):
-            title, body = _parse_memory_file(path)
+            title, body, confidence = _parse_memory_file(path)
             keywords = _extract_keywords(f"{title} {body}")
             embedding = _embed_or_none(f"{title}\n{body}")
             conn.execute(
-                """INSERT INTO memory_index (source_file, title, content, keywords, embedding)
-                   VALUES (?, ?, ?, ?, ?)
+                """INSERT INTO memory_index
+                       (source_file, title, content, keywords, embedding, confidence)
+                   VALUES (?, ?, ?, ?, ?, ?)
                    ON CONFLICT(source_file) DO UPDATE SET
                        title = excluded.title,
                        content = excluded.content,
                        keywords = excluded.keywords,
-                       embedding = excluded.embedding""",
-                (path.name, title, body, keywords, embedding),
+                       embedding = excluded.embedding,
+                       confidence = excluded.confidence""",
+                (path.name, title, body, keywords, embedding, confidence),
             )
             _upsert_memory_graph(conn, path.name, title, body, keywords)
             count += 1
@@ -2346,7 +2380,9 @@ def search_memory(query: str, *, limit: int = 3, db_path: Path = DB_PATH) -> lis
     Mirrors the "recall comes from the index, not the raw docs" split: this
     is the search layer, backed by whatever index_memory_files() last wrote.
     Not semantic search — weighted keyword-count ranking: a term counted in
-    title is worth 3 points, in keywords 2 points, in content 1 point.
+    title is worth 3 points, in keywords 2 points, in content 1 point. The
+    raw keyword score is then multiplied by the row's confidence, so a
+    low-confidence lesson ranks below an equally-matching high-confidence one.
     """
 
     terms = list(dict.fromkeys(_significant_words(query)))
@@ -2354,19 +2390,20 @@ def search_memory(query: str, *, limit: int = 3, db_path: Path = DB_PATH) -> lis
         return []
     with contextlib.closing(_connect(db_path)) as conn:
         rows = conn.execute(
-            "SELECT source_file, title, content, keywords FROM memory_index"
+            "SELECT source_file, title, content, keywords, confidence FROM memory_index"
         ).fetchall()
-    scored: list[tuple[int, dict]] = []
+    scored: list[tuple[float, dict]] = []
     for row in rows:
         title = row["title"].lower()
         keywords = row["keywords"].lower()
         content = row["content"].lower()
-        score = sum(
+        raw_score = sum(
             3 * title.count(term) + 2 * keywords.count(term) + content.count(term)
             for term in terms
         )
-        if score > 0:
-            scored.append((score, dict(row)))
+        if raw_score > 0:
+            confidence = row["confidence"] if row["confidence"] is not None else _DEFAULT_CONFIDENCE
+            scored.append((raw_score * confidence, dict(row)))
     scored.sort(key=lambda pair: pair[0], reverse=True)
     return [item for _score, item in scored[:limit]]
 
@@ -2375,22 +2412,26 @@ def semantic_search(query: str, *, limit: int = 3, db_path: Path = DB_PATH) -> l
     """Embedding-based search over memory_index — finds meaning matches with no shared words.
 
     Complements search_memory() (keyword ranking); this ranks by cosine similarity
-    between the query's embedding and each row's stored embedding.
+    between the query's embedding and each row's stored embedding, multiplied by
+    the row's confidence — a low-confidence lesson ranks below an equally
+    similar high-confidence one. `similarity` in the returned dict stays the raw
+    cosine value; the confidence weighting only affects ordering.
     """
 
     query_vector = np.frombuffer(_embed(query), dtype=np.float32)
     with contextlib.closing(_connect(db_path)) as conn:
         rows = conn.execute(
-            "SELECT source_file, title, content, keywords, embedding FROM memory_index "
-            "WHERE embedding IS NOT NULL"
+            "SELECT source_file, title, content, keywords, embedding, confidence "
+            "FROM memory_index WHERE embedding IS NOT NULL"
         ).fetchall()
     scored: list[tuple[float, dict]] = []
     for row in rows:
         row_vector = np.frombuffer(row["embedding"], dtype=np.float32)
         similarity = _cosine_similarity(query_vector, row_vector)
+        confidence = row["confidence"] if row["confidence"] is not None else _DEFAULT_CONFIDENCE
         item = {key: row[key] for key in row.keys() if key != "embedding"}
         item["similarity"] = similarity
-        scored.append((similarity, item))
+        scored.append((similarity * confidence, item))
     scored.sort(key=lambda pair: pair[0], reverse=True)
     return [item for _score, item in scored[:limit]]
 
@@ -2611,6 +2652,46 @@ def heal_memory(db_path: Path = DB_PATH) -> dict:
         merged += 1
 
     return {"groups_found": len(groups), "merged": merged}
+
+
+def retire_low_confidence_lessons(threshold: float = 0.3, db_path: Path = DB_PATH) -> int:
+    """Archive lessons whose confidence is below `threshold` (never delete).
+
+    Stage X: makes confidence a lever, not a dead metric — a lesson that
+    keeps scoring low in search eventually gets moved out of memory_index
+    entirely. Mirrors heal_memory()'s memory/_archived-healed/ pattern: files
+    are moved there, not deleted. MEMORY.md and decisions.md are structural
+    index files, not lessons, so they're exempt regardless of confidence.
+    """
+
+    memory_dir = Path(__file__).resolve().parent / "memory"
+    archived_dir = memory_dir / "_archived-healed"
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            """SELECT source_file, confidence FROM memory_index
+               WHERE source_file NOT IN ('MEMORY.md', 'decisions.md')"""
+        ).fetchall()
+        retired = [
+            row["source_file"]
+            for row in rows
+            if (row["confidence"] if row["confidence"] is not None else _DEFAULT_CONFIDENCE)
+            < threshold
+        ]
+        for source_file in retired:
+            conn.execute(
+                "DELETE FROM memory_index WHERE source_file = ?", (source_file,)
+            )
+        conn.commit()
+
+    if retired:
+        archived_dir.mkdir(exist_ok=True)
+        for source_file in retired:
+            old_path = memory_dir / source_file
+            if old_path.exists():
+                old_path.rename(archived_dir / source_file)
+
+    return len(retired)
 
 
 if __name__ == "__main__":

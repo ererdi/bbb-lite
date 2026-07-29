@@ -760,16 +760,36 @@ class ParseMemoryFileTestCase(unittest.TestCase):
             "---\ntitle: Guard blocks done\ndate: 2026-07-21\n---\n\nBody text here.\n",
             encoding="utf-8",
         )
-        title, body = mc._parse_memory_file(path)
+        title, body, confidence = mc._parse_memory_file(path)
         self.assertEqual("Guard blocks done", title)
         self.assertEqual("Body text here.", body)
+        self.assertEqual(0.5, confidence)  # no confidence field -> default
 
     def test_parse_memory_file_without_frontmatter_uses_filename(self) -> None:
         path = Path(self.tmp_dir.name) / "plain-note.md"
         path.write_text("Just some body text.\n", encoding="utf-8")
-        title, body = mc._parse_memory_file(path)
+        title, body, confidence = mc._parse_memory_file(path)
         self.assertEqual("plain-note", title)
         self.assertEqual("Just some body text.", body)
+        self.assertEqual(0.5, confidence)
+
+    def test_parse_memory_file_maps_confidence_labels(self) -> None:
+        cases = {"high": 0.9, "medium": 0.5, "low": 0.2}
+        for label, expected in cases.items():
+            path = Path(self.tmp_dir.name) / f"{label}.md"
+            path.write_text(
+                f"---\ntitle: Note\nconfidence: {label}\n---\n\nBody.\n", encoding="utf-8"
+            )
+            _title, _body, confidence = mc._parse_memory_file(path)
+            self.assertEqual(expected, confidence)
+
+    def test_parse_memory_file_unrecognized_confidence_defaults_to_medium(self) -> None:
+        path = Path(self.tmp_dir.name) / "weird.md"
+        path.write_text(
+            "---\ntitle: Note\nconfidence: extremely-sure\n---\n\nBody.\n", encoding="utf-8"
+        )
+        _title, _body, confidence = mc._parse_memory_file(path)
+        self.assertEqual(0.5, confidence)
 
 
 class MemoryIndexTestCase(unittest.TestCase):
@@ -850,6 +870,33 @@ class MemoryIndexTestCase(unittest.TestCase):
             ).fetchall()
         self.assertEqual(1, len(rows))
         self.assertEqual("Guard note updated", rows[0]["title"])
+
+    def test_index_memory_files_stores_confidence_from_frontmatter(self) -> None:
+        (self.memory_dir / "sure.md").write_text(
+            "---\ntitle: Sure thing\nconfidence: high\n---\n\nBody.\n", encoding="utf-8"
+        )
+        mc.index_memory_files(db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT confidence FROM memory_index WHERE source_file = 'sure.md'"
+            ).fetchone()
+        self.assertEqual(0.9, row["confidence"])
+
+    def test_search_memory_ranks_higher_confidence_above_equal_keyword_score(self) -> None:
+        (self.memory_dir / "shaky.md").write_text(
+            "---\ntitle: Widget notes\nconfidence: low\n---\n\n"
+            "The widget behaves oddly under load.\n",
+            encoding="utf-8",
+        )
+        (self.memory_dir / "solid.md").write_text(
+            "---\ntitle: Widget notes\nconfidence: high\n---\n\n"
+            "The widget behaves oddly under load.\n",
+            encoding="utf-8",
+        )
+        mc.index_memory_files(db_path=self.db_path)
+        results = mc.search_memory("widget", db_path=self.db_path)
+        self.assertEqual("solid.md", results[0]["source_file"])
+        self.assertEqual("shaky.md", results[1]["source_file"])
 
     def test_search_memory_ranks_higher_keyword_count_first(self) -> None:
         self._write_note(
@@ -943,6 +990,56 @@ class MemoryIndexTestCase(unittest.TestCase):
                 db_path=self.db_path,
             )
         self.assertIsNotNone(result)
+
+    def test_retire_low_confidence_lessons_archives_below_threshold(self) -> None:
+        (self.memory_dir / "shaky.md").write_text(
+            "---\ntitle: Shaky lesson\nconfidence: 0.1\n---\n\nProbably wrong.\n",
+            encoding="utf-8",
+        )
+        (self.memory_dir / "solid.md").write_text(
+            "---\ntitle: Solid lesson\nconfidence: high\n---\n\nStill true.\n",
+            encoding="utf-8",
+        )
+        mc.index_memory_files(db_path=self.db_path)
+
+        retired_count = mc.retire_low_confidence_lessons(threshold=0.3, db_path=self.db_path)
+
+        self.assertEqual(1, retired_count)
+        archived_dir = self.memory_dir / "_archived-healed"
+        self.assertTrue((archived_dir / "shaky.md").exists())
+        self.assertFalse((self.memory_dir / "shaky.md").exists())
+        self.assertTrue((self.memory_dir / "solid.md").exists())
+
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            remaining = {
+                row["source_file"]
+                for row in conn.execute("SELECT source_file FROM memory_index").fetchall()
+            }
+        self.assertNotIn("shaky.md", remaining)
+        self.assertIn("solid.md", remaining)
+
+    def test_retire_low_confidence_lessons_keeps_at_or_above_threshold(self) -> None:
+        (self.memory_dir / "borderline.md").write_text(
+            "---\ntitle: Borderline lesson\nconfidence: 0.3\n---\n\nStill on the fence.\n",
+            encoding="utf-8",
+        )
+        mc.index_memory_files(db_path=self.db_path)
+
+        retired_count = mc.retire_low_confidence_lessons(threshold=0.3, db_path=self.db_path)
+
+        self.assertEqual(0, retired_count)
+        self.assertTrue((self.memory_dir / "borderline.md").exists())
+
+    def test_retire_low_confidence_lessons_exempts_structural_files(self) -> None:
+        (self.memory_dir / "MEMORY.md").write_text("Index content.\n", encoding="utf-8")
+        (self.memory_dir / "decisions.md").write_text("Decision log.\n", encoding="utf-8")
+        mc.index_memory_files(db_path=self.db_path)
+
+        retired_count = mc.retire_low_confidence_lessons(threshold=0.9, db_path=self.db_path)
+
+        self.assertEqual(0, retired_count)
+        self.assertTrue((self.memory_dir / "MEMORY.md").exists())
+        self.assertTrue((self.memory_dir / "decisions.md").exists())
 
 
 class SemanticSearchTestCase(unittest.TestCase):

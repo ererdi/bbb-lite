@@ -191,3 +191,9 @@
   dokümanlarını (northstar.md gibi) dosya olarak değil MC'de tutuyoruz"
   fikrinin karşılığı. Şimdilik sadece northstar/plan/note tipleri var,
   gerçek sistemdeki gibi zengin bir doküman kategorisi yok.
+
+- **2026-07-29 - confidence skoru artık gerçekten kullanılıyor (Stage X)** -
+  arama sıralamasını etkiliyor, düşük confidence otomatik emekliye
+  ayrılıyor. Haroon'un sisteminde bu metrik neredeyse hep aynı değerde
+  kümelenmiş ("ölü metrik") bulunmuştu - bizim sistemimizde en azından
+  gerçekten okunuyor ve kullanılıyor.
