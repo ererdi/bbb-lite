@@ -17,9 +17,19 @@ def main() -> None:
     session_id = payload.get("session_id", "unknown")
     source = payload.get("source", "unknown")
     cwd = payload.get("cwd") or os.getcwd()
+    # Stage AH: not a documented field of Claude Code's real SessionStart
+    # payload (checked against the hooks docs, 2026-07-29) - read it
+    # defensively so a payload without it behaves exactly as before.
+    client_session_uuid = payload.get("client_session_uuid")
 
     mc.init_db()
-    mc.ensure_session(session_id)
+    # Look up any earlier session tied to this client_session_uuid BEFORE
+    # ensure_session() below tags the *current* session_id with it - otherwise
+    # the lookup would just find itself.
+    linked_session_id = (
+        mc.find_session_by_client_uuid(client_session_uuid) if client_session_uuid else None
+    )
+    mc.ensure_session(session_id, client_session_uuid=client_session_uuid)
     mc.record_lifecycle_run(
         "session_start",
         session_id=session_id,
@@ -40,17 +50,28 @@ def main() -> None:
     # Stage AF: /clear hands session_start a brand-new session_id (verified
     # live: two distinct UUIDs across a /clear), which has no row in `roles`
     # yet. Left alone, get_role() would silently fall back to "brozzer" and
-    # the declared role would be lost. Inherit the most recently declared
-    # role instead. NOT fail-soft on purpose: if there is no previous role to
-    # inherit either, say so out loud rather than defaulting quietly (see
-    # decisions.md, 2026-07-29).
+    # the declared role would be lost. Inherit a role instead. NOT fail-soft
+    # on purpose: if there is no previous role to inherit either, say so out
+    # loud rather than defaulting quietly (see decisions.md, 2026-07-29).
     if source == "clear" and not mc.role_exists(session_id):
-        inherited = mc.get_most_recent_role()
-        if inherited:
+        # Stage AH: if client_session_uuid linked us to a specific earlier
+        # session, that is a more precise connection than "whatever role was
+        # declared most recently anywhere" - prefer it. Otherwise fall back
+        # to Stage AF's original behavior unchanged (see decisions.md,
+        # 2026-07-29).
+        if linked_session_id and linked_session_id != session_id:
+            inherited = mc.get_role(linked_session_id)
             mc.set_role(session_id, inherited)
-            print(f"[bbb-lite] role inherited after /clear: {inherited}")
+            print(
+                f"[bbb-lite] role inherited after /clear via client_session_uuid: {inherited}"
+            )
         else:
-            print("[bbb-lite] NOTE: no previous role found, defaulting to brozzer")
+            inherited = mc.get_most_recent_role()
+            if inherited:
+                mc.set_role(session_id, inherited)
+                print(f"[bbb-lite] role inherited after /clear: {inherited}")
+            else:
+                print("[bbb-lite] NOTE: no previous role found, defaulting to brozzer")
 
     role = mc.get_role(session_id)
     print(

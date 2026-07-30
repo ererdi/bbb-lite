@@ -433,6 +433,11 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 status TEXT NOT NULL
             )"""
         )
+        existing_session_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        if "client_session_uuid" not in existing_session_columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN client_session_uuid TEXT")
         conn.execute(
             """CREATE TABLE IF NOT EXISTS roles (
                 session_id TEXT PRIMARY KEY,
@@ -741,18 +746,42 @@ def init_db(db_path: Path = DB_PATH) -> None:
         conn.commit()
 
 
-def ensure_session(session_id: str, db_path: Path = DB_PATH) -> str:
+def ensure_session(
+    session_id: str, client_session_uuid: str | None = None, db_path: Path = DB_PATH
+) -> str:
     with contextlib.closing(_connect(db_path)) as conn:
         row = conn.execute(
             "SELECT session_id FROM sessions WHERE session_id = ?", (session_id,)
         ).fetchone()
         if row is None:
             conn.execute(
-                "INSERT INTO sessions (session_id, started_at, status) VALUES (?, ?, ?)",
-                (session_id, _now(), "active"),
+                """INSERT INTO sessions
+                   (session_id, started_at, status, client_session_uuid)
+                   VALUES (?, ?, ?, ?)""",
+                (session_id, _now(), "active", client_session_uuid),
             )
-            conn.commit()
+        elif client_session_uuid is not None:
+            conn.execute(
+                "UPDATE sessions SET client_session_uuid = ? WHERE session_id = ?",
+                (client_session_uuid, session_id),
+            )
+        conn.commit()
     return session_id
+
+
+def find_session_by_client_uuid(
+    client_session_uuid: str, db_path: Path = DB_PATH
+) -> str | None:
+    """The most recent session_id recorded under this client_session_uuid, or
+    None if no session was ever tagged with it (Stage AH)."""
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        row = conn.execute(
+            """SELECT session_id FROM sessions WHERE client_session_uuid = ?
+               ORDER BY started_at DESC LIMIT 1""",
+            (client_session_uuid,),
+        ).fetchone()
+    return row["session_id"] if row else None
 
 
 ROLE_PERMISSIONS = {

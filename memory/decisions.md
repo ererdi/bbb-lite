@@ -285,3 +285,5 @@
 - 2026-07-29 - KRITIK BUG DUZELTILDI (Stage AF): Claude Code'un /clear'i yeni bir session_id urettigi dogrulandi (canli test: iki farkli UUID). Bu, rolun /clear sonrasi sessizce brozzer'a dustugu anlamina geliyordu - artik en son declare edilen rol yeni session_id'ye miras aliniyor.
 
 - 2026-07-29 - Project resolution eklendi (Stage AG) - cwd'nin son klasor adi ile projects.name eslestiriliyor, basit bir eslesme. Eslesmezse Haroon'un ilkesine uygun sekilde 'unmapped' acikca belirtiliyor, sessizce bir projeye baglanmiyor.
+
+- 2026-07-29 - client_session_uuid destegi eklendi (Stage AH) - Claude Code'un GERCEKTE bu alani saglayip saglamadigi dogrulanmadi (payload'da yoksa sessizce None kullaniliyor, hata vermiyor). Varsa Stage AF'deki 'en son rol' fallback'inden daha kesin bir baglanti sagliyor.
