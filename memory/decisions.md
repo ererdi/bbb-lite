@@ -291,3 +291,5 @@
 - 2026-07-29 - post_compact_recap.py ayri hook olarak cikarildi (Stage AI) - Haroon'un PostCompact hook'unun karsiligi, davranis degismedi, sadece kod session_start.py'den ayrildi.
 
 - 2026-07-29 - auto-safepoint guclendirildi (Stage AJ) - opsiyonel git auto-commit eklendi (BBB_AUTO_COMMIT=1 ile acilir, varsayilan kapali - her turda otomatik commit riskli olabilecegi icin bilerek opt-in yapildi).
+
+- 2026-07-29 - session_warn.py eklendi (Stage AK) - Codex'in Session Lifecycle listesindeki 9 alt-maddenin sonuncusu, boylece bu madde tamamlandi. Mevcut session_score() (Stage Y) fonksiyonunu kullaniyor, yeni bir skorlama mantigi icat etmedi.

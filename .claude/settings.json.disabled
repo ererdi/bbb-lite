@@ -6,6 +6,10 @@
           {
             "type": "command",
             "command": "py hooks/role_declare.py"
+          },
+          {
+            "type": "command",
+            "command": "py hooks/session_warn.py"
           }
         ]
       }
