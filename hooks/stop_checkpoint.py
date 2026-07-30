@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -47,6 +49,30 @@ def _last_assistant_summary(transcript_path: str) -> str | None:
     return summary[:SUMMARY_LIMIT] if summary else None
 
 
+def _auto_commit(summary: str) -> None:
+    """Stage AJ: the git-commit half of Haroon's auto-safepoint.sh (the other
+    half - saving session state as a real checkpoint - was already covered by
+    write_checkpoint()/record_lifecycle_run() above).
+
+    Opt-in only (BBB_AUTO_COMMIT=1) - auto-committing every turn is risky
+    enough that the user should turn it on deliberately, not get it by
+    default (see decisions.md, 2026-07-29). Fail-soft: a git error here must
+    never affect the checkpoint write that already happened.
+    """
+
+    if os.environ.get("BBB_AUTO_COMMIT") != "1":
+        return
+    try:
+        subprocess.run(["git", "add", "-A"], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", f"auto-safepoint: {summary[:80]}"],
+            check=True,
+            capture_output=True,
+        )
+    except Exception:
+        pass
+
+
 def main() -> None:
     payload = json.load(sys.stdin)
     session_id = payload.get("session_id", "unknown")
@@ -63,6 +89,8 @@ def main() -> None:
         status="ok",
         details={"summary": summary[:120]},
     )
+
+    _auto_commit(summary)
 
 
 if __name__ == "__main__":

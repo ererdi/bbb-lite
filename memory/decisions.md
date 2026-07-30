@@ -289,3 +289,5 @@
 - 2026-07-29 - client_session_uuid destegi eklendi (Stage AH) - Claude Code'un GERCEKTE bu alani saglayip saglamadigi dogrulanmadi (payload'da yoksa sessizce None kullaniliyor, hata vermiyor). Varsa Stage AF'deki 'en son rol' fallback'inden daha kesin bir baglanti sagliyor.
 
 - 2026-07-29 - post_compact_recap.py ayri hook olarak cikarildi (Stage AI) - Haroon'un PostCompact hook'unun karsiligi, davranis degismedi, sadece kod session_start.py'den ayrildi.
+
+- 2026-07-29 - auto-safepoint guclendirildi (Stage AJ) - opsiyonel git auto-commit eklendi (BBB_AUTO_COMMIT=1 ile acilir, varsayilan kapali - her turda otomatik commit riskli olabilecegi icin bilerek opt-in yapildi).
