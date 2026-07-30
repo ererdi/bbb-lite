@@ -8,8 +8,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import mc
+import post_compact_recap
 
 
 def main() -> None:
@@ -80,32 +82,11 @@ def main() -> None:
     )
 
     if source == "compact":
-        checkpoint = mc.latest_checkpoint(session_id)
-        state = "checkpoint intact" if checkpoint else "no checkpoint found"
-        print(f"[bbb-lite] resumed after compaction, {state}")
-
-        # Stage R: NOT fail-soft on purpose. If we can't save or compare the
-        # post-compact snapshot, that is itself a finding — Compact must not
-        # be treated as a successful recovery when persistence can't be
-        # verified (see decisions.md, 2026-07-27).
-        try:
-            mc.save_snapshot(session_id, "post")
-            findings = mc.compare_snapshots(session_id)
-        except Exception as exc:
-            findings = [f"unable to verify compact recovery: {exc}"]
-
-        if findings:
-            mc.mark_session_degraded(session_id)
-            print(f"[bbb-lite] DEGRADED RECOVERY: {'; '.join(findings)}")
-        else:
-            snapshot = mc.compact_snapshot(session_id)
-            total = (
-                len(snapshot["tasks"])
-                + snapshot["decisions"]
-                + snapshot["checklist_items"]
-                + (1 if snapshot["role_declared"] else 0)
-            )
-            print(f"[bbb-lite] compact recovery verified: {total}/{total} items intact")
+        # Stage AI: moved to hooks/post_compact_recap.py so it maps onto
+        # Claude Code's real PostCompact event, not just SessionStart's
+        # "compact" matcher - see decisions.md, 2026-07-29. Still called
+        # directly here so this matcher's behavior is unchanged.
+        post_compact_recap.recap(session_id)
         return
 
     if source == "clear":

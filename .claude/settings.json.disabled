@@ -45,6 +45,16 @@
         ]
       }
     ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "py hooks/post_compact_recap.py"
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
