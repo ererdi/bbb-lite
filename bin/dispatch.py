@@ -228,20 +228,31 @@ async def dispatch(task: str) -> None:
         print(f"[dispatch] role=builder -> {change}")
         if run_id:
             _safe_mc(None, mc.record_agent_output, run_id, "builder", change)
-        if task_id is not None:
-            _safe_mc(None, mc.complete_task, task_id, session_id=DISPATCH_SESSION_ID)
+
+    # Recorded before complete_task() regardless of run_id, since Stage AE
+    # requires a real evidence row to complete a task at all.
+    evidence_id = _safe_mc(
+        None,
+        mc.record_evidence,
+        "dispatch",
+        "architect_builder_local_dispatch",
+        "passed" if change is not None else "needs_review",
+        details={"dispatch_run_id": run_id, "role_needed": role_needed},
+    )
+
+    if task_id is not None and change is not None and evidence_id is not None:
+        _safe_mc(
+            None,
+            mc.complete_task,
+            task_id,
+            session_id=DISPATCH_SESSION_ID,
+            evidence_id=evidence_id,
+            completion_summary=change,
+        )
 
     if run_id:
         status = "completed" if change is not None else "needs_attention"
         _safe_mc(None, mc.complete_dispatch_run, run_id, status=status, summary=f"{role_needed} -> builder")
-        _safe_mc(
-            None,
-            mc.record_evidence,
-            "dispatch",
-            "architect_builder_local_dispatch",
-            "passed" if change is not None else "needs_review",
-            details={"dispatch_run_id": run_id, "role_needed": role_needed},
-        )
     print("[dispatch] baton: done")
 
 

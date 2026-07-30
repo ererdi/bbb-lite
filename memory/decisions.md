@@ -274,3 +274,10 @@
   - bu, curate_graph_edge()'in (Stage S, advisory) işaretlediği auto-graph
   edge'lerinin context-map'e sızmasını engelliyor. canvas_server.py'ye giden
   {"nodes":[], "edges":[]} sözleşmesi değişmedi.
+
+- 2026-07-29 - complete_task() artık zorunlu kanıt istiyor (Stage AE, Codex
+  önerisi) - var olan evidence tablosuna bağlandı, yeni tablo açılmadı.
+  completed_by_role ayrı parametre istemek yerine get_role()'den otomatik
+  türetiliyor - zaten bilinen bilgiyi tekrar sormamak için.
+  verified_default_path Codex'in önerisinde belirsizdi, "evidence status !=
+  fail" kontrolü olarak yorumlandı.

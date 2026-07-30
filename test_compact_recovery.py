@@ -119,7 +119,16 @@ class CompactRecoveryTestCase(unittest.TestCase):
         task_ids = [t["id"] for t in mc.list_open_tasks(db_path=self.db_path)]
         with _bind_to_test_db(self.db_path):
             _run_pre_compact(self.session_id)
-            mc.complete_task(task_ids[0], db_path=self.db_path)  # the "loss"
+            evidence_id = mc.record_evidence(
+                "test", "compact-recovery fixture", "passed", db_path=self.db_path
+            )
+            mc.complete_task(
+                task_ids[0],
+                session_id=self.session_id,
+                evidence_id=evidence_id,
+                completion_summary="task closed for compact-recovery test",
+                db_path=self.db_path,
+            )  # the "loss"
             output = _run_session_start_compact(self.session_id)
         self.assertIn("[bbb-lite] DEGRADED RECOVERY:", output)
         self.assertIn("tasks: 5 -> 4", output)

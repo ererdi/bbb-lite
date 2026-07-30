@@ -103,6 +103,18 @@ class DispatchTestCase(unittest.TestCase):
         self._ledger_patches = [patcher.start() for patcher in patches]
         for patcher in patches:
             self.addCleanup(patcher.stop)
+        (
+            self.mock_init_db,
+            self.mock_ensure_session,
+            self.mock_create_dispatch_run,
+            self.mock_record_agent_output,
+            self.mock_complete_dispatch_run,
+            self.mock_record_evidence,
+            self.mock_add_task,
+            self.mock_complete_task,
+            self.mock_create_worktree,
+            self.mock_remove_worktree,
+        ) = self._ledger_patches
 
     def _run(self, task: str = "add a hello world function") -> str:
         buffer = io.StringIO()
@@ -178,7 +190,10 @@ class DispatchTestCase(unittest.TestCase):
             "Fix the login bug", session_id=dispatch.DISPATCH_SESSION_ID
         )
         complete_task_mock.assert_called_once_with(
-            42, session_id=dispatch.DISPATCH_SESSION_ID
+            42,
+            session_id=dispatch.DISPATCH_SESSION_ID,
+            evidence_id=self.mock_record_evidence.return_value,
+            completion_summary="short change",
         )
         self.assertIn("[dispatch] role=cto -> Fix the login bug (architect: yes)", output)
         self.assertIn("[dispatch] role=architect -> short plan", output)
@@ -198,7 +213,12 @@ class DispatchTestCase(unittest.TestCase):
         add_task_mock.assert_called_once_with(
             "Add a helper", session_id=dispatch.DISPATCH_SESSION_ID
         )
-        complete_task_mock.assert_called_once_with(7, session_id=dispatch.DISPATCH_SESSION_ID)
+        complete_task_mock.assert_called_once_with(
+            7,
+            session_id=dispatch.DISPATCH_SESSION_ID,
+            evidence_id=self.mock_record_evidence.return_value,
+            completion_summary="short change",
+        )
         self.assertIn("[dispatch] role=cto -> Add a helper (architect: no)", output)
         self.assertNotIn("role=architect", output)
 

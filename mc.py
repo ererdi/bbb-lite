@@ -509,6 +509,17 @@ def init_db(db_path: Path = DB_PATH) -> None:
             )"""
         )
         conn.execute(
+            """CREATE TABLE IF NOT EXISTS task_completions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                evidence_id INTEGER NOT NULL,
+                completed_by_role TEXT NOT NULL,
+                completion_summary TEXT NOT NULL,
+                completed_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
             """CREATE TABLE IF NOT EXISTS turns (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -2429,12 +2440,37 @@ def recovery_package_size(session_id: str, db_path: Path = DB_PATH) -> int:
 
 
 def complete_task(
-    task_id: int, *, session_id: str | None = None, db_path: Path = DB_PATH
+    task_id: int,
+    *,
+    session_id: str,
+    evidence_id: int,
+    completion_summary: str,
+    db_path: Path = DB_PATH,
 ) -> dict:
     """The one sanctioned path to tasks.status='done'; raw SQL is refused by the guard.
 
-    If session_id is given, records a 'completed' row in task_activity.
+    Stage AE: "no done without evidence" — session_id, evidence_id, and
+    completion_summary are all required (no defaults). evidence_id must name
+    an existing evidence row whose status isn't 'fail', and completion_summary
+    can't be blank. completed_by_role is not a separate parameter — it's
+    derived from session_id via get_role(), since that's already known.
+
+    Records a 'completed' row in task_activity and a full receipt (evidence,
+    role, summary) in task_completions.
     """
+
+    if not completion_summary.strip():
+        raise ValueError("completion_summary cannot be empty")
+
+    evidence_rows = query_rows(
+        "SELECT * FROM evidence WHERE id = ?", (evidence_id,), db_path=db_path
+    )
+    if not evidence_rows:
+        raise ValueError(f"evidence not found: {evidence_id}")
+    if evidence_rows[0]["status"] == "fail":
+        raise ValueError("cannot complete a task with failing evidence")
+
+    completed_by_role = get_role(session_id, db_path=db_path)
 
     authorization = _CompletionAuthorization(task_id=str(task_id))
     now = _now()
@@ -2453,13 +2489,24 @@ def complete_task(
             raise MCCompletionRefused(
                 f"completion refused: guarded update changed {updated.rowcount} rows"
             )
-        if session_id is not None:
-            conn.execute(
-                "INSERT INTO task_activity (task_id, session_id, activity, at) VALUES (?, ?, ?, ?)",
-                (task_id, session_id, "completed", now),
-            )
+        conn.execute(
+            "INSERT INTO task_activity (task_id, session_id, activity, at) VALUES (?, ?, ?, ?)",
+            (task_id, session_id, "completed", now),
+        )
+        conn.execute(
+            """INSERT INTO task_completions
+               (task_id, session_id, evidence_id, completed_by_role, completion_summary, completed_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (task_id, session_id, evidence_id, completed_by_role, completion_summary, now),
+        )
         conn.commit()
-    return {"ok": True, "task_id": task_id, "status": "done"}
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "status": "done",
+        "evidence_id": evidence_id,
+        "completed_by_role": completed_by_role,
+    }
 
 
 _STOPWORDS = {
