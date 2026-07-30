@@ -1501,6 +1501,11 @@ class StageNTestCase(unittest.TestCase):
         mc.set_role("s1", "builder", db_path=self.db_path)
         self.assertEqual("builder", mc.get_role("s1", db_path=self.db_path))
 
+    def test_set_role_then_get_role_roundtrips_for_claude_code_style_session_id(self) -> None:
+        fake_session_id = "a3066b4d-9d92-4700-8806-8020398a57c5"
+        mc.set_role(fake_session_id, "builder", db_path=self.db_path)
+        self.assertEqual("builder", mc.get_role(fake_session_id, db_path=self.db_path))
+
     def test_set_role_twice_replaces_the_previous_role(self) -> None:
         mc.set_role("s1", "advisor", db_path=self.db_path)
         mc.set_role("s1", "builder", db_path=self.db_path)

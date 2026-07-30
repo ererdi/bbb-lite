@@ -26,6 +26,21 @@ def main() -> None:
         details={"source": source},
     )
 
+    # Stage AF: /clear hands session_start a brand-new session_id (verified
+    # live: two distinct UUIDs across a /clear), which has no row in `roles`
+    # yet. Left alone, get_role() would silently fall back to "brozzer" and
+    # the declared role would be lost. Inherit the most recently declared
+    # role instead. NOT fail-soft on purpose: if there is no previous role to
+    # inherit either, say so out loud rather than defaulting quietly (see
+    # decisions.md, 2026-07-29).
+    if source == "clear" and not mc.role_exists(session_id):
+        inherited = mc.get_most_recent_role()
+        if inherited:
+            mc.set_role(session_id, inherited)
+            print(f"[bbb-lite] role inherited after /clear: {inherited}")
+        else:
+            print("[bbb-lite] NOTE: no previous role found, defaulting to brozzer")
+
     role = mc.get_role(session_id)
     print(
         f"[bbb-lite] role: {role} "

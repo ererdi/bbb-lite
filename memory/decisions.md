@@ -281,3 +281,5 @@
   türetiliyor - zaten bilinen bilgiyi tekrar sormamak için.
   verified_default_path Codex'in önerisinde belirsizdi, "evidence status !=
   fail" kontrolü olarak yorumlandı.
+
+- 2026-07-29 - KRITIK BUG DUZELTILDI (Stage AF): Claude Code'un /clear'i yeni bir session_id urettigi dogrulandi (canli test: iki farkli UUID). Bu, rolun /clear sonrasi sessizce brozzer'a dustugu anlamina geliyordu - artik en son declare edilen rol yeni session_id'ye miras aliniyor.

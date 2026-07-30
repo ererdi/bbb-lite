@@ -786,6 +786,28 @@ def get_role(session_id: str, db_path: Path = DB_PATH) -> str:
     return row["role"] if row else "brozzer"
 
 
+def role_exists(session_id: str, db_path: Path = DB_PATH) -> bool:
+    """Whether this session_id has an explicit row in `roles` (vs. never declared)."""
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM roles WHERE session_id = ?", (session_id,)
+        ).fetchone()
+    return row is not None
+
+
+def get_most_recent_role(db_path: Path = DB_PATH) -> str | None:
+    """The role with the latest declared_at across ALL sessions, or None if
+    `roles` is empty. Used by Stage AF to carry a role across /clear, which
+    hands session_start a fresh session_id with no roles row of its own."""
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        row = conn.execute(
+            "SELECT role FROM roles ORDER BY declared_at DESC LIMIT 1"
+        ).fetchone()
+    return row["role"] if row else None
+
+
 def can_write_code(session_id: str, db_path: Path = DB_PATH) -> bool:
     return ROLE_PERMISSIONS[get_role(session_id, db_path=db_path)]["code"]
 
