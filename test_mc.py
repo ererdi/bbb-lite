@@ -1480,6 +1480,56 @@ class StageACTestCase(McTestCase):
         result = mc.list_context_map(db_path=self.db_path)
         self.assertEqual([], result["edges"])
 
+    def test_query_rows_rejects_non_select(self) -> None:
+        with self.assertRaises(ValueError):
+            mc.query_rows("UPDATE tasks SET status = 'done'", db_path=self.db_path)
+
+    def test_query_rows_returns_dicts_for_select(self) -> None:
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            conn.execute(
+                "INSERT INTO tasks (title, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                ("write tests", "open", "2026-07-29T00:00:00+00:00", "2026-07-29T00:00:00+00:00"),
+            )
+            conn.commit()
+        rows = mc.query_rows("SELECT title, status FROM tasks", db_path=self.db_path)
+        self.assertEqual([{"title": "write tests", "status": "open"}], rows)
+
+    def test_readback_verify_returns_existing_row(self) -> None:
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            cur = conn.execute(
+                "INSERT INTO tasks (title, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                ("ship it", "open", "2026-07-29T00:00:00+00:00", "2026-07-29T00:00:00+00:00"),
+            )
+            task_id = cur.lastrowid
+            conn.commit()
+        row = mc.readback_verify("tasks", task_id, db_path=self.db_path)
+        self.assertEqual("ship it", row["title"])
+
+    def test_readback_verify_raises_mcdegraded_for_missing_row(self) -> None:
+        with self.assertRaises(mc.MCDegraded):
+            mc.readback_verify("tasks", 999999, db_path=self.db_path)
+
+    def test_write_gate_true_for_known_operations(self) -> None:
+        self.assertTrue(mc.write_gate("complete_task"))
+        self.assertTrue(mc.write_gate("add_curated_edge"))
+        self.assertTrue(mc.write_gate("mark_session_degraded"))
+        self.assertFalse(mc.write_gate("delete_everything"))
+
+    def test_complete_task_then_readback_verify(self) -> None:
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            cur = conn.execute(
+                "INSERT INTO tasks (title, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                ("finish MC seam", "open", "2026-07-29T00:00:00+00:00", "2026-07-29T00:00:00+00:00"),
+            )
+            task_id = cur.lastrowid
+            conn.commit()
+        mc.complete_task(task_id, db_path=self.db_path)
+        row = mc.readback_verify("tasks", task_id, db_path=self.db_path)
+        self.assertEqual("done", row["status"])
+
 
 if __name__ == "__main__":
     unittest.main()

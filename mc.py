@@ -77,6 +77,10 @@ class MCCompletionRefused(MCAccessError):
     """A task transition to done was attempted outside complete_task()."""
 
 
+class MCDegraded(Exception):
+    """A read or write could not reach the database, or failed a guard check."""
+
+
 @dataclass(frozen=True)
 class _CompletionAuthorization:
     """Internal capability minted only by complete_task()."""
@@ -350,6 +354,74 @@ def _connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
+    """Public name for _connect() — same GuardedLocalConnection, no bypass.
+
+    Named after haroon-bbb-sync's connect() for familiarity; behavior is
+    entirely this project's existing guard, not a new access path.
+    """
+
+    return _connect(db_path)
+
+
+def query_rows(sql: str, params: tuple = (), db_path: Path = DB_PATH) -> list[dict]:
+    """Read-only helper: only SELECT statements are accepted.
+
+    Not a general execute() — INSERT/UPDATE/DELETE/etc. raise ValueError
+    before the query ever reaches sqlite, so this cannot become a backdoor
+    around GuardedLocalConnection's write guard.
+    """
+
+    if not sql.strip().upper().startswith("SELECT"):
+        raise ValueError("query_rows() only accepts SELECT statements")
+    with contextlib.closing(connect(db_path)) as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+_GUARDED_OPERATIONS = frozenset({"complete_task", "add_curated_edge", "mark_session_degraded"})
+
+
+def write_gate(operation: str) -> bool:
+    """Documentation lookup: does `operation` already have a dedicated guard?
+
+    This does not add a new restriction — it records which existing
+    functions (complete_task's completion guard, add_curated_edge's
+    dual-approval gate, mark_session_degraded's degraded-marking path)
+    are the sanctioned way to perform a sensitive operation, so callers
+    can check before reaching for raw SQL.
+    """
+
+    return operation in _GUARDED_OPERATIONS
+
+
+def readback_verify(table: str, row_id: int, db_path: Path = DB_PATH) -> dict:
+    """Confirm (table, row_id) really persisted, via a fresh connection.
+
+    A general "did what I just write actually land" check, independent of
+    Stage R's snapshot mechanism. Optional for callers — complete_task() and
+    similar critical writes may call this after commit(), but nothing
+    requires it and existing callers are unaffected. Raises MCDegraded if
+    the table is unknown or the row can't be found.
+    """
+
+    with contextlib.closing(connect(db_path)) as conn:
+        known_tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        }
+        if table not in known_tables:
+            raise MCDegraded(f"readback_verify: unknown table {table!r}")
+        row = conn.execute(
+            f'SELECT * FROM "{table}" WHERE id = ?', (row_id,)
+        ).fetchone()
+    if row is None:
+        raise MCDegraded(f"readback_verify: no row in {table!r} with id={row_id}")
+    return dict(row)
 
 
 def init_db(db_path: Path = DB_PATH) -> None:

@@ -252,6 +252,15 @@
   nasıl taşıyacağına dair ayrı bir tasarım kararı gerektirir, bu yüzden
   şimdilik kapsam dışı bırakıldı.
 
+- **2026-07-29 - MC seam layer eklendi (Stage AD)** - Codex'in önerisi, ama
+  GÜVENLİ versiyon: query_rows() sadece SELECT'e izin veriyor (serbest
+  execute() yok - mevcut guard'ları atlayabilecek bir "arka kapı" bilerek
+  eklenmedi). write_gate()/readback_verify() var olan guard mantığının
+  üzerine dokümantasyon/doğrulama katmanı, yeni bir yazma yolu değil.
+  Ayrı bir lib/ dosyasına taşıma (Codex'in önerdiği gibi) şimdilik
+  yapılmadı - mc.py tek dosya kalmaya devam ediyor, bu ayrı bir karar
+  (dosya organizasyonu, ayrı bir Stage'de ele alınabilir).
+
 - **2026-07-29 - Stage AC: context_nodes/context_edges (Stage Z) ile
   graph_nodes/graph_edges (Stage R, 07-26) arasındaki tekrar giderildi.**
   Zorunlu-kürasyon davranışı graph_edges'e taşındı (requires_dual_approval +
