@@ -157,7 +157,10 @@
   tarihli "SDK ayrı API key + pay-per-token gerektiriyor" kararını geçersiz
   kılar.
 
-- **2026-07-27 - Compact recovery validation eklendi (Stage R).** Bilerek
+- **2026-07-27 - Compact recovery validation eklendi (Stage R2 - "Stage R"
+  etiketi burada yanlış kullanılmıştı, 2026-07-26 tarihli graph memory
+  girişiyle çakışıyordu; bu girdi ayrı bir stage olarak Stage R2 diye
+  yeniden adlandırıldı, kod/tablo adları değişmedi).** Bilerek
   fail-soft DEĞİL: eksik kayıt varsa session 'degraded' işaretlenir ve
   görünür şekilde bildirilir - Haroon'un ekip şablonundaki "prevent Compact
   from being treated as successful if persistence fails" gereksinimine
@@ -217,3 +220,48 @@
   ölçümü eklendi. On-demand genişletme (ek sorgu ile daha fazla hafıza
   çekme) HÂLÂ yok - bu, ayrı bir skill olarak eklenebilir, şimdilik kapsam
   dışı.
+
+- **2026-07-30 - Known duplication: context_nodes/context_edges (Stage Z)
+  vs graph_nodes/graph_edges (Stage R, 07-26).** İkisi de "node/edge
+  ilişki grafiği" problem alanına hizmet ediyor ama farklı güven
+  modelleriyle: graph_nodes/graph_edges çoğunlukla otomatik dolduruluyor
+  (_upsert_memory_graph: memory dosyalarından keyword/wikilink çıkarımı,
+  artı graph/edges.jsonl'den trusted-typed edge'ler), authority/
+  confidence/currentness/curated alanlarıyla güven derecesi işaretleniyor
+  ama curated=0 olan edge'ler de sorgulanabiliyor - kürasyon burada
+  advisory (sonradan işaretleme), zorunlu bir kapı değil. context_nodes/
+  context_edges (Stage Z) ise tam tersi: hiçbir otomatik doldurma yok,
+  bir edge sadece HER İKİ node approve_node() ile onaylandıktan sonra
+  add_edge() ile oluşturulabiliyor - kürasyon burada insert-time'da
+  zorunlu bir kapı (add_edge ValueError fırlatıyor aksi halde). Ayrıca
+  şema seviyesinde de örtüşme var: graph_nodes string node_id (slug)
+  kullanırken context_nodes autoincrement int id kullanıyor, ikisi
+  arasında hiçbir köprü/FK yok - aynı gerçek-dünya varlığı için iki ayrı,
+  birbirinden habersiz kayıt oluşabilir.
+  Öneri (kod değişikliği YAPILMADI, sadece not): Stage S'te graph_edges'e
+  eklenen curated/confidence/currentness alanları, Stage Z'nin var olma
+  sebebini (kürasyon) zaten kısmen karşılıyor. graph_nodes/graph_edges
+  taraf, traverse_graph/graph_depends_on/graph_impact/graph_memory_search
+  gibi gerçek kullanım noktalarına sahip olduğu için daha zengin ve daha
+  çok yaslanılan taraf - context_nodes/context_edges şu an sadece
+  list_context_map() tarafından okunuyor ve hiçbir otomatik besleme yok.
+  Uzun vadede tek bir kürasyon modeline (graph_edges.curated + insert-time
+  zorunlu kapı seçeneği) birleştirilmesi, iki paralel şemayı taşımaktan
+  daha az karmaşık olur - ama bu, context-map'in "otomatik büyüme asla
+  olmasın" garantisini graph_edges'in mevcut advisory kürasyon modeline
+  nasıl taşıyacağına dair ayrı bir tasarım kararı gerektirir, bu yüzden
+  şimdilik kapsam dışı bırakıldı.
+
+- **2026-07-29 - Stage AC: context_nodes/context_edges (Stage Z) ile
+  graph_nodes/graph_edges (Stage R, 07-26) arasındaki tekrar giderildi.**
+  Zorunlu-kürasyon davranışı graph_edges'e taşındı (requires_dual_approval +
+  add_curated_edge). Eski tablolar silinmedi ama artık kullanılmıyor
+  (deprecated). propose_node/approve_node artık graph_nodes üzerinde
+  çalışıyor (node_id = _graph_node_id(node_type, label), curated 0/1);
+  add_edge() kaldırıldı, yerine add_curated_edge() geldi - HER İKİ node
+  graph_nodes'ta curated=1 olmadan edge oluşturulamıyor (Stage Z'nin
+  zorunlu-kapı kısıtı korundu). list_context_map() artık graph_nodes/
+  graph_edges'ten okuyor; edge filtresi curated=1 AND requires_dual_approval=1
+  - bu, curate_graph_edge()'in (Stage S, advisory) işaretlediği auto-graph
+  edge'lerinin context-map'e sızmasını engelliyor. canvas_server.py'ye giden
+  {"nodes":[], "edges":[]} sözleşmesi değişmedi.

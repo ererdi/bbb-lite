@@ -540,6 +540,15 @@ def init_db(db_path: Path = DB_PATH) -> None:
             conn.execute("ALTER TABLE graph_edges ADD COLUMN confidence TEXT NOT NULL DEFAULT 'unknown'")
         if "curated" not in existing_graph_edge_columns:
             conn.execute("ALTER TABLE graph_edges ADD COLUMN curated INTEGER NOT NULL DEFAULT 0")
+        if "requires_dual_approval" not in existing_graph_edge_columns:
+            conn.execute(
+                "ALTER TABLE graph_edges ADD COLUMN requires_dual_approval INTEGER NOT NULL DEFAULT 0"
+            )
+        existing_graph_node_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(graph_nodes)").fetchall()
+        }
+        if "curated" not in existing_graph_node_columns:
+            conn.execute("ALTER TABLE graph_nodes ADD COLUMN curated INTEGER NOT NULL DEFAULT 0")
         conn.execute(
             """CREATE TABLE IF NOT EXISTS answer_quality_scores (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -611,6 +620,8 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 updated_at TEXT NOT NULL
             )"""
         )
+        # Deprecated since Stage AC (superseded by graph_nodes/graph_edges
+        # curated + requires_dual_approval); kept only so old rows aren't lost.
         conn.execute(
             """CREATE TABLE IF NOT EXISTS context_nodes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1565,6 +1576,7 @@ def _upsert_graph_edge(
     currentness: str = "unknown",
     confidence: str = "unknown",
     curated: bool = False,
+    requires_dual_approval: bool = False,
 ) -> None:
     src, dst, edge_type = src.strip(), dst.strip(), edge_type.strip()
     if not src or not dst or not edge_type:
@@ -1573,8 +1585,8 @@ def _upsert_graph_edge(
     conn.execute(
         """INSERT INTO graph_edges
            (src, dst, type, evidence, weight, source_ref, authority, updated_at,
-            currentness, confidence, curated)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            currentness, confidence, curated, requires_dual_approval)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(src, dst, type) DO UPDATE SET
                evidence = excluded.evidence,
                weight = excluded.weight,
@@ -1583,7 +1595,8 @@ def _upsert_graph_edge(
                updated_at = excluded.updated_at,
                currentness = excluded.currentness,
                confidence = excluded.confidence,
-               curated = excluded.curated""",
+               curated = excluded.curated,
+               requires_dual_approval = excluded.requires_dual_approval""",
         (
             src,
             dst,
@@ -1596,6 +1609,7 @@ def _upsert_graph_edge(
             currentness,
             confidence,
             int(curated),
+            int(requires_dual_approval),
         ),
     )
 
@@ -2845,73 +2859,90 @@ def retire_low_confidence_lessons(threshold: float = 0.3, db_path: Path = DB_PAT
     return len(retired)
 
 
-def propose_node(node_type: str, label: str, db_path: Path = DB_PATH) -> int:
-    """Add a context-map node with status='proposed'.
+def propose_node(node_type: str, label: str, db_path: Path = DB_PATH) -> str:
+    """Add a context-map node into graph_nodes with curated=0.
 
-    A proposed node cannot be linked by add_edge() until approve_node()
-    curates it — see decisions.md, Stage Z.
+    A proposed node cannot be linked by add_curated_edge() until
+    approve_node() curates it — see decisions.md, Stage AC (formerly
+    Stage Z's own context_nodes/context_edges, merged into graph_nodes/
+    graph_edges to remove the duplicate schema).
     """
 
+    node_id = _graph_node_id(node_type, label)
     with contextlib.closing(_connect(db_path)) as conn:
-        cur = conn.execute(
-            "INSERT INTO context_nodes (node_type, label, status, created_at) "
-            "VALUES (?, ?, 'proposed', ?)",
-            (node_type, label, _now()),
-        )
+        _upsert_graph_node(conn, node_id, node_type, label, source_ref="context-map")
         conn.commit()
-        return cur.lastrowid
+    return node_id
 
 
-def approve_node(node_id: int, db_path: Path = DB_PATH) -> None:
+def approve_node(node_id: str, db_path: Path = DB_PATH) -> None:
     with contextlib.closing(_connect(db_path)) as conn:
         conn.execute(
-            "UPDATE context_nodes SET status = 'approved' WHERE id = ?", (node_id,)
+            "UPDATE graph_nodes SET curated = 1, updated_at = ? WHERE node_id = ?",
+            (_now(), node_id),
         )
         conn.commit()
 
 
-def add_edge(from_node_id: int, to_node_id: int, relation: str, db_path: Path = DB_PATH) -> int:
-    """Link two curated nodes. Raises ValueError unless both are 'approved'.
+def add_curated_edge(
+    from_node_id: str, to_node_id: str, relation: str, db_path: Path = DB_PATH
+) -> None:
+    """Link two curated nodes in graph_edges. Raises ValueError unless both
+    nodes are curated=1 in graph_nodes.
 
-    This is the project's most important rule: the context map only grows
-    by human-curated approval, never automatically (see decisions.md, Stage Z).
+    This is the project's most important rule carried over from Stage Z: the
+    context map only grows by human-curated approval, never automatically
+    (see decisions.md, Stage AC). requires_dual_approval=1 marks the edge as
+    having passed this gate, distinguishing it from edges advisory-curated
+    after the fact via curate_graph_edge().
     """
 
     with contextlib.closing(_connect(db_path)) as conn:
         rows = conn.execute(
-            "SELECT id, status FROM context_nodes WHERE id IN (?, ?)",
+            "SELECT node_id, curated FROM graph_nodes WHERE node_id IN (?, ?)",
             (from_node_id, to_node_id),
         ).fetchall()
-        statuses = {row["id"]: row["status"] for row in rows}
-        if statuses.get(from_node_id) != "approved" or statuses.get(to_node_id) != "approved":
+        curated = {row["node_id"]: bool(row["curated"]) for row in rows}
+        if not curated.get(from_node_id) or not curated.get(to_node_id):
             raise ValueError(
-                "add_edge requires both nodes to be status='approved'; "
+                "add_curated_edge requires both nodes to be curated=1 in graph_nodes; "
                 "approve_node() them first"
             )
-        cur = conn.execute(
-            "INSERT INTO context_edges (from_node_id, to_node_id, relation, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (from_node_id, to_node_id, relation, _now()),
+        _upsert_graph_edge(
+            conn,
+            from_node_id,
+            to_node_id,
+            relation,
+            authority="human-curated",
+            currentness="current",
+            confidence="verified",
+            curated=True,
+            requires_dual_approval=True,
         )
         conn.commit()
-        return cur.lastrowid
 
 
 def list_context_map(only_approved: bool = True, db_path: Path = DB_PATH) -> dict:
     """{"nodes": [...], "edges": [...]} — approved-only by default.
 
-    An edge can only exist between two approved nodes (add_edge() enforces
-    that), so filtering edges never needs to check node status separately.
+    Backed by graph_nodes/graph_edges since Stage AC (context_nodes/
+    context_edges are deprecated, no longer written to). An edge only
+    appears here if it was created through add_curated_edge()'s dual-
+    approval gate (requires_dual_approval=1), so edges advisory-curated by
+    curate_graph_edge() or auto-derived by the memory graph never leak in.
     """
 
     with contextlib.closing(_connect(db_path)) as conn:
         if only_approved:
             nodes = conn.execute(
-                "SELECT * FROM context_nodes WHERE status = 'approved' ORDER BY id"
+                "SELECT * FROM graph_nodes WHERE curated = 1 ORDER BY node_id"
             ).fetchall()
         else:
-            nodes = conn.execute("SELECT * FROM context_nodes ORDER BY id").fetchall()
-        edges = conn.execute("SELECT * FROM context_edges ORDER BY id").fetchall()
+            nodes = conn.execute("SELECT * FROM graph_nodes ORDER BY node_id").fetchall()
+        edges = conn.execute(
+            "SELECT * FROM graph_edges WHERE curated = 1 AND requires_dual_approval = 1 "
+            "ORDER BY updated_at"
+        ).fetchall()
     return {
         "nodes": [dict(row) for row in nodes],
         "edges": [dict(row) for row in edges],
