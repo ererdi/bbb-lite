@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -15,6 +16,7 @@ def main() -> None:
     payload = json.load(sys.stdin)
     session_id = payload.get("session_id", "unknown")
     source = payload.get("source", "unknown")
+    cwd = payload.get("cwd") or os.getcwd()
 
     mc.init_db()
     mc.ensure_session(session_id)
@@ -25,6 +27,15 @@ def main() -> None:
         status="ok",
         details={"source": source},
     )
+
+    # Stage AG: match cwd's folder name against projects.name. An unmapped
+    # cwd is said out loud, not silently attached to some existing project
+    # (Haroon's "unmapped" principle - see decisions.md, 2026-07-29).
+    project = mc.resolve_project(cwd)
+    if project["status"] == "unmapped":
+        print("[bbb-lite] project: unmapped (cwd not linked to any project)")
+    else:
+        print(f"[bbb-lite] project: {project['name']}")
 
     # Stage AF: /clear hands session_start a brand-new session_id (verified
     # live: two distinct UUIDs across a /clear), which has no row in `roles`

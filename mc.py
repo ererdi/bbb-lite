@@ -914,6 +914,25 @@ def list_projects(db_path: Path = DB_PATH) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def resolve_project(cwd: str, db_path: Path = DB_PATH) -> dict:
+    """Match cwd's last folder name against projects.name.
+
+    Stage AG: no fuzzy matching, no default project - an unrecognized cwd
+    gets an explicit {"id": None, "name": "unmapped", "status": "unmapped"}
+    rather than silently attaching to some existing project (Haroon's
+    "say unmapped out loud" principle).
+    """
+
+    folder_name = Path(cwd).name
+    with contextlib.closing(_connect(db_path)) as conn:
+        row = conn.execute(
+            "SELECT * FROM projects WHERE name = ?", (folder_name,)
+        ).fetchone()
+    if row is None:
+        return {"id": None, "name": "unmapped", "status": "unmapped"}
+    return dict(row)
+
+
 def add_sprint(
     project_id: int, name: str, status: str = "active", db_path: Path = DB_PATH
 ) -> int:
