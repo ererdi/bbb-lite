@@ -3103,22 +3103,47 @@ def index_symbols(
                     continue
                 rel_path = str(path.relative_to(root))
                 for symbol in _extract_python_symbols(tree):
-                    embedding = _embed_or_none(f"{symbol['name']}\n{symbol['docstring'] or ''}")
-                    conn.execute(
-                        """INSERT INTO symbol_index
-                               (file_path, symbol_name, symbol_type, docstring, embedding, project)
-                           VALUES (?, ?, ?, ?, ?, ?)
-                           ON CONFLICT(file_path, symbol_name) DO UPDATE SET
-                               symbol_type = excluded.symbol_type,
-                               docstring = excluded.docstring,
-                               embedding = excluded.embedding,
-                               project = excluded.project""",
-                        (
-                            rel_path, symbol["name"], symbol["type"],
-                            symbol["docstring"], embedding, project,
-                        ),
-                    )
+                    _upsert_symbol_row(conn, rel_path, symbol, project)
                     count += 1
+        conn.commit()
+    return count
+
+
+def _upsert_symbol_row(conn: sqlite3.Connection, file_path: str, symbol: dict, project: str) -> None:
+    embedding = _embed_or_none(f"{symbol['name']}\n{symbol['docstring'] or ''}")
+    conn.execute(
+        """INSERT INTO symbol_index
+               (file_path, symbol_name, symbol_type, docstring, embedding, project)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(file_path, symbol_name) DO UPDATE SET
+               symbol_type = excluded.symbol_type,
+               docstring = excluded.docstring,
+               embedding = excluded.embedding,
+               project = excluded.project""",
+        (file_path, symbol["name"], symbol["type"], symbol["docstring"], embedding, project),
+    )
+
+
+def upsert_symbol_file(
+    file_path: str | Path, *, project: str | None = None, db_path: Path = DB_PATH
+) -> int:
+    """Re-index just one .py file's symbols — a lighter, single-file version
+    of index_symbols() for CLI/editor-integration use (Stage AN 3/3).
+
+    project defaults to the file's parent directory name (same convention
+    index_symbols() uses for a whole root_dir) if not given.
+    """
+
+    path = Path(file_path)
+    if project is None:
+        project = path.resolve().parent.name
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    rel_path = str(path)
+    count = 0
+    with contextlib.closing(_connect(db_path)) as conn:
+        for symbol in _extract_python_symbols(tree):
+            _upsert_symbol_row(conn, rel_path, symbol, project)
+            count += 1
         conn.commit()
     return count
 
@@ -3132,6 +3157,43 @@ def _parse_doc_file(path: Path) -> tuple[str, str]:
     heading_match = re.match(r"^#\s+(.+)$", first_line)
     title = heading_match.group(1).strip() if heading_match else path.stem
     return title, text
+
+
+def _upsert_doc_row(conn: sqlite3.Connection, file_path: str, title: str, content: str, project: str) -> None:
+    embedding = _embed_or_none(f"{title}\n{content}")
+    conn.execute(
+        """INSERT INTO doc_index (file_path, title, content, embedding, project)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(file_path) DO UPDATE SET
+               title = excluded.title,
+               content = excluded.content,
+               embedding = excluded.embedding,
+               project = excluded.project""",
+        (file_path, title, content, embedding, project),
+    )
+
+
+def upsert_doc_file(
+    file_path: str | Path, *, project: str | None = None, db_path: Path = DB_PATH
+) -> int:
+    """Re-index just one .md file into doc_index — a lighter, single-file
+    version of index_docs() for CLI/editor-integration use (Stage AN 3/3).
+
+    project defaults to the file's parent directory name (same convention
+    index_docs() uses for a whole root_dir) if not given. Does not exempt
+    memory/ the way index_docs() does — a direct, explicit path always wins;
+    the memory/ skip is index_docs()'s "don't duplicate a bulk scan" rule,
+    not a blanket ban.
+    """
+
+    path = Path(file_path)
+    if project is None:
+        project = path.resolve().parent.name
+    title, content = _parse_doc_file(path)
+    with contextlib.closing(_connect(db_path)) as conn:
+        _upsert_doc_row(conn, str(path), title, content, project)
+        conn.commit()
+    return 1
 
 
 def index_docs(
@@ -3167,17 +3229,7 @@ def index_docs(
                     title, content = _parse_doc_file(path)
                 except (UnicodeDecodeError, OSError):
                     continue
-                embedding = _embed_or_none(f"{title}\n{content}")
-                conn.execute(
-                    """INSERT INTO doc_index (file_path, title, content, embedding, project)
-                       VALUES (?, ?, ?, ?, ?)
-                       ON CONFLICT(file_path) DO UPDATE SET
-                           title = excluded.title,
-                           content = excluded.content,
-                           embedding = excluded.embedding,
-                           project = excluded.project""",
-                    (str(rel_path), title, content, embedding, project),
-                )
+                _upsert_doc_row(conn, str(rel_path), title, content, project)
                 count += 1
         conn.commit()
     return count

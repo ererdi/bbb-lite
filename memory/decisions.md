@@ -303,3 +303,5 @@
 - 2026-07-29 - Stage AN (1/3): doc_index/symbol_index temel sema. Duzeltme notu: onceki 'Stage P code memory' iddiasi YANLISTI - o is hic yapilmamisti (ne code_index tablosu ne de search_code/index_codebase fonksiyonlari vardi); ayrica ast tabanli bir _extract_symbols mantigi da hic yoktu, bu Stage AN ile gercek ilk implementasyon, sifirdan yazildi. Simdilik sadece .py dosyalari indeksleniyor, diger diller (js/ts/sql/sh) sonraki bir adima birakildi.
 
 - 2026-07-29 - Stage AN (2/3): cyg_exists/cyg_similar eklendi - Haroon'un Golden Rule'unun (reuse-first) pratik karsiligi. pretooluse_log.py artik bunu kullaniyor. Duzeltme notu: onceki 'Stage T search_code bilgilendirme mantigi' iddiasi da YANLISTI - pretooluse_log.py hicbir zaman kod-yeniden-kullanim kontrolu yapmiyordu, bu bilgilendirme (engelleme yok) ilk kez burada eklendi.
+
+- 2026-07-29 - Stage AN (3/3) TAMAMLANDI: CLI scriptleri eklendi. Codex'in 6. maddesi (Graph Memory/Code Graph) artik tam - doc_index/symbol_index semasi, cyg_exists/cyg_similar, ve CLI araclarinin hepsi gercek, test edilmis.
