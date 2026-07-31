@@ -2334,6 +2334,16 @@ def session_score(
     }
 
 
+def _safe_default(fn, default):
+    """Run fn(), fall back to default on any error - a "best effort" summary
+    field must never turn into a crash (Stage AL, see decisions.md, 2026-07-29)."""
+
+    try:
+        return fn()
+    except Exception:
+        return default
+
+
 def compact_snapshot(session_id: str, db_path: Path = DB_PATH) -> dict:
     """A small, stable-keyed count of state a /compact should not lose.
 
@@ -2343,6 +2353,16 @@ def compact_snapshot(session_id: str, db_path: Path = DB_PATH) -> dict:
     single-axis compromise, see decisions.md 2026-07-24). role_declared and
     checklist_items ARE session-scoped, since roles/checkpoints key on
     session_id directly.
+
+    Stage AL added open_task_ids/latest_checkpoint_id/latest_dispatch_run_id/
+    evidence_count/receipt_count/has_active_document/graph_node_count/
+    graph_edge_count - all read from tables that already existed
+    (dispatch_runs, evidence, answer_receipts, documents, graph_nodes/edges),
+    no new table. compare_snapshots() only reads the original four keys, so
+    these additions cannot introduce a new degraded-recovery finding; they
+    are read-only extras for a fuller "what did this session touch" summary.
+    Each is individually fail-soft: missing/unreadable data becomes
+    0/None/False, never a raised error.
     """
 
     open_tasks = [task["id"] for task in list_open_tasks(db_path=db_path)]
@@ -2363,11 +2383,69 @@ def compact_snapshot(session_id: str, db_path: Path = DB_PATH) -> dict:
         if isinstance(parsed, list):
             checklist_items = len(parsed)
 
+    def _latest_checkpoint_id():
+        with contextlib.closing(_connect(db_path)) as conn:
+            row = conn.execute(
+                """SELECT rowid FROM checkpoints WHERE session_id = ?
+                   ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+                (session_id,),
+            ).fetchone()
+        return row["rowid"] if row else None
+
+    def _latest_dispatch_run_id():
+        runs = list_dispatch_runs(limit=1, db_path=db_path)
+        return runs[-1]["id"] if runs else None
+
+    def _evidence_count():
+        with contextlib.closing(_connect(db_path)) as conn:
+            return conn.execute("SELECT COUNT(*) FROM evidence").fetchone()[0]
+
+    def _receipt_count():
+        with contextlib.closing(_connect(db_path)) as conn:
+            return conn.execute("SELECT COUNT(*) FROM answer_receipts").fetchone()[0]
+
+    def _has_active_document():
+        # No session_id -> project_id mapping exists in the schema yet (see
+        # decisions.md, 2026-07-29) - always False until one does.
+        return False
+
+    def _graph_counts():
+        stats = graph_stats(db_path=db_path)
+        return stats["nodes"], stats["edges"]
+
+    graph_node_count, graph_edge_count = _safe_default(_graph_counts, (0, 0))
+
     return {
         "tasks": open_tasks,
         "decisions": decision_count,
         "role_declared": role_row is not None,
         "checklist_items": checklist_items,
+        "open_task_ids": open_tasks,
+        "latest_checkpoint_id": _safe_default(_latest_checkpoint_id, None),
+        "latest_dispatch_run_id": _safe_default(_latest_dispatch_run_id, None),
+        "evidence_count": _safe_default(_evidence_count, 0),
+        "receipt_count": _safe_default(_receipt_count, 0),
+        "has_active_document": _safe_default(_has_active_document, False),
+        "graph_node_count": graph_node_count,
+        "graph_edge_count": graph_edge_count,
+    }
+
+
+def clear_recovery_verified(session_id: str, db_path: Path = DB_PATH) -> dict:
+    """A compact_snapshot()-style summary for /clear specifically.
+
+    verified=True means Stage AF/AH's role-inheritance mechanism (or an
+    already-declared role) left this session_id with an actual row in
+    `roles` - not just get_role()'s bare "brozzer" fallback with nothing
+    behind it (see decisions.md, 2026-07-29).
+    """
+
+    return {
+        "role": get_role(session_id, db_path=db_path),
+        "latest_checkpoint": latest_checkpoint(session_id, db_path=db_path),
+        "open_task_ids": [task["id"] for task in list_open_tasks(db_path=db_path)],
+        "recent_decisions": recent_decisions(limit=2, db_path=db_path),
+        "verified": role_exists(session_id, db_path=db_path),
     }
 
 

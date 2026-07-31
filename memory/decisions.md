@@ -293,3 +293,5 @@
 - 2026-07-29 - auto-safepoint guclendirildi (Stage AJ) - opsiyonel git auto-commit eklendi (BBB_AUTO_COMMIT=1 ile acilir, varsayilan kapali - her turda otomatik commit riskli olabilecegi icin bilerek opt-in yapildi).
 
 - 2026-07-29 - session_warn.py eklendi (Stage AK) - Codex'in Session Lifecycle listesindeki 9 alt-maddenin sonuncusu, boylece bu madde tamamlandi. Mevcut session_score() (Stage Y) fonksiyonunu kullaniyor, yeni bir skorlama mantigi icat etmedi.
+
+- 2026-07-29 - compact_snapshot() genisletildi ve clear_recovery_verified() eklendi (Stage AL) - Codex'in 4. maddesi. Tum yeni alanlar VAR OLAN tablolardan (dispatch_runs, evidence, answer_receipts, documents, graph_nodes/edges) okunuyor, yeni tablo acilmadi. Fail-soft: eksik veri hata vermiyor, 0/None/False ile devam ediyor.

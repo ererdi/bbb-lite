@@ -147,6 +147,17 @@ def main() -> None:
     # just asserted.
     print(f"[bbb-lite] recovery package: {mc.recovery_package_size(session_id)} chars")
 
+    # Stage AL: after everything else, a one-line proof that /clear recovery
+    # actually landed - role, open tasks, checkpoint presence (see
+    # decisions.md, 2026-07-29).
+    if source == "clear":
+        verified = mc.clear_recovery_verified(session_id)
+        checkpoint_state = "var" if verified["latest_checkpoint"] else "yok"
+        print(
+            f"[bbb-lite] clear recovery verified: role={verified['role']}, "
+            f"{len(verified['open_task_ids'])} open tasks, checkpoint={checkpoint_state}"
+        )
+
 
 if __name__ == "__main__":
     main()
