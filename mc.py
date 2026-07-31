@@ -1624,6 +1624,22 @@ def recent_decisions(limit: int = 2, db_path: Path = DB_PATH) -> list[str]:
     return [row["text"] for row in rows]
 
 
+def recent_decision_ids(limit: int = 2, db_path: Path = DB_PATH) -> list[int]:
+    """The most recent N decision row ids, newest first, across all sessions.
+
+    Same ordering/scope as recent_decisions(), but ids instead of text -
+    for callers (e.g. clear_recovery_verified()) that want a stable,
+    compact reference rather than the full decision text.
+    """
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT id FROM decisions ORDER BY created_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [row["id"] for row in rows]
+
+
 def upsert_capability_boundary(
     capability: str,
     enabled: bool,
@@ -2405,9 +2421,23 @@ def compact_snapshot(session_id: str, db_path: Path = DB_PATH) -> dict:
             return conn.execute("SELECT COUNT(*) FROM answer_receipts").fetchone()[0]
 
     def _has_active_document():
-        # No session_id -> project_id mapping exists in the schema yet (see
-        # decisions.md, 2026-07-29) - always False until one does.
-        return False
+        # None = "unknown", distinct from False = "no active document".
+        # projects has no session_id column today, so there is no real path
+        # from session_id to project_id - checked dynamically (not hardcoded)
+        # so this starts working the day that column exists, with no further
+        # change here (see decisions.md, 2026-08-01).
+        with contextlib.closing(_connect(db_path)) as conn:
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(projects)").fetchall()
+            }
+            if "session_id" not in columns:
+                return None
+            row = conn.execute(
+                "SELECT id FROM projects WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return get_document(row["id"], "northstar", db_path=db_path) is not None
 
     def _graph_counts():
         stats = graph_stats(db_path=db_path)
@@ -2425,7 +2455,7 @@ def compact_snapshot(session_id: str, db_path: Path = DB_PATH) -> dict:
         "latest_dispatch_run_id": _safe_default(_latest_dispatch_run_id, None),
         "evidence_count": _safe_default(_evidence_count, 0),
         "receipt_count": _safe_default(_receipt_count, 0),
-        "has_active_document": _safe_default(_has_active_document, False),
+        "has_active_document": _safe_default(_has_active_document, None),
         "graph_node_count": graph_node_count,
         "graph_edge_count": graph_edge_count,
     }

@@ -95,7 +95,9 @@ class CompactSnapshotExtensionTestCase(unittest.TestCase):
         self.assertIsNotNone(snapshot["latest_checkpoint_id"])
         self.assertEqual(2, snapshot["evidence_count"])
         self.assertEqual(0, snapshot["receipt_count"])
-        self.assertFalse(snapshot["has_active_document"])
+        # No session_id -> project_id mapping exists in the schema, so this is
+        # "unknown" (None), not "no" (False) - see decisions.md, 2026-08-01.
+        self.assertIsNone(snapshot["has_active_document"])
         self.assertEqual(1, snapshot["graph_node_count"])
         self.assertEqual(0, snapshot["graph_edge_count"])
         self.assertIsNone(snapshot["latest_dispatch_run_id"])
@@ -108,9 +110,32 @@ class CompactSnapshotExtensionTestCase(unittest.TestCase):
         self.assertIsNone(snapshot["latest_dispatch_run_id"])
         self.assertEqual(0, snapshot["evidence_count"])
         self.assertEqual(0, snapshot["receipt_count"])
-        self.assertFalse(snapshot["has_active_document"])
+        self.assertIsNone(snapshot["has_active_document"])
         self.assertEqual(0, snapshot["graph_node_count"])
         self.assertEqual(0, snapshot["graph_edge_count"])
+
+    def test_has_active_document_resolves_a_real_value_once_a_session_project_link_exists(
+        self,
+    ) -> None:
+        """If projects ever gains a session_id column, this starts computing a
+        real True/False instead of None - with no change to mc.py needed."""
+
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            conn.execute("ALTER TABLE projects ADD COLUMN session_id TEXT")
+            cur = conn.execute(
+                "INSERT INTO projects (name, status, created_at, session_id) "
+                "VALUES (?, ?, ?, ?)",
+                ("demo-project", "active", mc._now(), self.session_id),
+            )
+            project_id = cur.lastrowid
+            conn.commit()
+
+        no_doc_yet = mc.compact_snapshot(self.session_id, db_path=self.db_path)
+        self.assertFalse(no_doc_yet["has_active_document"])
+
+        mc.add_document(project_id, "northstar", "North Star", "content", db_path=self.db_path)
+        with_doc = mc.compact_snapshot(self.session_id, db_path=self.db_path)
+        self.assertTrue(with_doc["has_active_document"])
 
     def test_original_fields_and_compare_snapshots_unaffected(self) -> None:
         mc.add_task("t1", db_path=self.db_path)
@@ -119,6 +144,39 @@ class CompactSnapshotExtensionTestCase(unittest.TestCase):
         mc.save_snapshot(self.session_id, "post", db_path=self.db_path)
         findings = mc.compare_snapshots(self.session_id, db_path=self.db_path)
         self.assertEqual([], findings)
+
+
+class RecentDecisionIdsTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        self.db_path = Path(tmp.name)
+        self.db_path.unlink()
+        mc.init_db(self.db_path)
+        self.md_path = self.db_path.parent / f"{self.db_path.stem}-decisions.md"
+
+    def tearDown(self) -> None:
+        self.db_path.unlink(missing_ok=True)
+        self.md_path.unlink(missing_ok=True)
+
+    def test_returns_ids_newest_first(self) -> None:
+        id1 = mc.add_decision("first", db_path=self.db_path, md_path=self.md_path)
+        id2 = mc.add_decision("second", db_path=self.db_path, md_path=self.md_path)
+        id3 = mc.add_decision("third", db_path=self.db_path, md_path=self.md_path)
+
+        ids = mc.recent_decision_ids(limit=2, db_path=self.db_path)
+
+        self.assertEqual([id3, id2], ids)
+        self.assertNotIn(id1, ids)
+
+    def test_empty_when_no_decisions(self) -> None:
+        self.assertEqual([], mc.recent_decision_ids(db_path=self.db_path))
+
+    def test_recent_decisions_text_function_is_untouched(self) -> None:
+        mc.add_decision("only decision", db_path=self.db_path, md_path=self.md_path)
+        self.assertEqual(
+            ["only decision"], mc.recent_decisions(limit=2, db_path=self.db_path)
+        )
 
 
 class ClearRecoveryVerifiedTestCase(unittest.TestCase):

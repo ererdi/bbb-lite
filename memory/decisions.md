@@ -295,3 +295,5 @@
 - 2026-07-29 - session_warn.py eklendi (Stage AK) - Codex'in Session Lifecycle listesindeki 9 alt-maddenin sonuncusu, boylece bu madde tamamlandi. Mevcut session_score() (Stage Y) fonksiyonunu kullaniyor, yeni bir skorlama mantigi icat etmedi.
 
 - 2026-07-29 - compact_snapshot() genisletildi ve clear_recovery_verified() eklendi (Stage AL) - Codex'in 4. maddesi. Tum yeni alanlar VAR OLAN tablolardan (dispatch_runs, evidence, answer_receipts, documents, graph_nodes/edges) okunuyor, yeni tablo acilmadi. Fail-soft: eksik veri hata vermiyor, 0/None/False ile devam ediyor.
+
+- 2026-08-01 - Stage AL duzeltmesi: has_active_document artik bool | None - projects tablosunda session_id sutunu olmadigi icin (gercek bir session->project yolu yok) None ("bilinmiyor") donduruyor, False ("yok") degil; sutun ileride eklenirse mc.py degismeden gercek degeri hesaplayacak sekilde dinamik kontrol ediliyor. Ayrica recent_decision_ids(limit=2) eklendi - recent_decisions() metin icin oldugu gibi kaldi, ID donduren ayri bir fonksiyon.
