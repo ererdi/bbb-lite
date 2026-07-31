@@ -1023,18 +1023,23 @@ class ParseMemoryFileTestCase(unittest.TestCase):
             "---\ntitle: Guard blocks done\ndate: 2026-07-21\n---\n\nBody text here.\n",
             encoding="utf-8",
         )
-        title, body, confidence = mc._parse_memory_file(path)
-        self.assertEqual("Guard blocks done", title)
-        self.assertEqual("Body text here.", body)
-        self.assertEqual(0.5, confidence)  # no confidence field -> default
+        parsed = mc._parse_memory_file(path)
+        self.assertEqual("Guard blocks done", parsed["title"])
+        self.assertEqual("Body text here.", parsed["body"])
+        self.assertEqual(0.5, parsed["confidence"])  # no confidence field -> default
 
     def test_parse_memory_file_without_frontmatter_uses_filename(self) -> None:
         path = Path(self.tmp_dir.name) / "plain-note.md"
         path.write_text("Just some body text.\n", encoding="utf-8")
-        title, body, confidence = mc._parse_memory_file(path)
-        self.assertEqual("plain-note", title)
-        self.assertEqual("Just some body text.", body)
-        self.assertEqual(0.5, confidence)
+        parsed = mc._parse_memory_file(path)
+        self.assertEqual("plain-note", parsed["title"])
+        self.assertEqual("Just some body text.", parsed["body"])
+        self.assertEqual(0.5, parsed["confidence"])
+        # Stage AM: no frontmatter at all -> every new field is the default too.
+        self.assertEqual("lesson", parsed["doc_type"])
+        self.assertEqual("global", parsed["project"])
+        self.assertEqual("unknown", parsed["evidence_level"])
+        self.assertEqual("current", parsed["currentness"])
 
     def test_parse_memory_file_maps_confidence_labels(self) -> None:
         cases = {"high": 0.9, "medium": 0.5, "low": 0.2}
@@ -1043,16 +1048,43 @@ class ParseMemoryFileTestCase(unittest.TestCase):
             path.write_text(
                 f"---\ntitle: Note\nconfidence: {label}\n---\n\nBody.\n", encoding="utf-8"
             )
-            _title, _body, confidence = mc._parse_memory_file(path)
-            self.assertEqual(expected, confidence)
+            parsed = mc._parse_memory_file(path)
+            self.assertEqual(expected, parsed["confidence"])
 
     def test_parse_memory_file_unrecognized_confidence_defaults_to_medium(self) -> None:
         path = Path(self.tmp_dir.name) / "weird.md"
         path.write_text(
             "---\ntitle: Note\nconfidence: extremely-sure\n---\n\nBody.\n", encoding="utf-8"
         )
-        _title, _body, confidence = mc._parse_memory_file(path)
-        self.assertEqual(0.5, confidence)
+        parsed = mc._parse_memory_file(path)
+        self.assertEqual(0.5, parsed["confidence"])
+
+    def test_parse_memory_file_reads_stage_am_fields(self) -> None:
+        path = Path(self.tmp_dir.name) / "rich.md"
+        path.write_text(
+            "---\ntitle: Rich note\ntype: feedback\nproject: bbb-lite\n"
+            "evidence_level: verified\ncurrentness: historical\n---\n\nBody.\n",
+            encoding="utf-8",
+        )
+        parsed = mc._parse_memory_file(path)
+        self.assertEqual("feedback", parsed["doc_type"])
+        self.assertEqual("bbb-lite", parsed["project"])
+        self.assertEqual("verified", parsed["evidence_level"])
+        self.assertEqual("historical", parsed["currentness"])
+
+    def test_parse_memory_file_unrecognized_stage_am_fields_fall_back_to_defaults(
+        self,
+    ) -> None:
+        path = Path(self.tmp_dir.name) / "typo.md"
+        path.write_text(
+            "---\ntitle: Note\ntype: not-a-real-type\nevidence_level: super-sure\n"
+            "currentness: idk\n---\n\nBody.\n",
+            encoding="utf-8",
+        )
+        parsed = mc._parse_memory_file(path)
+        self.assertEqual("lesson", parsed["doc_type"])
+        self.assertEqual("unknown", parsed["evidence_level"])
+        self.assertEqual("current", parsed["currentness"])
 
 
 class MemoryIndexTestCase(unittest.TestCase):
@@ -1144,6 +1176,78 @@ class MemoryIndexTestCase(unittest.TestCase):
                 "SELECT confidence FROM memory_index WHERE source_file = 'sure.md'"
             ).fetchone()
         self.assertEqual(0.9, row["confidence"])
+
+    def test_index_memory_files_stores_stage_am_fields(self) -> None:
+        (self.memory_dir / "tagged.md").write_text(
+            "---\ntitle: Tagged note\ntype: feedback\nproject: bbb-lite\n"
+            "evidence_level: verified\ncurrentness: historical\n---\n\nBody.\n",
+            encoding="utf-8",
+        )
+        mc.index_memory_files(db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT doc_type, project, evidence_level, currentness "
+                "FROM memory_index WHERE source_file = 'tagged.md'"
+            ).fetchone()
+        self.assertEqual("feedback", row["doc_type"])
+        self.assertEqual("bbb-lite", row["project"])
+        self.assertEqual("verified", row["evidence_level"])
+        self.assertEqual("historical", row["currentness"])
+
+    def test_index_memory_files_defaults_stage_am_fields_without_frontmatter(self) -> None:
+        self._write_note("plain.md", "Plain note", "No special fields here.")
+        mc.index_memory_files(db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT doc_type, project, evidence_level, currentness "
+                "FROM memory_index WHERE source_file = 'plain.md'"
+            ).fetchone()
+        self.assertEqual("lesson", row["doc_type"])
+        self.assertEqual("global", row["project"])
+        self.assertEqual("unknown", row["evidence_level"])
+        self.assertEqual("current", row["currentness"])
+
+    def _write_project_note(self, filename: str, title: str, project: str, body: str) -> None:
+        (self.memory_dir / filename).write_text(
+            f"---\ntitle: {title}\nproject: {project}\n---\n\n{body}\n", encoding="utf-8"
+        )
+
+    def test_search_memory_project_filter_only_returns_that_project(self) -> None:
+        self._write_project_note("a.md", "Widget note", "project-a", "The widget is great.")
+        self._write_project_note("b.md", "Widget note", "project-b", "The widget is great.")
+        mc.index_memory_files(db_path=self.db_path)
+
+        results = mc.search_memory("widget", project="project-a", db_path=self.db_path)
+
+        self.assertEqual(1, len(results))
+        self.assertEqual("a.md", results[0]["source_file"])
+
+    def test_search_memory_without_project_returns_all(self) -> None:
+        self._write_project_note("a.md", "Widget note", "project-a", "The widget is great.")
+        self._write_project_note("b.md", "Widget note", "project-b", "The widget is great.")
+        mc.index_memory_files(db_path=self.db_path)
+
+        results = mc.search_memory("widget", db_path=self.db_path)
+
+        self.assertEqual(
+            {"a.md", "b.md"}, {hit["source_file"] for hit in results}
+        )
+
+    def test_semantic_search_project_filter_only_returns_that_project(self) -> None:
+        self._write_project_note(
+            "a.md", "Widget note", "project-a", "The widget behaves oddly under load."
+        )
+        self._write_project_note(
+            "b.md", "Widget note", "project-b", "The widget behaves oddly under load."
+        )
+        mc.index_memory_files(db_path=self.db_path)
+
+        results = mc.semantic_search(
+            "widget behaving oddly", project="project-b", db_path=self.db_path
+        )
+
+        self.assertEqual(1, len(results))
+        self.assertEqual("b.md", results[0]["source_file"])
 
     def test_search_memory_ranks_higher_confidence_above_equal_keyword_score(self) -> None:
         (self.memory_dir / "shaky.md").write_text(

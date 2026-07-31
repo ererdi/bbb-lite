@@ -504,6 +504,18 @@ def init_db(db_path: Path = DB_PATH) -> None:
             conn.execute("ALTER TABLE memory_index ADD COLUMN embedding BLOB")
         if "confidence" not in existing_columns:
             conn.execute("ALTER TABLE memory_index ADD COLUMN confidence REAL DEFAULT 0.5")
+        if "doc_type" not in existing_columns:
+            conn.execute("ALTER TABLE memory_index ADD COLUMN doc_type TEXT DEFAULT 'lesson'")
+        if "project" not in existing_columns:
+            conn.execute("ALTER TABLE memory_index ADD COLUMN project TEXT DEFAULT 'global'")
+        if "evidence_level" not in existing_columns:
+            conn.execute(
+                "ALTER TABLE memory_index ADD COLUMN evidence_level TEXT DEFAULT 'unknown'"
+            )
+        if "currentness" not in existing_columns:
+            conn.execute(
+                "ALTER TABLE memory_index ADD COLUMN currentness TEXT DEFAULT 'current'"
+            )
         conn.execute(
             """CREATE TABLE IF NOT EXISTS task_activity (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2090,13 +2102,24 @@ def graph_impact(node: str, *, hops: int = GRAPH_MAX_HOPS, db_path: Path = DB_PA
     return traverse_graph(node, edge_types=["depends-on"], direction="in", hops=hops, db_path=db_path)
 
 
-def graph_memory_search(query: str, *, limit: int = 3, hops: int = 1, db_path: Path = DB_PATH) -> list[dict]:
-    """Recall memory hits plus their graph neighborhood."""
+def graph_memory_search(
+    query: str,
+    *,
+    limit: int = 3,
+    hops: int = 1,
+    project: str | None = None,
+    db_path: Path = DB_PATH,
+) -> list[dict]:
+    """Recall memory hits plus their graph neighborhood.
 
-    hits = search_memory(query, limit=limit, db_path=db_path)
+    project is an optional filter (Stage AM), passed through to
+    search_memory()/semantic_search() unchanged - None searches everything.
+    """
+
+    hits = search_memory(query, limit=limit, project=project, db_path=db_path)
     if len(hits) < limit:
         with contextlib.suppress(Exception):
-            for hit in semantic_search(query, limit=limit, db_path=db_path):
+            for hit in semantic_search(query, limit=limit, project=project, db_path=db_path):
                 if not any(existing["source_file"] == hit["source_file"] for existing in hits):
                     hits.append(hit)
                 if len(hits) >= limit:
@@ -2719,6 +2742,18 @@ def _extract_keywords(text: str, *, limit: int = 20) -> str:
 _CONFIDENCE_LEVELS = {"high": 0.9, "medium": 0.5, "low": 0.2}
 _DEFAULT_CONFIDENCE = 0.5
 
+# Stage AM: frontmatter fields separate from the numeric `confidence` above.
+# evidence_level is Haroon's epistemic category (how was this known, not how
+# confident are we), not a replacement for confidence (see decisions.md,
+# 2026-07-29).
+_VALID_DOC_TYPES = {"feedback", "project", "reference", "lesson"}
+_DEFAULT_DOC_TYPE = "lesson"
+_DEFAULT_PROJECT = "global"
+_VALID_EVIDENCE_LEVELS = {"verified", "remembered", "inferred", "unknown"}
+_DEFAULT_EVIDENCE_LEVEL = "unknown"
+_VALID_CURRENTNESS = {"current", "historical", "superseded", "unknown"}
+_DEFAULT_CURRENTNESS = "current"
+
 
 def _parse_confidence_value(raw: str) -> float:
     """Map a frontmatter confidence label (high/medium/low) or bare number to a float.
@@ -2736,18 +2771,39 @@ def _parse_confidence_value(raw: str) -> float:
         return _DEFAULT_CONFIDENCE
 
 
-def _parse_memory_file(path: Path) -> tuple[str, str, float]:
-    """Return (title, body, confidence) — title/confidence from frontmatter if present.
+def _parse_memory_file(path: Path) -> dict:
+    """Return this memory/*.md file's frontmatter-derived fields as a dict.
 
-    Title falls back to the filename and confidence to _DEFAULT_CONFIDENCE when
-    frontmatter is absent or doesn't declare them.
+    Keys: title, body, confidence, doc_type, project, evidence_level,
+    currentness. Each falls back to a sane default when frontmatter is
+    absent or doesn't declare it, so a plain lesson file with no
+    frontmatter (or pre-Stage-AM frontmatter with only title/confidence)
+    indexes exactly as it did before Stage AM.
     """
 
     text = path.read_text(encoding="utf-8")
     match = re.match(r"^---\n(.*?)\n---\n(.*)$", text, re.S)
     if not match:
-        return path.stem, text.strip(), _DEFAULT_CONFIDENCE
+        return {
+            "title": path.stem,
+            "body": text.strip(),
+            "confidence": _DEFAULT_CONFIDENCE,
+            "doc_type": _DEFAULT_DOC_TYPE,
+            "project": _DEFAULT_PROJECT,
+            "evidence_level": _DEFAULT_EVIDENCE_LEVEL,
+            "currentness": _DEFAULT_CURRENTNESS,
+        }
     frontmatter, body = match.group(1), match.group(2)
+
+    def _field(name: str, valid: set[str] | None, default: str) -> str:
+        field_match = re.search(rf"^{name}:\s*(.+)$", frontmatter, re.M)
+        if not field_match:
+            return default
+        value = field_match.group(1).strip().lower()
+        if valid is not None and value not in valid:
+            return default
+        return value
+
     title_match = re.search(r"^title:\s*(.+)$", frontmatter, re.M)
     title = title_match.group(1).strip() if title_match else path.stem
     confidence_match = re.search(r"^confidence:\s*(.+)$", frontmatter, re.M)
@@ -2756,7 +2812,15 @@ def _parse_memory_file(path: Path) -> tuple[str, str, float]:
         if confidence_match
         else _DEFAULT_CONFIDENCE
     )
-    return title, body.strip(), confidence
+    return {
+        "title": title,
+        "body": body.strip(),
+        "confidence": confidence,
+        "doc_type": _field("type", _VALID_DOC_TYPES, _DEFAULT_DOC_TYPE),
+        "project": _field("project", None, _DEFAULT_PROJECT),
+        "evidence_level": _field("evidence_level", _VALID_EVIDENCE_LEVELS, _DEFAULT_EVIDENCE_LEVEL),
+        "currentness": _field("currentness", _VALID_CURRENTNESS, _DEFAULT_CURRENTNESS),
+    }
 
 
 def _get_embedding_model() -> Any:
@@ -2815,20 +2879,30 @@ def index_memory_files(db_path: Path = DB_PATH) -> int:
     count = 0
     with contextlib.closing(_connect(db_path)) as conn:
         for path in sorted(memory_dir.glob("*.md")):
-            title, body, confidence = _parse_memory_file(path)
+            parsed = _parse_memory_file(path)
+            title, body, confidence = parsed["title"], parsed["body"], parsed["confidence"]
             keywords = _extract_keywords(f"{title} {body}")
             embedding = _embed_or_none(f"{title}\n{body}")
             conn.execute(
                 """INSERT INTO memory_index
-                       (source_file, title, content, keywords, embedding, confidence)
-                   VALUES (?, ?, ?, ?, ?, ?)
+                       (source_file, title, content, keywords, embedding, confidence,
+                        doc_type, project, evidence_level, currentness)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(source_file) DO UPDATE SET
                        title = excluded.title,
                        content = excluded.content,
                        keywords = excluded.keywords,
                        embedding = excluded.embedding,
-                       confidence = excluded.confidence""",
-                (path.name, title, body, keywords, embedding, confidence),
+                       confidence = excluded.confidence,
+                       doc_type = excluded.doc_type,
+                       project = excluded.project,
+                       evidence_level = excluded.evidence_level,
+                       currentness = excluded.currentness""",
+                (
+                    path.name, title, body, keywords, embedding, confidence,
+                    parsed["doc_type"], parsed["project"], parsed["evidence_level"],
+                    parsed["currentness"],
+                ),
             )
             _upsert_memory_graph(conn, path.name, title, body, keywords)
             count += 1
@@ -2836,7 +2910,9 @@ def index_memory_files(db_path: Path = DB_PATH) -> int:
     return count
 
 
-def search_memory(query: str, *, limit: int = 3, db_path: Path = DB_PATH) -> list[dict]:
+def search_memory(
+    query: str, *, limit: int = 3, project: str | None = None, db_path: Path = DB_PATH
+) -> list[dict]:
     """Keyword search over memory_index — never reads memory/*.md directly.
 
     Mirrors the "recall comes from the index, not the raw docs" split: this
@@ -2845,15 +2921,25 @@ def search_memory(query: str, *, limit: int = 3, db_path: Path = DB_PATH) -> lis
     title is worth 3 points, in keywords 2 points, in content 1 point. The
     raw keyword score is then multiplied by the row's confidence, so a
     low-confidence lesson ranks below an equally-matching high-confidence one.
+
+    project is an optional filter (Stage AM) — None (the default) searches
+    everything, exactly as before that stage.
     """
 
     terms = list(dict.fromkeys(_significant_words(query)))
     if not terms:
         return []
     with contextlib.closing(_connect(db_path)) as conn:
-        rows = conn.execute(
-            "SELECT source_file, title, content, keywords, confidence FROM memory_index"
-        ).fetchall()
+        if project is None:
+            rows = conn.execute(
+                "SELECT source_file, title, content, keywords, confidence FROM memory_index"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT source_file, title, content, keywords, confidence
+                   FROM memory_index WHERE project = ?""",
+                (project,),
+            ).fetchall()
     scored: list[tuple[float, dict]] = []
     for row in rows:
         title = row["title"].lower()
@@ -2870,7 +2956,9 @@ def search_memory(query: str, *, limit: int = 3, db_path: Path = DB_PATH) -> lis
     return [item for _score, item in scored[:limit]]
 
 
-def semantic_search(query: str, *, limit: int = 3, db_path: Path = DB_PATH) -> list[dict]:
+def semantic_search(
+    query: str, *, limit: int = 3, project: str | None = None, db_path: Path = DB_PATH
+) -> list[dict]:
     """Embedding-based search over memory_index — finds meaning matches with no shared words.
 
     Complements search_memory() (keyword ranking); this ranks by cosine similarity
@@ -2878,14 +2966,24 @@ def semantic_search(query: str, *, limit: int = 3, db_path: Path = DB_PATH) -> l
     the row's confidence — a low-confidence lesson ranks below an equally
     similar high-confidence one. `similarity` in the returned dict stays the raw
     cosine value; the confidence weighting only affects ordering.
+
+    project is an optional filter (Stage AM) — None (the default) searches
+    everything, exactly as before that stage.
     """
 
     query_vector = np.frombuffer(_embed(query), dtype=np.float32)
     with contextlib.closing(_connect(db_path)) as conn:
-        rows = conn.execute(
-            "SELECT source_file, title, content, keywords, embedding, confidence "
-            "FROM memory_index WHERE embedding IS NOT NULL"
-        ).fetchall()
+        if project is None:
+            rows = conn.execute(
+                "SELECT source_file, title, content, keywords, embedding, confidence "
+                "FROM memory_index WHERE embedding IS NOT NULL"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT source_file, title, content, keywords, embedding, confidence
+                   FROM memory_index WHERE embedding IS NOT NULL AND project = ?""",
+                (project,),
+            ).fetchall()
     scored: list[tuple[float, dict]] = []
     for row in rows:
         row_vector = np.frombuffer(row["embedding"], dtype=np.float32)
