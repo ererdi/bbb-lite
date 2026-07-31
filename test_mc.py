@@ -102,7 +102,7 @@ class McTestCase(unittest.TestCase):
         self.assertEqual({"write tests", "ship it"}, titles)
 
     def test_complete_task_marks_done_and_hides_from_open_list(self) -> None:
-        task_id = mc.add_task("write tests", db_path=self.db_path)
+        task_id = mc.add_task("write tests", status="in_progress", db_path=self.db_path)
         evidence_id = _passing_evidence_id(self.db_path)
         result = mc.complete_task(
             task_id,
@@ -126,7 +126,7 @@ class McTestCase(unittest.TestCase):
             )
 
     def test_complete_task_twice_refused(self) -> None:
-        task_id = mc.add_task("write tests", db_path=self.db_path)
+        task_id = mc.add_task("write tests", status="in_progress", db_path=self.db_path)
         evidence_id = _passing_evidence_id(self.db_path)
         mc.complete_task(
             task_id,
@@ -146,7 +146,7 @@ class McTestCase(unittest.TestCase):
 
     def test_list_tasks_includes_open_and_done(self) -> None:
         open_id = mc.add_task("write tests", db_path=self.db_path)
-        done_id = mc.add_task("ship it", db_path=self.db_path)
+        done_id = mc.add_task("ship it", status="in_progress", db_path=self.db_path)
         evidence_id = _passing_evidence_id(self.db_path)
         mc.complete_task(
             done_id,
@@ -205,7 +205,9 @@ class McTestCase(unittest.TestCase):
         other_sprint = mc.add_sprint(other_project_id, "other sprint", db_path=self.db_path)
 
         mc.add_task("task a", sprint_id=sprint1, db_path=self.db_path)
-        done_id = mc.add_task("task b", sprint_id=sprint1, db_path=self.db_path)
+        done_id = mc.add_task(
+            "task b", status="in_progress", sprint_id=sprint1, db_path=self.db_path
+        )
         evidence_id = _passing_evidence_id(self.db_path)
         mc.complete_task(
             done_id,
@@ -270,7 +272,9 @@ class McTestCase(unittest.TestCase):
 
     def test_list_task_activity_returns_all_rows(self) -> None:
         mc.ensure_session("s1", db_path=self.db_path)
-        task_id = mc.add_task("write tests", session_id="s1", db_path=self.db_path)
+        task_id = mc.add_task(
+            "write tests", status="in_progress", session_id="s1", db_path=self.db_path
+        )
         evidence_id = _passing_evidence_id(self.db_path)
         mc.complete_task(
             task_id,
@@ -507,7 +511,7 @@ class McTestCase(unittest.TestCase):
         self.assertEqual("Next: first task", mc.pick_next_action(db_path=self.db_path))
 
     def test_pick_next_action_skips_done_tasks(self) -> None:
-        first_id = mc.add_task("first task", db_path=self.db_path)
+        first_id = mc.add_task("first task", status="in_progress", db_path=self.db_path)
         mc.add_task("second task", db_path=self.db_path)
         evidence_id = _passing_evidence_id(self.db_path)
         mc.complete_task(
@@ -526,7 +530,7 @@ class McTestCase(unittest.TestCase):
 
     def test_has_completed_task_since_true_after_complete_task(self) -> None:
         mc.ensure_session("s1", db_path=self.db_path)
-        task_id = mc.add_task("write tests", db_path=self.db_path)
+        task_id = mc.add_task("write tests", status="in_progress", db_path=self.db_path)
         evidence_id = _passing_evidence_id(self.db_path)
         mc.complete_task(
             task_id,
@@ -557,7 +561,9 @@ class McTestCase(unittest.TestCase):
 
     def test_complete_task_with_session_id_records_completed_activity(self) -> None:
         mc.ensure_session("s1", db_path=self.db_path)
-        task_id = mc.add_task("write tests", session_id="s1", db_path=self.db_path)
+        task_id = mc.add_task(
+            "write tests", status="in_progress", session_id="s1", db_path=self.db_path
+        )
         evidence_id = _passing_evidence_id(self.db_path)
         mc.complete_task(
             task_id,
@@ -577,7 +583,9 @@ class McTestCase(unittest.TestCase):
 
     def test_tasks_touched_by_session_dedupes_and_flags_completion(self) -> None:
         mc.ensure_session("s1", db_path=self.db_path)
-        done_id = mc.add_task("finish report", session_id="s1", db_path=self.db_path)
+        done_id = mc.add_task(
+            "finish report", status="in_progress", session_id="s1", db_path=self.db_path
+        )
         open_id = mc.add_task("review pr", session_id="s1", db_path=self.db_path)
         evidence_id = _passing_evidence_id(self.db_path)
         mc.complete_task(
@@ -610,7 +618,9 @@ class McTestCase(unittest.TestCase):
 
     def test_session_score_half_completed_scores_50(self) -> None:
         mc.ensure_session("s1", db_path=self.db_path)
-        done_id = mc.add_task("finish report", session_id="s1", db_path=self.db_path)
+        done_id = mc.add_task(
+            "finish report", status="in_progress", session_id="s1", db_path=self.db_path
+        )
         mc.add_task("review pr", session_id="s1", db_path=self.db_path)
         evidence_id = _passing_evidence_id(self.db_path)
         mc.complete_task(
@@ -629,8 +639,12 @@ class McTestCase(unittest.TestCase):
 
     def test_session_score_all_completed_scores_100(self) -> None:
         mc.ensure_session("s1", db_path=self.db_path)
-        first_id = mc.add_task("finish report", session_id="s1", db_path=self.db_path)
-        second_id = mc.add_task("review pr", session_id="s1", db_path=self.db_path)
+        first_id = mc.add_task(
+            "finish report", status="in_progress", session_id="s1", db_path=self.db_path
+        )
+        second_id = mc.add_task(
+            "review pr", status="in_progress", session_id="s1", db_path=self.db_path
+        )
         evidence_id = _passing_evidence_id(self.db_path)
         mc.complete_task(
             first_id,
@@ -697,7 +711,9 @@ class McTestCase(unittest.TestCase):
 
     def test_session_score_overall_averages_the_three_axes(self) -> None:
         mc.ensure_session("s1", db_path=self.db_path)
-        done_id = mc.add_task("finish report", session_id="s1", db_path=self.db_path)
+        done_id = mc.add_task(
+            "finish report", status="in_progress", session_id="s1", db_path=self.db_path
+        )
         mc.add_task("review pr", session_id="s1", db_path=self.db_path)
         evidence_id = _passing_evidence_id(self.db_path)
         mc.complete_task(
@@ -746,7 +762,7 @@ class StageAECompletionEvidenceTestCase(McTestCase):
     """Stage AE: complete_task() refuses to mark done without real evidence."""
 
     def test_complete_task_refuses_unknown_evidence_id(self) -> None:
-        task_id = mc.add_task("write tests", db_path=self.db_path)
+        task_id = mc.add_task("write tests", status="in_progress", db_path=self.db_path)
         with self.assertRaises(ValueError):
             mc.complete_task(
                 task_id,
@@ -756,11 +772,11 @@ class StageAECompletionEvidenceTestCase(McTestCase):
                 db_path=self.db_path,
             )
         self.assertEqual(
-            "todo", mc.list_tasks(db_path=self.db_path)[0]["status"]
+            "in_progress", mc.list_tasks(db_path=self.db_path)[0]["status"]
         )
 
     def test_complete_task_refuses_failing_evidence(self) -> None:
-        task_id = mc.add_task("write tests", db_path=self.db_path)
+        task_id = mc.add_task("write tests", status="in_progress", db_path=self.db_path)
         failing_evidence_id = mc.record_evidence(
             "tests", "unit suite", "fail", db_path=self.db_path
         )
@@ -773,11 +789,11 @@ class StageAECompletionEvidenceTestCase(McTestCase):
                 db_path=self.db_path,
             )
         self.assertEqual(
-            "todo", mc.list_tasks(db_path=self.db_path)[0]["status"]
+            "in_progress", mc.list_tasks(db_path=self.db_path)[0]["status"]
         )
 
     def test_complete_task_refuses_empty_completion_summary(self) -> None:
-        task_id = mc.add_task("write tests", db_path=self.db_path)
+        task_id = mc.add_task("write tests", status="in_progress", db_path=self.db_path)
         evidence_id = _passing_evidence_id(self.db_path)
         with self.assertRaises(ValueError):
             mc.complete_task(
@@ -788,11 +804,11 @@ class StageAECompletionEvidenceTestCase(McTestCase):
                 db_path=self.db_path,
             )
         self.assertEqual(
-            "todo", mc.list_tasks(db_path=self.db_path)[0]["status"]
+            "in_progress", mc.list_tasks(db_path=self.db_path)[0]["status"]
         )
 
     def test_complete_task_writes_task_completions_row(self) -> None:
-        task_id = mc.add_task("write tests", db_path=self.db_path)
+        task_id = mc.add_task("write tests", status="in_progress", db_path=self.db_path)
         evidence_id = _passing_evidence_id(self.db_path)
         mc.complete_task(
             task_id,
@@ -812,7 +828,7 @@ class StageAECompletionEvidenceTestCase(McTestCase):
 
     def test_complete_task_derives_completed_by_role_from_get_role(self) -> None:
         mc.set_role("s1", "builder", db_path=self.db_path)
-        task_id = mc.add_task("write tests", db_path=self.db_path)
+        task_id = mc.add_task("write tests", status="in_progress", db_path=self.db_path)
         evidence_id = _passing_evidence_id(self.db_path)
         result = mc.complete_task(
             task_id,
@@ -830,7 +846,7 @@ class StageAECompletionEvidenceTestCase(McTestCase):
         self.assertEqual("builder", row["completed_by_role"])
 
     def test_complete_task_still_refused_for_already_done_task_regardless_of_evidence(self) -> None:
-        task_id = mc.add_task("write tests", db_path=self.db_path)
+        task_id = mc.add_task("write tests", status="in_progress", db_path=self.db_path)
         first_evidence_id = _passing_evidence_id(self.db_path)
         mc.complete_task(
             task_id,
@@ -1644,7 +1660,7 @@ def _seed_20_tracked_items(db_path: Path, session_id: str) -> None:
     """5 open tasks + 10 decisions + role declared (1) + 4 checklist items = 20."""
 
     for i in range(5):
-        mc.add_task(f"task {i}", db_path=db_path)
+        mc.add_task(f"task {i}", status="in_progress", db_path=db_path)
     for i in range(10):
         mc.add_decision(
             f"decision {i}", session_id=session_id, db_path=db_path,
@@ -1850,7 +1866,10 @@ class StageACTestCase(McTestCase):
             cur = conn.execute(
                 "INSERT INTO tasks (title, status, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?)",
-                ("finish MC seam", "open", "2026-07-29T00:00:00+00:00", "2026-07-29T00:00:00+00:00"),
+                (
+                    "finish MC seam", "in_progress",
+                    "2026-07-29T00:00:00+00:00", "2026-07-29T00:00:00+00:00",
+                ),
             )
             task_id = cur.lastrowid
             conn.commit()

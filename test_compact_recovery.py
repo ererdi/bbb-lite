@@ -61,7 +61,7 @@ def _seed_20_tracked_items(db_path: Path, session_id: str, md_path: Path) -> Non
     """5 open tasks + 10 decisions + role declared (1) + 4 checklist items = 20."""
 
     for i in range(5):
-        mc.add_task(f"task {i}", db_path=db_path)
+        mc.add_task(f"task {i}", status="in_progress", db_path=db_path)
     for i in range(10):
         mc.add_decision(f"decision {i}", session_id=session_id, db_path=db_path, md_path=md_path)
     mc.set_role(session_id, "builder", db_path=db_path)

@@ -488,6 +488,8 @@ def init_db(db_path: Path = DB_PATH) -> None:
         }
         if "sprint_id" not in existing_task_columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN sprint_id INTEGER")
+        if "parent_task_id" not in existing_task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN parent_task_id INTEGER")
         conn.execute(
             """CREATE TABLE IF NOT EXISTS memory_index (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -920,6 +922,7 @@ def add_task(
     status: str = "todo",
     *,
     sprint_id: int | None = None,
+    parent_task_id: int | None = None,
     session_id: str | None = None,
     db_path: Path = DB_PATH,
 ) -> int:
@@ -927,15 +930,18 @@ def add_task(
 
     sprint_id is optional and defaults to None (backward compatible with
     tasks created before Stage L's projects/sprints hierarchy existed).
-    If session_id is given, records a 'created' row in task_activity so
-    tasks_touched_by_session() can later find it.
+    parent_task_id is optional (Stage AP) — set it to make this task a
+    subtask; complete_task() refuses to close a parent while any of its
+    subtasks are still open. If session_id is given, records a 'created' row
+    in task_activity so tasks_touched_by_session() can later find it.
     """
 
     with contextlib.closing(_connect(db_path)) as conn:
         cur = conn.execute(
-            "INSERT INTO tasks (title, status, created_at, updated_at, sprint_id) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (title, status, _now(), _now(), sprint_id),
+            """INSERT INTO tasks
+                   (title, status, created_at, updated_at, sprint_id, parent_task_id)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (title, status, _now(), _now(), sprint_id, parent_task_id),
         )
         task_id = cur.lastrowid
         if session_id is not None:
@@ -945,6 +951,34 @@ def add_task(
             )
         conn.commit()
         return task_id
+
+
+def request_review(task_id: int, session_id: str, db_path: Path = DB_PATH) -> None:
+    """Move a task from 'in_progress' to 'ready_for_review' (Stage AP).
+
+    An intermediate step, not completion — complete_task() still requires
+    its own evidence/summary/subtask checks afterward. Raises ValueError if
+    the task isn't currently 'in_progress' (the only state review can be
+    requested from).
+    """
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"unknown task_id: {task_id}")
+        if row["status"] != "in_progress":
+            raise ValueError(
+                f"cannot request review: task status is {row['status']!r}, expected 'in_progress'"
+            )
+        conn.execute(
+            "UPDATE tasks SET status = 'ready_for_review', updated_at = ? WHERE id = ?",
+            (_now(), task_id),
+        )
+        conn.execute(
+            "INSERT INTO task_activity (task_id, session_id, activity, at) VALUES (?, ?, ?, ?)",
+            (task_id, session_id, "review_requested", _now()),
+        )
+        conn.commit()
 
 
 def list_open_tasks(db_path: Path = DB_PATH) -> list[dict]:
@@ -2664,12 +2698,16 @@ def recovery_package_size(session_id: str, db_path: Path = DB_PATH) -> int:
     return sum(len(line) for line in lines)
 
 
+_COMPLETABLE_STATUSES = {"in_progress", "ready_for_review"}
+
+
 def complete_task(
     task_id: int,
     *,
     session_id: str,
     evidence_id: int,
     completion_summary: str,
+    require_test_evidence: bool = True,
     db_path: Path = DB_PATH,
 ) -> dict:
     """The one sanctioned path to tasks.status='done'; raw SQL is refused by the guard.
@@ -2679,6 +2717,19 @@ def complete_task(
     an existing evidence row whose status isn't 'fail', and completion_summary
     can't be blank. completed_by_role is not a separate parameter — it's
     derived from session_id via get_role(), since that's already known.
+
+    Stage AP tightens this further (Codex's Task Completion item):
+    - require_test_evidence (default True) refuses completion unless the
+      evidence row's `kind` contains "test" (case-insensitive) — completion
+      needs the evidence to actually be a test run, not just any passing
+      record. Callers whose evidence genuinely isn't a test run (e.g.
+      bin/dispatch.py's agentic dispatch receipt) must pass
+      require_test_evidence=False explicitly, not fake a "test" label.
+    - the task must currently be 'in_progress' or 'ready_for_review' —
+      'todo'/'pending' or 'blocked' tasks must progress first; this is
+      checked before the subtask check below.
+    - a task with any not-yet-'done' subtask (parent_task_id pointing at
+      it) cannot be completed until every subtask is done.
 
     Records a 'completed' row in task_activity and a full receipt (evidence,
     role, summary) in task_completions.
@@ -2694,17 +2745,32 @@ def complete_task(
         raise ValueError(f"evidence not found: {evidence_id}")
     if evidence_rows[0]["status"] == "fail":
         raise ValueError("cannot complete a task with failing evidence")
+    if require_test_evidence and "test" not in evidence_rows[0]["kind"].lower():
+        raise ValueError("completion evidence must include test execution")
 
     completed_by_role = get_role(session_id, db_path=db_path)
 
     authorization = _CompletionAuthorization(task_id=str(task_id))
     now = _now()
     with contextlib.closing(_connect(db_path)) as conn:
-        task = conn.execute("SELECT id, status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        task = conn.execute(
+            "SELECT id, status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
         if task is None:
             raise MCCompletionRefused(f"completion refused: task not found: {task_id}")
         if task["status"] == "done":
             raise MCCompletionRefused(f"completion refused: task already done: {task_id}")
+        if task["status"] not in _COMPLETABLE_STATUSES:
+            raise ValueError(
+                f"cannot complete: task status {task['status']!r} is not ready "
+                "(must be 'in_progress' or 'ready_for_review')"
+            )
+        open_subtasks = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE parent_task_id = ? AND status != 'done'",
+            (task_id,),
+        ).fetchone()[0]
+        if open_subtasks:
+            raise ValueError(f"cannot complete: {open_subtasks} subtask(s) still open")
         updated = conn.execute(
             "UPDATE tasks SET status = 'done', updated_at = ? WHERE id = ? AND status != 'done'",
             (now, task_id),

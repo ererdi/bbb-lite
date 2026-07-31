@@ -187,13 +187,14 @@ class DispatchTestCase(unittest.TestCase):
             output = self._run()
         classify_mock.assert_not_called()  # CTO answered cleanly, no fallback needed
         add_task_mock.assert_called_once_with(
-            "Fix the login bug", session_id=dispatch.DISPATCH_SESSION_ID
+            "Fix the login bug", status="in_progress", session_id=dispatch.DISPATCH_SESSION_ID
         )
         complete_task_mock.assert_called_once_with(
             42,
             session_id=dispatch.DISPATCH_SESSION_ID,
             evidence_id=self.mock_record_evidence.return_value,
             completion_summary="short change",
+            require_test_evidence=False,
         )
         self.assertIn("[dispatch] role=cto -> Fix the login bug (architect: yes)", output)
         self.assertIn("[dispatch] role=architect -> short plan", output)
@@ -211,13 +212,14 @@ class DispatchTestCase(unittest.TestCase):
         classify_mock.assert_not_called()
         self.assertEqual(2, claude_mock.call_count)  # cto + builder, no architect turn
         add_task_mock.assert_called_once_with(
-            "Add a helper", session_id=dispatch.DISPATCH_SESSION_ID
+            "Add a helper", status="in_progress", session_id=dispatch.DISPATCH_SESSION_ID
         )
         complete_task_mock.assert_called_once_with(
             7,
             session_id=dispatch.DISPATCH_SESSION_ID,
             evidence_id=self.mock_record_evidence.return_value,
             completion_summary="short change",
+            require_test_evidence=False,
         )
         self.assertIn("[dispatch] role=cto -> Add a helper (architect: no)", output)
         self.assertNotIn("role=architect", output)

@@ -176,7 +176,9 @@ async def dispatch(task: str) -> None:
         )
         if run_id:
             _safe_mc(None, mc.record_agent_output, run_id, "cto", cto_reply)
-        task_id = _safe_mc(None, mc.add_task, title, session_id=DISPATCH_SESSION_ID)
+        task_id = _safe_mc(
+            None, mc.add_task, title, status="in_progress", session_id=DISPATCH_SESSION_ID
+        )
         role_needed = "architect" if needs_architect else "builder"
     else:
         print("[dispatch] role=cto -> unavailable, falling back to classify()")
@@ -241,6 +243,9 @@ async def dispatch(task: str) -> None:
     )
 
     if task_id is not None and change is not None and evidence_id is not None:
+        # Stage AP: this evidence is a dispatch receipt, not a test run - an
+        # honest require_test_evidence=False rather than mislabeling the
+        # evidence kind as "test" just to pass the new default check.
         _safe_mc(
             None,
             mc.complete_task,
@@ -248,6 +253,7 @@ async def dispatch(task: str) -> None:
             session_id=DISPATCH_SESSION_ID,
             evidence_id=evidence_id,
             completion_summary=change,
+            require_test_evidence=False,
         )
 
     if run_id:
