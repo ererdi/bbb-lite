@@ -3183,19 +3183,31 @@ def index_docs(
     return count
 
 
-def search_symbols(query: str, *, limit: int = 3, db_path: Path = DB_PATH) -> list[dict]:
+def search_symbols(
+    query: str, *, limit: int = 3, project: str | None = None, db_path: Path = DB_PATH
+) -> list[dict]:
     """Embedding-based search over symbol_index — same cosine-similarity ranking
     as semantic_search(), applied to indexed function/class symbols instead of
     memory/*.md notes (Stage AN 1/3). No confidence weighting: symbol_index
     has no confidence column, unlike memory_index.
+
+    project is an optional filter (Stage AN 2/3, same shape as Stage AM's
+    memory search filter) — None searches everything.
     """
 
     query_vector = np.frombuffer(_embed(query), dtype=np.float32)
     with contextlib.closing(_connect(db_path)) as conn:
-        rows = conn.execute(
-            """SELECT file_path, symbol_name, symbol_type, docstring, embedding, project
-               FROM symbol_index WHERE embedding IS NOT NULL"""
-        ).fetchall()
+        if project is None:
+            rows = conn.execute(
+                """SELECT file_path, symbol_name, symbol_type, docstring, embedding, project
+                   FROM symbol_index WHERE embedding IS NOT NULL"""
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT file_path, symbol_name, symbol_type, docstring, embedding, project
+                   FROM symbol_index WHERE embedding IS NOT NULL AND project = ?""",
+                (project,),
+            ).fetchall()
     scored: list[tuple[float, dict]] = []
     for row in rows:
         row_vector = np.frombuffer(row["embedding"], dtype=np.float32)
@@ -3207,18 +3219,30 @@ def search_symbols(query: str, *, limit: int = 3, db_path: Path = DB_PATH) -> li
     return [item for _score, item in scored[:limit]]
 
 
-def search_docs(query: str, *, limit: int = 3, db_path: Path = DB_PATH) -> list[dict]:
+def search_docs(
+    query: str, *, limit: int = 3, project: str | None = None, db_path: Path = DB_PATH
+) -> list[dict]:
     """Embedding-based search over doc_index — same cosine-similarity ranking
     as semantic_search(), applied to indexed docs/*.md files instead of
     memory/*.md notes (Stage AN 1/3).
+
+    project is an optional filter (Stage AN 2/3, same shape as Stage AM's
+    memory search filter) — None searches everything.
     """
 
     query_vector = np.frombuffer(_embed(query), dtype=np.float32)
     with contextlib.closing(_connect(db_path)) as conn:
-        rows = conn.execute(
-            """SELECT file_path, title, content, embedding, project
-               FROM doc_index WHERE embedding IS NOT NULL"""
-        ).fetchall()
+        if project is None:
+            rows = conn.execute(
+                """SELECT file_path, title, content, embedding, project
+                   FROM doc_index WHERE embedding IS NOT NULL"""
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT file_path, title, content, embedding, project
+                   FROM doc_index WHERE embedding IS NOT NULL AND project = ?""",
+                (project,),
+            ).fetchall()
     scored: list[tuple[float, dict]] = []
     for row in rows:
         row_vector = np.frombuffer(row["embedding"], dtype=np.float32)
@@ -3228,6 +3252,55 @@ def search_docs(query: str, *, limit: int = 3, db_path: Path = DB_PATH) -> list[
         scored.append((similarity, item))
     scored.sort(key=lambda pair: pair[0], reverse=True)
     return [item for _score, item in scored[:limit]]
+
+
+def cyg_similar(
+    query: str, *, project: str | None = None, limit: int = 5, db_path: Path = DB_PATH
+) -> list[dict]:
+    """Merge search_symbols()/search_docs() hits, ranked by similarity.
+
+    The practical form of Haroon's "reuse before build" Golden Rule (Stage AN
+    2/3): what indexed code or doc already looks like `query`. Each hit
+    carries source_table ("symbol_index" or "doc_index") so a caller (or
+    cyg_exists()) knows where a match came from.
+    """
+
+    symbol_hits = search_symbols(query, limit=limit, project=project, db_path=db_path)
+    doc_hits = search_docs(query, limit=limit, project=project, db_path=db_path)
+    combined = []
+    for hit in symbol_hits:
+        item = dict(hit)
+        item["source_table"] = "symbol_index"
+        combined.append(item)
+    for hit in doc_hits:
+        item = dict(hit)
+        item["source_table"] = "doc_index"
+        combined.append(item)
+    combined.sort(key=lambda item: item["similarity"], reverse=True)
+    return combined[:limit]
+
+
+def cyg_exists(
+    query: str, *, project: str | None = None, threshold: float = 0.6, db_path: Path = DB_PATH
+) -> dict:
+    """Does something like `query` already exist in symbol_index/doc_index?
+
+    The practical, checkable form of Haroon's "reuse before build" Golden
+    Rule (Stage AN 2/3) — checks real indexed symbols/docs instead of just
+    trusting the model to remember to search first. `score` is always the
+    best similarity found (None only if nothing is indexed at all); `match`
+    is populated only once that score clears `threshold` — below threshold,
+    the score is still reported so a caller can see "close but not close
+    enough", not just a bare False.
+    """
+
+    hits = cyg_similar(query, project=project, limit=1, db_path=db_path)
+    if not hits:
+        return {"exists": False, "match": None, "score": None}
+    best = hits[0]
+    score = best["similarity"]
+    exists = score >= threshold
+    return {"exists": exists, "match": best if exists else None, "score": score}
 
 
 def ask_ollama(prompt: str, model: str = "gemma:2b") -> str | None:

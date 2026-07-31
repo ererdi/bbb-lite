@@ -53,6 +53,35 @@ def _log_denied(session_id: str, reason: str) -> None:
         pass  # fail-soft: never block a tool call over a logging error
 
 
+def _check_reuse(file_path: str, tool_input: dict) -> None:
+    """Stage AN (2/3): informational-only reuse nudge before new .py code is
+    written. The practical, checkable form of Haroon's "reuse before build"
+    Golden Rule, via cyg_exists() against real indexed symbols/docs instead
+    of just trusting the model to remember to search first. Never blocks;
+    fails soft if cyg_exists() can't run at all (e.g. embedding model
+    unavailable) - see decisions.md, 2026-07-29.
+    """
+
+    if not file_path.endswith(".py"):
+        return
+    new_code = tool_input.get("content") or tool_input.get("new_string")
+    if not new_code or not new_code.strip():
+        return
+    try:
+        mc.init_db()
+        result = mc.cyg_exists(new_code)
+    except Exception:
+        return
+    if result["exists"]:
+        match = result["match"]
+        label = match.get("symbol_name") or match.get("title") or match["file_path"]
+        print(
+            f"[bbb-lite] INFO: similar code may already exist - "
+            f"{match['source_table']}: {label} (score={result['score']:.2f}) - "
+            "consider reuse before writing new code"
+        )
+
+
 def check(tool_input: dict, session_id: str | None = None) -> dict | None:
     """None means allow (no output needed); a dict is the block payload.
 
@@ -79,6 +108,7 @@ def check(tool_input: dict, session_id: str | None = None) -> dict | None:
             _log_denied(session_id, reason)
             return _deny(reason)
 
+    _check_reuse(file_path, tool_input)
     _log(file_path)
     return None
 
