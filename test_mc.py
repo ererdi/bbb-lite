@@ -46,6 +46,7 @@ class McTestCase(unittest.TestCase):
                 "answer_quality_scores", "answer_receipts", "lifecycle_runs",
                 "decisions", "compact_snapshots", "documents",
                 "context_nodes", "context_edges",
+                "doc_index", "symbol_index",
             },
             names,
         )

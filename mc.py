@@ -11,6 +11,7 @@ tasks.status='done'; only complete_task() may do that.
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import hashlib
 import json
@@ -516,6 +517,29 @@ def init_db(db_path: Path = DB_PATH) -> None:
             conn.execute(
                 "ALTER TABLE memory_index ADD COLUMN currentness TEXT DEFAULT 'current'"
             )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS doc_index (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path TEXT NOT NULL,
+                title TEXT,
+                content TEXT,
+                embedding BLOB,
+                project TEXT,
+                UNIQUE(file_path)
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS symbol_index (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path TEXT NOT NULL,
+                symbol_name TEXT NOT NULL,
+                symbol_type TEXT NOT NULL,
+                docstring TEXT,
+                embedding BLOB,
+                project TEXT,
+                UNIQUE(file_path, symbol_name)
+            )"""
+        )
         conn.execute(
             """CREATE TABLE IF NOT EXISTS task_activity (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2992,6 +3016,216 @@ def semantic_search(
         item = {key: row[key] for key in row.keys() if key != "embedding"}
         item["similarity"] = similarity
         scored.append((similarity * confidence, item))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _score, item in scored[:limit]]
+
+
+_EXCLUDED_INDEX_DIR_NAMES = {"__pycache__", "node_modules"}
+
+
+def _is_excluded_index_path(path: Path) -> bool:
+    """Skip hidden dirs (.git, .vs, .claude, ...) and dependency/cache dirs."""
+
+    return any(
+        part.startswith(".") or part in _EXCLUDED_INDEX_DIR_NAMES for part in path.parts
+    )
+
+
+def _extract_python_symbols(tree: ast.AST) -> list[dict]:
+    """Every function/class def in a parsed Python module, dotted-qualified by
+    enclosing scope (e.g. "ClassName.method_name") so two classes in the same
+    file can each have a method of the same name without colliding on
+    symbol_index's UNIQUE(file_path, symbol_name)."""
+
+    symbols: list[dict] = []
+    scope_stack: list[str] = []
+
+    class _Visitor(ast.NodeVisitor):
+        def _record(self, node: ast.AST, symbol_type: str) -> None:
+            qualified_name = ".".join(scope_stack + [node.name])
+            symbols.append(
+                {
+                    "name": qualified_name,
+                    "type": symbol_type,
+                    "docstring": ast.get_docstring(node),
+                }
+            )
+            scope_stack.append(node.name)
+            self.generic_visit(node)
+            scope_stack.pop()
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            self._record(node, "class")
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self._record(node, "function")
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self._record(node, "async function")
+
+    _Visitor().visit(tree)
+    return symbols
+
+
+def index_symbols(
+    root_dir: str | Path | None = None,
+    extensions: tuple[str, ...] = (".py",),
+    *,
+    db_path: Path = DB_PATH,
+) -> int:
+    """Parse source files under root_dir and upsert their symbols into symbol_index.
+
+    Stage AN (1/3): only ".py" (via the ast module) actually does anything -
+    other languages (.js/.ts/.sql/.sh) are a deliberate next step, not
+    started here (see decisions.md, 2026-07-29). extensions is accepted so
+    that future shape doesn't require an API change; any extension other
+    than ".py" is silently skipped for now.
+
+    project is set to root_dir's own folder name for every symbol indexed in
+    this run - the same "last folder name" convention resolve_project() uses
+    (Stage AG), since there is no other session/file -> project mapping in
+    the schema.
+    """
+
+    root = Path(root_dir) if root_dir is not None else Path(__file__).resolve().parent
+    project = root.name
+    count = 0
+    with contextlib.closing(_connect(db_path)) as conn:
+        for ext in extensions:
+            if ext != ".py":
+                continue
+            for path in sorted(root.rglob(f"*{ext}")):
+                if _is_excluded_index_path(path.relative_to(root)):
+                    continue
+                try:
+                    tree = ast.parse(path.read_text(encoding="utf-8"))
+                except (SyntaxError, UnicodeDecodeError, OSError):
+                    continue
+                rel_path = str(path.relative_to(root))
+                for symbol in _extract_python_symbols(tree):
+                    embedding = _embed_or_none(f"{symbol['name']}\n{symbol['docstring'] or ''}")
+                    conn.execute(
+                        """INSERT INTO symbol_index
+                               (file_path, symbol_name, symbol_type, docstring, embedding, project)
+                           VALUES (?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(file_path, symbol_name) DO UPDATE SET
+                               symbol_type = excluded.symbol_type,
+                               docstring = excluded.docstring,
+                               embedding = excluded.embedding,
+                               project = excluded.project""",
+                        (
+                            rel_path, symbol["name"], symbol["type"],
+                            symbol["docstring"], embedding, project,
+                        ),
+                    )
+                    count += 1
+        conn.commit()
+    return count
+
+
+def _parse_doc_file(path: Path) -> tuple[str, str]:
+    """Return (title, content) for a plain (frontmatter-free) doc: title is
+    the first "# heading" line if present, else the filename stem."""
+
+    text = path.read_text(encoding="utf-8").strip()
+    first_line = text.splitlines()[0] if text else ""
+    heading_match = re.match(r"^#\s+(.+)$", first_line)
+    title = heading_match.group(1).strip() if heading_match else path.stem
+    return title, text
+
+
+def index_docs(
+    root_dir: str | Path | None = None,
+    extensions: tuple[str, ...] = (".md",),
+    *,
+    db_path: Path = DB_PATH,
+) -> int:
+    """Index project docs (e.g. docs/*.md) into doc_index.
+
+    Deliberately skips memory/ - memory/*.md is already covered by
+    memory_index/index_memory_files() (Stage C onward); duplicating it here
+    would just be two indexes of the same files (see decisions.md,
+    2026-07-29). Stage AN (1/3): only ".md" does anything for now, same
+    placeholder shape as index_symbols().
+    """
+
+    root = Path(root_dir) if root_dir is not None else Path(__file__).resolve().parent
+    memory_dir = (root / "memory").resolve()
+    project = root.name
+    count = 0
+    with contextlib.closing(_connect(db_path)) as conn:
+        for ext in extensions:
+            if ext != ".md":
+                continue
+            for path in sorted(root.rglob(f"*{ext}")):
+                rel_path = path.relative_to(root)
+                if _is_excluded_index_path(rel_path):
+                    continue
+                if path.resolve().is_relative_to(memory_dir):
+                    continue
+                try:
+                    title, content = _parse_doc_file(path)
+                except (UnicodeDecodeError, OSError):
+                    continue
+                embedding = _embed_or_none(f"{title}\n{content}")
+                conn.execute(
+                    """INSERT INTO doc_index (file_path, title, content, embedding, project)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(file_path) DO UPDATE SET
+                           title = excluded.title,
+                           content = excluded.content,
+                           embedding = excluded.embedding,
+                           project = excluded.project""",
+                    (str(rel_path), title, content, embedding, project),
+                )
+                count += 1
+        conn.commit()
+    return count
+
+
+def search_symbols(query: str, *, limit: int = 3, db_path: Path = DB_PATH) -> list[dict]:
+    """Embedding-based search over symbol_index — same cosine-similarity ranking
+    as semantic_search(), applied to indexed function/class symbols instead of
+    memory/*.md notes (Stage AN 1/3). No confidence weighting: symbol_index
+    has no confidence column, unlike memory_index.
+    """
+
+    query_vector = np.frombuffer(_embed(query), dtype=np.float32)
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            """SELECT file_path, symbol_name, symbol_type, docstring, embedding, project
+               FROM symbol_index WHERE embedding IS NOT NULL"""
+        ).fetchall()
+    scored: list[tuple[float, dict]] = []
+    for row in rows:
+        row_vector = np.frombuffer(row["embedding"], dtype=np.float32)
+        similarity = _cosine_similarity(query_vector, row_vector)
+        item = {key: row[key] for key in row.keys() if key != "embedding"}
+        item["similarity"] = similarity
+        scored.append((similarity, item))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _score, item in scored[:limit]]
+
+
+def search_docs(query: str, *, limit: int = 3, db_path: Path = DB_PATH) -> list[dict]:
+    """Embedding-based search over doc_index — same cosine-similarity ranking
+    as semantic_search(), applied to indexed docs/*.md files instead of
+    memory/*.md notes (Stage AN 1/3).
+    """
+
+    query_vector = np.frombuffer(_embed(query), dtype=np.float32)
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            """SELECT file_path, title, content, embedding, project
+               FROM doc_index WHERE embedding IS NOT NULL"""
+        ).fetchall()
+    scored: list[tuple[float, dict]] = []
+    for row in rows:
+        row_vector = np.frombuffer(row["embedding"], dtype=np.float32)
+        similarity = _cosine_similarity(query_vector, row_vector)
+        item = {key: row[key] for key in row.keys() if key != "embedding"}
+        item["similarity"] = similarity
+        scored.append((similarity, item))
     scored.sort(key=lambda pair: pair[0], reverse=True)
     return [item for _score, item in scored[:limit]]
 
