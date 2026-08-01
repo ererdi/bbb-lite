@@ -1734,6 +1734,57 @@ def recent_decision_ids(limit: int = 2, db_path: Path = DB_PATH) -> list[int]:
     return [row["id"] for row in rows]
 
 
+_DECISION_CONFLICT_WORD_OVERLAP_THRESHOLD = 0.5
+
+
+def detect_decision_conflicts(db_path: Path = DB_PATH) -> list[dict]:
+    """Find pairs of decisions that may disagree (Stage AT, Haroon's team doc item 7).
+
+    Detection only — nothing here resolves or deletes anything, it just
+    surfaces candidate pairs for a human to look at. Two decisions are
+    compared only if they're NOT known to come from the same session: a
+    pair is skipped when both rows carry the same non-NULL session_id
+    (evolving your own earlier call in one session isn't a "conflict"); if
+    either session_id is NULL (the common case — most decisions here are
+    logged without one, see decisions.md 2026-07-24), the pair IS compared,
+    since "same session" can't be ruled out either way and staying silent
+    would defeat the point of this check.
+
+    "High similarity" is Jaccard overlap of _significant_words(text) sets
+    (shared with search_memory's keyword layer) at or above
+    _DECISION_CONFLICT_WORD_OVERLAP_THRESHOLD — a simple word-overlap
+    heuristic, not semantic search.
+    """
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = [dict(row) for row in conn.execute("SELECT * FROM decisions").fetchall()]
+
+    word_sets = [set(_significant_words(row["text"])) for row in rows]
+    conflicts: list[dict] = []
+    for i in range(len(rows)):
+        for j in range(i + 1, len(rows)):
+            a, b = rows[i], rows[j]
+            if a["session_id"] is not None and a["session_id"] == b["session_id"]:
+                continue
+            words_a, words_b = word_sets[i], word_sets[j]
+            union = words_a | words_b
+            if not union:
+                continue
+            overlap = len(words_a & words_b) / len(union)
+            if overlap >= _DECISION_CONFLICT_WORD_OVERLAP_THRESHOLD:
+                conflicts.append(
+                    {
+                        "a": a,
+                        "b": b,
+                        "reason": (
+                            f"word overlap {overlap:.2f} across different sessions "
+                            f"(session_id {a['session_id']!r} vs {b['session_id']!r})"
+                        ),
+                    }
+                )
+    return conflicts
+
+
 def upsert_capability_boundary(
     capability: str,
     enabled: bool,
@@ -3198,6 +3249,8 @@ def semantic_search(
     project is an optional filter (Stage AM) — None (the default) searches
     everything, exactly as before that stage. include_replaced (Stage AS) —
     False (the default) hides rows a heal_memory() merge marked 'replaced'.
+    The returned dict includes `currentness` (Stage AT: detect_memory_conflicts()
+    compares it across results to spot same-topic notes that disagree).
     """
 
     query_vector = np.frombuffer(_embed(query), dtype=np.float32)
@@ -3211,7 +3264,7 @@ def semantic_search(
     where_clause = " AND ".join(conditions)
     with contextlib.closing(_connect(db_path)) as conn:
         rows = conn.execute(
-            f"""SELECT source_file, title, content, keywords, embedding, confidence
+            f"""SELECT source_file, title, content, keywords, embedding, confidence, currentness
                FROM memory_index WHERE {where_clause}""",
             params,
         ).fetchall()
@@ -3225,6 +3278,41 @@ def semantic_search(
         scored.append((similarity * confidence, item))
     scored.sort(key=lambda pair: pair[0], reverse=True)
     return [item for _score, item in scored[:limit]]
+
+
+_MEMORY_CONFLICT_SIMILARITY_THRESHOLD = 0.5
+
+
+def detect_memory_conflicts(query: str, *, db_path: Path = DB_PATH) -> list[dict]:
+    """Find same-topic memory notes that disagree on currentness (Stage AT, item 7).
+
+    Runs semantic_search(query, limit=5) — which already excludes
+    status='replaced' rows (Stage AS; those are already-resolved merges, not
+    open conflicts) — then pairs up results that both clear
+    _MEMORY_CONFLICT_SIMILARITY_THRESHOLD similarity to the query AND whose
+    `currentness` field disagrees (e.g. one 'current', one 'superseded').
+    Detection only: nothing here rewrites currentness or merges anything.
+    """
+
+    results = semantic_search(query, limit=5, db_path=db_path)
+    candidates = [r for r in results if r["similarity"] > _MEMORY_CONFLICT_SIMILARITY_THRESHOLD]
+    conflicts: list[dict] = []
+    for i in range(len(candidates)):
+        for j in range(i + 1, len(candidates)):
+            a, b = candidates[i], candidates[j]
+            if a["currentness"] != b["currentness"]:
+                conflicts.append(
+                    {
+                        "a": a,
+                        "b": b,
+                        "reason": (
+                            f"both match '{query}' (similarity {a['similarity']:.2f}/"
+                            f"{b['similarity']:.2f}) but currentness differs: "
+                            f"{a['currentness']!r} vs {b['currentness']!r}"
+                        ),
+                    }
+                )
+    return conflicts
 
 
 _EXCLUDED_INDEX_DIR_NAMES = {"__pycache__", "node_modules"}

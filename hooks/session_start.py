@@ -142,6 +142,19 @@ def main() -> None:
                 f"({hit['source_file']}, confidence={hit['confidence']})"
             )
 
+        # Stage AT: same fail-soft treatment as the related-memory nudge
+        # above — a conflict check that can't run (e.g. broken embedding
+        # model) should skip silently, not break session start.
+        try:
+            conflicts = mc.detect_memory_conflicts(checkpoint["current_task"])
+        except Exception:
+            conflicts = []
+        if conflicts:
+            print(
+                f"[bbb-lite] CONFLICT WARNING: found {len(conflicts)} conflicting "
+                "memory record(s) for this topic - review before trusting"
+            )
+
     # Stage AA: a bounded-package proof — total chars of the recovery info
     # above, so "this is a small nudge, not a context dump" is measured, not
     # just asserted.
