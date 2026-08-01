@@ -1885,5 +1885,22 @@ class StageACTestCase(McTestCase):
         self.assertEqual("done", row["status"])
 
 
+class StageAQDbHealthCheckTestCase(McTestCase):
+    def test_reachable_when_db_exists(self) -> None:
+        result = mc.db_health_check(self.db_path)
+        self.assertEqual(
+            {"reachable": True, "mode": "local-only", "path": str(self.db_path)},
+            result,
+        )
+
+    def test_unreachable_when_db_missing(self) -> None:
+        missing_path = self.db_path.parent / "does-not-exist.db"
+        result = mc.db_health_check(missing_path)
+        self.assertEqual(
+            {"reachable": False, "mode": "local-only", "path": str(missing_path)},
+            result,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

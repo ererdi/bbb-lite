@@ -3769,5 +3769,27 @@ def list_context_map(only_approved: bool = True, db_path: Path = DB_PATH) -> dic
     }
 
 
+def db_health_check(db_path: Path = DB_PATH) -> dict:
+    """Local-only stand-in for a "server unavailable" check (Stage AQ).
+
+    There is no server to ping, so this just checks whether the sqlite
+    file itself is reachable (exists and opens for a read).
+    """
+
+    reachable = False
+    if db_path.exists():
+        try:
+            with contextlib.closing(_connect(db_path)) as conn:
+                conn.execute("SELECT 1")
+            reachable = True
+        except sqlite3.Error:
+            reachable = False
+    return {
+        "reachable": reachable,
+        "mode": "local-only",
+        "path": str(db_path),
+    }
+
+
 if __name__ == "__main__":
     init_db()

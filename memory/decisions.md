@@ -307,3 +307,5 @@
 - 2026-07-29 - Stage AN (3/3) TAMAMLANDI: CLI scriptleri eklendi. Codex'in 6. maddesi (Graph Memory/Code Graph) artik tam - doc_index/symbol_index semasi, cyg_exists/cyg_similar, ve CLI araclarinin hepsi gercek, test edilmis.
 
 - 2026-07-29 - Stage AP: task tamamlama Codex'in 3. maddesine gore sikilastirildi - subtask kontrolu, test-kaniti zorunlulugu (require_test_evidence), ready_for_review ara durumu eklendi. Tam 5 durum (pending/in_progress/blocked/ ready_for_review/verified_complete) yerine 4 kullanildi - 'verified_complete' ile 'done' ayni sey sayildi, isim degismedi (geriye donuk uyumluluk icin).
+
+- 2026-07-29 - Stage AQ: data-ownership matrix (docs/data-ownership-matrix.md) oluşturuldu - bizde sunucu olmadığı için tüm veriler 'local-only', sync/conflict senaryoları N/A. Bu madde Haroon'un sistemi için ANLAMLI (Mini/HOSNI ayrımı var), bizim için büyük ölçüde teorik - şablon olarak hazırlandı, gerçek kod ihtiyacı minimal (sadece db_health_check()).
