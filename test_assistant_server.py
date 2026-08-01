@@ -132,6 +132,41 @@ class AssistantAnswerTestCase(unittest.TestCase):
         packet.assert_called_once()
 
 
+class HealthEventLoggingTestCase(AssistantAnswerTestCase):
+    """Stage AU: write_checkpoint's existing fail-soft (never breaks the console
+    reply) now also logs a health_events row - same swallow, now visible."""
+
+    def test_write_checkpoint_failure_is_still_swallowed_and_now_logged(self) -> None:
+        with self._mock_context(), \
+            mock.patch("assistant_server.run_claude", return_value="claude answer"), \
+            mock.patch("assistant_server.mc.ask_ollama"), \
+            mock.patch(
+                "assistant_server.mc.write_checkpoint", side_effect=RuntimeError("db locked")
+            ), \
+            mock.patch("assistant_server.mc.log_health_event") as health_log, \
+            mock.patch("assistant_server.mc.record_turn"), \
+            mock.patch("assistant_server.mc.record_event"):
+            result = assistant_server.answer_message("hello", "web")  # must not raise
+
+        self.assertEqual("claude-cli", result["engine"])  # unaffected, same as before Stage AU
+        health_log.assert_called_once()
+        args, kwargs = health_log.call_args
+        self.assertEqual("checkpoint", args[0])
+        self.assertEqual("write_failed", args[1])
+        self.assertEqual("web", kwargs.get("session_id"))
+
+    def test_write_checkpoint_success_does_not_log_anything(self) -> None:
+        with self._mock_context(), \
+            mock.patch("assistant_server.run_claude", return_value="claude answer"), \
+            mock.patch("assistant_server.mc.ask_ollama"), \
+            mock.patch("assistant_server.mc.write_checkpoint"), \
+            mock.patch("assistant_server.mc.log_health_event") as health_log, \
+            mock.patch("assistant_server.mc.record_turn"), \
+            mock.patch("assistant_server.mc.record_event"):
+            assistant_server.answer_message("hello", "web")
+        health_log.assert_not_called()
+
+
 class CollectContextTestCase(unittest.TestCase):
     def test_collect_context_declares_role_and_reads_memory(self) -> None:
         with mock.patch("assistant_server.mc.init_db"), \

@@ -388,7 +388,7 @@ def answer_message(message: str, session_id: str = DEFAULT_SESSION_ID, *, db_pat
         answer = _local_brozzer_answer(message, context)
         engine = "local-guarded"
         if os.environ.get("BBB_ASSISTANT_USE_OLLAMA") == "1":
-            ollama_answer = _clean_model_output(mc.ask_ollama(prompt))
+            ollama_answer = _clean_model_output(mc.ask_ollama(prompt, db_path=db_path))
             if ollama_answer:
                 answer = ollama_answer
                 engine = "ollama"
@@ -402,16 +402,22 @@ def answer_message(message: str, session_id: str = DEFAULT_SESSION_ID, *, db_pat
     answer = _enforce_brozzer_contract(answer, message, context, engine)
     checkpoint_risk = "low" if engine != "unavailable" else "model_unavailable"
 
-    _safe_call(
-        None,
-        mc.write_checkpoint,
-        session_id,
-        current_task=_clip(message, 160),
-        last_decision="assistant_console_reply",
-        next_action=_clip(answer, 180),
-        risk=checkpoint_risk,
-        db_path=db_path,
-    )
+    # Stage AU: this was already fail-soft via _safe_call (a failed checkpoint
+    # write must never break the console reply) - now it also logs, so a
+    # checkpoint that silently failed to persist shows up in get_health_state().
+    try:
+        mc.write_checkpoint(
+            session_id,
+            current_task=_clip(message, 160),
+            last_decision="assistant_console_reply",
+            next_action=_clip(answer, 180),
+            risk=checkpoint_risk,
+            db_path=db_path,
+        )
+    except Exception as exc:
+        mc.log_health_event(
+            "checkpoint", "write_failed", detail=str(exc), session_id=session_id, db_path=db_path
+        )
     assistant_turn_id = _safe_call(
         None,
         mc.record_turn,

@@ -790,6 +790,17 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 UNIQUE(alias)
             )"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS health_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                component TEXT NOT NULL,
+                event TEXT NOT NULL,
+                detail TEXT,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS health_events_created ON health_events(created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS graph_edges_src ON graph_edges(src, type)")
         conn.execute("CREATE INDEX IF NOT EXISTS graph_edges_dst ON graph_edges(dst, type)")
         conn.execute("CREATE INDEX IF NOT EXISTS graph_nodes_type ON graph_nodes(node_type)")
@@ -1256,6 +1267,80 @@ def list_events(limit: int = 20, db_path: Path = DB_PATH) -> list[dict]:
             (limit,),
         ).fetchall()
     return [dict(row) for row in reversed(rows)]
+
+
+def log_health_event(
+    component: str,
+    event: str,
+    detail: str | None = None,
+    session_id: str | None = None,
+    db_path: Path = DB_PATH,
+) -> None:
+    """Record one failure-visibility row (Stage AU, Haroon's team doc item 8).
+
+    Called from EXISTING fail-soft points (write_checkpoint callers,
+    ask_ollama, _get_embedding_model, index_memory_files) that already
+    swallow their own errors — this only makes those swallowed errors
+    visible via get_health_state(), it does not change whether they're
+    swallowed. component examples: "checkpoint", "memory_index",
+    "embedding_model", "ollama", "db".
+
+    Fail-soft itself, on purpose: logging must never be the thing that
+    crashes a caller that was already handling its own failure gracefully.
+    Any error here (e.g. a locked/corrupt db) is swallowed silently.
+    """
+
+    try:
+        with contextlib.closing(_connect(db_path)) as conn:
+            conn.execute(
+                """INSERT INTO health_events (session_id, component, event, detail, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (session_id, component, event, detail, _now()),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+_HEALTH_BLOCKED_THRESHOLD = 3
+
+
+def get_health_state(session_id: str | None = None, db_path: Path = DB_PATH) -> str:
+    """Roll up the last hour of health_events into one of three states.
+
+    A simple threshold system covering 3 of Haroon's 6 states — "recovery
+    required"/"validation failed"/"sync pending" don't apply here (no
+    server, no sync, see decisions.md 2026-07-29). Every logged component
+    (checkpoint, memory_index, embedding_model, ollama, db) counts the same:
+
+    - no events in the last hour -> "healthy"
+    - 1 to _HEALTH_BLOCKED_THRESHOLD events -> "degraded" (something failed
+      and is worth a look — even a single checkpoint/db write failure)
+    - more than _HEALTH_BLOCKED_THRESHOLD events -> "blocked" (failing
+      repeatedly, not just once)
+
+    session_id scopes to that session's events when given; None (the
+    default) looks at events across all sessions, matching recent_decisions()'s
+    project-wide default.
+    """
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    with contextlib.closing(_connect(db_path)) as conn:
+        if session_id is None:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM health_events WHERE created_at >= ?", (cutoff,)
+            ).fetchone()[0]
+        else:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM health_events WHERE created_at >= ? AND session_id = ?",
+                (cutoff, session_id),
+            ).fetchone()[0]
+
+    if count == 0:
+        return "healthy"
+    if count > _HEALTH_BLOCKED_THRESHOLD:
+        return "blocked"
+    return "degraded"
 
 
 def create_decision_packet(
@@ -3053,6 +3138,14 @@ def _get_embedding_model() -> Any:
     Not offline-first: the very first call on a machine downloads the model from the
     Hugging Face Hub and raises if there's no network. Once Hugging Face's local cache
     (~/.cache/huggingface) has the model, later calls load from disk and need no network.
+
+    Stage AU: logs a health_events row (component="embedding_model") the moment
+    it goes unavailable — still raises right after, exactly as before, so
+    _embed_or_none() (the actual fail-soft point for callers) is unchanged.
+    Logs to the default db_path: whether the embedding model is loadable is a
+    process-global fact (the _embedding_unavailable flag itself is global, not
+    per-caller), not something scoped to whichever db_path the caller happens
+    to be using.
     """
 
     global _embedding_model, _embedding_unavailable
@@ -3063,8 +3156,9 @@ def _get_embedding_model() -> Any:
 
         try:
             _embedding_model = SentenceTransformer(_EMBEDDING_MODEL_NAME)
-        except Exception:
+        except Exception as exc:
             _embedding_unavailable = True
+            log_health_event("embedding_model", "load_failed", detail=str(exc))
             raise
     return _embedding_model
 
@@ -3104,55 +3198,69 @@ def index_memory_files(db_path: Path = DB_PATH) -> int:
     and version are left untouched (nothing actually changed); otherwise
     updated_at moves to now and version increments. created_at is set once,
     on the row's first insert, and never overwritten afterward.
+
+    Stage AU: a single unreadable/malformed file no longer aborts the whole
+    sweep — it's skipped (logged as a health_events row, component=
+    "memory_index") and indexing continues with the rest.
     """
 
     memory_dir = Path(__file__).resolve().parent / "memory"
     count = 0
     now = _now()
+    # Skips are logged AFTER the connection below commits/closes, not from
+    # inside the loop — log_health_event() opens its own connection, and
+    # doing that while `conn` still holds an uncommitted write transaction
+    # open would deadlock/"database is locked" against itself.
+    skipped: list[tuple[str, str]] = []
     with contextlib.closing(_connect(db_path)) as conn:
         for path in sorted(memory_dir.glob("*.md")):
-            parsed = _parse_memory_file(path)
-            title, body, confidence = parsed["title"], parsed["body"], parsed["confidence"]
-            keywords = _extract_keywords(f"{title} {body}")
-            embedding = _embed_or_none(f"{title}\n{body}")
-            content_hash = _sha256_text(body)
-            conn.execute(
-                """INSERT INTO memory_index
-                       (source_file, title, content, keywords, embedding, confidence,
-                        doc_type, project, evidence_level, currentness,
-                        content_hash, created_at, updated_at, status, replaced_by, version)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, 1)
-                   ON CONFLICT(source_file) DO UPDATE SET
-                       title = excluded.title,
-                       content = excluded.content,
-                       keywords = excluded.keywords,
-                       embedding = excluded.embedding,
-                       confidence = excluded.confidence,
-                       doc_type = excluded.doc_type,
-                       project = excluded.project,
-                       evidence_level = excluded.evidence_level,
-                       currentness = excluded.currentness,
-                       content_hash = excluded.content_hash,
-                       created_at = COALESCE(memory_index.created_at, excluded.created_at),
-                       updated_at = CASE
-                           WHEN memory_index.content_hash IS excluded.content_hash
-                           THEN COALESCE(memory_index.updated_at, excluded.updated_at)
-                           ELSE excluded.updated_at
-                       END,
-                       version = CASE
-                           WHEN memory_index.content_hash IS excluded.content_hash
-                           THEN COALESCE(memory_index.version, 1)
-                           ELSE COALESCE(memory_index.version, 1) + 1
-                       END""",
-                (
-                    path.name, title, body, keywords, embedding, confidence,
-                    parsed["doc_type"], parsed["project"], parsed["evidence_level"],
-                    parsed["currentness"], content_hash, now, now,
-                ),
-            )
-            _upsert_memory_graph(conn, path.name, title, body, keywords)
-            count += 1
+            try:
+                parsed = _parse_memory_file(path)
+                title, body, confidence = parsed["title"], parsed["body"], parsed["confidence"]
+                keywords = _extract_keywords(f"{title} {body}")
+                embedding = _embed_or_none(f"{title}\n{body}")
+                content_hash = _sha256_text(body)
+                conn.execute(
+                    """INSERT INTO memory_index
+                           (source_file, title, content, keywords, embedding, confidence,
+                            doc_type, project, evidence_level, currentness,
+                            content_hash, created_at, updated_at, status, replaced_by, version)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, 1)
+                       ON CONFLICT(source_file) DO UPDATE SET
+                           title = excluded.title,
+                           content = excluded.content,
+                           keywords = excluded.keywords,
+                           embedding = excluded.embedding,
+                           confidence = excluded.confidence,
+                           doc_type = excluded.doc_type,
+                           project = excluded.project,
+                           evidence_level = excluded.evidence_level,
+                           currentness = excluded.currentness,
+                           content_hash = excluded.content_hash,
+                           created_at = COALESCE(memory_index.created_at, excluded.created_at),
+                           updated_at = CASE
+                               WHEN memory_index.content_hash IS excluded.content_hash
+                               THEN COALESCE(memory_index.updated_at, excluded.updated_at)
+                               ELSE excluded.updated_at
+                           END,
+                           version = CASE
+                               WHEN memory_index.content_hash IS excluded.content_hash
+                               THEN COALESCE(memory_index.version, 1)
+                               ELSE COALESCE(memory_index.version, 1) + 1
+                           END""",
+                    (
+                        path.name, title, body, keywords, embedding, confidence,
+                        parsed["doc_type"], parsed["project"], parsed["evidence_level"],
+                        parsed["currentness"], content_hash, now, now,
+                    ),
+                )
+                _upsert_memory_graph(conn, path.name, title, body, keywords)
+                count += 1
+            except Exception as exc:
+                skipped.append((path.name, str(exc)))
         conn.commit()
+    for name, detail in skipped:
+        log_health_event("memory_index", "file_skipped", detail=f"{name}: {detail}", db_path=db_path)
     return count
 
 
@@ -3650,12 +3758,14 @@ def cyg_exists(
     return {"exists": exists, "match": best if exists else None, "score": score}
 
 
-def ask_ollama(prompt: str, model: str = "gemma:2b") -> str | None:
+def ask_ollama(prompt: str, model: str = "gemma:2b", *, db_path: Path = DB_PATH) -> str | None:
     """Fail-soft call to a local ollama model; None (never raises) if it's unavailable.
 
     Mirrors the MC-unreachable-never-breaks-the-session principle: if ollama isn't
     installed, isn't running, or just times out, callers fall back to their own
-    default behavior instead of crashing.
+    default behavior instead of crashing. Stage AU: every None return now also
+    logs a health_events row (component="ollama") — same fail-soft outcome,
+    just visible now via get_health_state().
     """
 
     try:
@@ -3666,12 +3776,19 @@ def ask_ollama(prompt: str, model: str = "gemma:2b") -> str | None:
             errors="replace",
             timeout=30,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
+        log_health_event("ollama", "unavailable", detail=str(exc), db_path=db_path)
         return None
     if result.returncode != 0:
+        log_health_event(
+            "ollama", "nonzero_exit", detail=f"returncode={result.returncode}", db_path=db_path
+        )
         return None
     output = result.stdout.strip()
-    return output or None
+    if not output:
+        log_health_event("ollama", "blank_output", db_path=db_path)
+        return None
+    return output
 
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")

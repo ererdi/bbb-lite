@@ -25,6 +25,21 @@ def main() -> None:
     client_session_uuid = payload.get("client_session_uuid")
 
     mc.init_db()
+
+    # Stage AU: failure visibility, first thing - a degraded/blocked state
+    # (recent checkpoint/db failures, or too many failures of any kind) is
+    # worth knowing about before anything else prints. Fail-soft: this is a
+    # visibility nudge, not a gate, so a broken health check must not itself
+    # block session start.
+    try:
+        health_state = mc.get_health_state()
+    except Exception:
+        health_state = "healthy"
+    if health_state != "healthy":
+        print(
+            f"[bbb-lite] SYSTEM HEALTH: {health_state} - see health_events for details"
+        )
+
     # Look up any earlier session tied to this client_session_uuid BEFORE
     # ensure_session() below tags the *current* session_id with it - otherwise
     # the lookup would just find itself.

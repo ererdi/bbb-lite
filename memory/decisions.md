@@ -315,3 +315,5 @@
 - 2026-07-29 - Stage AS: memory_index'e content_hash, timestamps, status/replaced_by, version eklendi (Haroon'un ekip belgesi, madde 6). Owner alanı EKLENMEDİ (tek kullanıcı olduğu için anlamsız, kapsam dışı) - decisions.md'ye bu gerekçe not edildi. Ayrı bir 'audit history' tablosu açılmadı - version/updated_at/status zaten temel bir audit izi sağlıyor, tam log tablosu şimdilik gereksiz karmaşıklık.
 
 - 2026-07-29 - Stage AT: çelişki TESPİTİ eklendi (Haroon'un ekip belgesi, madde 7) - otomatik ÇÖZME değil, sadece görünür uyarı (human-review ruhuna uygun, ama bizde 'insana gönder' diye ayrı bir kuyruk yok, direkt session_start çıktısında gösteriliyor). 'Local vs server' senaryosu kapsam dışı - sunucu yok.
+
+- 2026-07-29 - Stage AU: failure visibility eklendi (Haroon'un ekip belgesi, madde 8) - health_events tablosu + get_health_state() 3 durumlu (healthy/degraded/blocked). 'Recovery required/validation failed/sync pending' durumları kapsam dışı - sunucu/sync olmadığı için anlamsız. ÖNEMLİ: mevcut fail-soft davranış DEĞİŞMEDİ, sadece artık loglanıyor - session'lar hâlâ hatalardan dolayı çökmüyor, sadece artık görünür.
