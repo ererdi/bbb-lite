@@ -519,6 +519,22 @@ def init_db(db_path: Path = DB_PATH) -> None:
             conn.execute(
                 "ALTER TABLE memory_index ADD COLUMN currentness TEXT DEFAULT 'current'"
             )
+        if "content_hash" not in existing_columns:
+            conn.execute("ALTER TABLE memory_index ADD COLUMN content_hash TEXT")
+        if "created_at" not in existing_columns:
+            conn.execute("ALTER TABLE memory_index ADD COLUMN created_at TEXT")
+        if "updated_at" not in existing_columns:
+            conn.execute("ALTER TABLE memory_index ADD COLUMN updated_at TEXT")
+        if "status" not in existing_columns:
+            conn.execute(
+                "ALTER TABLE memory_index ADD COLUMN status TEXT DEFAULT 'active'"
+            )
+        if "replaced_by" not in existing_columns:
+            conn.execute("ALTER TABLE memory_index ADD COLUMN replaced_by TEXT")
+        if "version" not in existing_columns:
+            conn.execute(
+                "ALTER TABLE memory_index ADD COLUMN version INTEGER DEFAULT 1"
+            )
         conn.execute(
             """CREATE TABLE IF NOT EXISTS doc_index (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3030,21 +3046,31 @@ def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def index_memory_files(db_path: Path = DB_PATH) -> int:
-    """Upsert every memory/*.md file into memory_index. Re-running re-indexes, never duplicates."""
+    """Upsert every memory/*.md file into memory_index. Re-running re-indexes, never duplicates.
+
+    Stage AS: also tracks content_hash/created_at/updated_at/version. If a
+    row's content_hash is unchanged from what's already stored, updated_at
+    and version are left untouched (nothing actually changed); otherwise
+    updated_at moves to now and version increments. created_at is set once,
+    on the row's first insert, and never overwritten afterward.
+    """
 
     memory_dir = Path(__file__).resolve().parent / "memory"
     count = 0
+    now = _now()
     with contextlib.closing(_connect(db_path)) as conn:
         for path in sorted(memory_dir.glob("*.md")):
             parsed = _parse_memory_file(path)
             title, body, confidence = parsed["title"], parsed["body"], parsed["confidence"]
             keywords = _extract_keywords(f"{title} {body}")
             embedding = _embed_or_none(f"{title}\n{body}")
+            content_hash = _sha256_text(body)
             conn.execute(
                 """INSERT INTO memory_index
                        (source_file, title, content, keywords, embedding, confidence,
-                        doc_type, project, evidence_level, currentness)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        doc_type, project, evidence_level, currentness,
+                        content_hash, created_at, updated_at, status, replaced_by, version)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, 1)
                    ON CONFLICT(source_file) DO UPDATE SET
                        title = excluded.title,
                        content = excluded.content,
@@ -3054,11 +3080,23 @@ def index_memory_files(db_path: Path = DB_PATH) -> int:
                        doc_type = excluded.doc_type,
                        project = excluded.project,
                        evidence_level = excluded.evidence_level,
-                       currentness = excluded.currentness""",
+                       currentness = excluded.currentness,
+                       content_hash = excluded.content_hash,
+                       created_at = COALESCE(memory_index.created_at, excluded.created_at),
+                       updated_at = CASE
+                           WHEN memory_index.content_hash IS excluded.content_hash
+                           THEN COALESCE(memory_index.updated_at, excluded.updated_at)
+                           ELSE excluded.updated_at
+                       END,
+                       version = CASE
+                           WHEN memory_index.content_hash IS excluded.content_hash
+                           THEN COALESCE(memory_index.version, 1)
+                           ELSE COALESCE(memory_index.version, 1) + 1
+                       END""",
                 (
                     path.name, title, body, keywords, embedding, confidence,
                     parsed["doc_type"], parsed["project"], parsed["evidence_level"],
-                    parsed["currentness"],
+                    parsed["currentness"], content_hash, now, now,
                 ),
             )
             _upsert_memory_graph(conn, path.name, title, body, keywords)
@@ -3067,8 +3105,33 @@ def index_memory_files(db_path: Path = DB_PATH) -> int:
     return count
 
 
+def mark_memory_replaced(
+    old_source_file: str, new_source_file: str, db_path: Path = DB_PATH
+) -> None:
+    """Mark an old memory_index row as replaced by a newer one (Stage AS).
+
+    Leaves the row in place instead of deleting it — status becomes
+    'replaced' and replaced_by points at the successor file, so heal_memory()
+    merges leave a trace of what replaced what. search_memory() and
+    semantic_search() exclude 'replaced' rows by default.
+    """
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        conn.execute(
+            """UPDATE memory_index SET status = 'replaced', replaced_by = ?, updated_at = ?
+               WHERE source_file = ?""",
+            (new_source_file, _now(), old_source_file),
+        )
+        conn.commit()
+
+
 def search_memory(
-    query: str, *, limit: int = 3, project: str | None = None, db_path: Path = DB_PATH
+    query: str,
+    *,
+    limit: int = 3,
+    project: str | None = None,
+    include_replaced: bool = False,
+    db_path: Path = DB_PATH,
 ) -> list[dict]:
     """Keyword search over memory_index — never reads memory/*.md directly.
 
@@ -3080,23 +3143,26 @@ def search_memory(
     low-confidence lesson ranks below an equally-matching high-confidence one.
 
     project is an optional filter (Stage AM) — None (the default) searches
-    everything, exactly as before that stage.
+    everything, exactly as before that stage. include_replaced (Stage AS) —
+    False (the default) hides rows a heal_memory() merge marked 'replaced'.
     """
 
     terms = list(dict.fromkeys(_significant_words(query)))
     if not terms:
         return []
+    conditions = []
+    params: list[Any] = []
+    if project is not None:
+        conditions.append("project = ?")
+        params.append(project)
+    if not include_replaced:
+        conditions.append("status != 'replaced'")
+    where_clause = f" WHERE {' AND '.join(conditions)}" if conditions else ""
     with contextlib.closing(_connect(db_path)) as conn:
-        if project is None:
-            rows = conn.execute(
-                "SELECT source_file, title, content, keywords, confidence FROM memory_index"
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """SELECT source_file, title, content, keywords, confidence
-                   FROM memory_index WHERE project = ?""",
-                (project,),
-            ).fetchall()
+        rows = conn.execute(
+            f"SELECT source_file, title, content, keywords, confidence FROM memory_index{where_clause}",
+            params,
+        ).fetchall()
     scored: list[tuple[float, dict]] = []
     for row in rows:
         title = row["title"].lower()
@@ -3114,7 +3180,12 @@ def search_memory(
 
 
 def semantic_search(
-    query: str, *, limit: int = 3, project: str | None = None, db_path: Path = DB_PATH
+    query: str,
+    *,
+    limit: int = 3,
+    project: str | None = None,
+    include_replaced: bool = False,
+    db_path: Path = DB_PATH,
 ) -> list[dict]:
     """Embedding-based search over memory_index — finds meaning matches with no shared words.
 
@@ -3125,22 +3196,25 @@ def semantic_search(
     cosine value; the confidence weighting only affects ordering.
 
     project is an optional filter (Stage AM) — None (the default) searches
-    everything, exactly as before that stage.
+    everything, exactly as before that stage. include_replaced (Stage AS) —
+    False (the default) hides rows a heal_memory() merge marked 'replaced'.
     """
 
     query_vector = np.frombuffer(_embed(query), dtype=np.float32)
+    conditions = ["embedding IS NOT NULL"]
+    params: list[Any] = []
+    if project is not None:
+        conditions.append("project = ?")
+        params.append(project)
+    if not include_replaced:
+        conditions.append("status != 'replaced'")
+    where_clause = " AND ".join(conditions)
     with contextlib.closing(_connect(db_path)) as conn:
-        if project is None:
-            rows = conn.execute(
-                "SELECT source_file, title, content, keywords, embedding, confidence "
-                "FROM memory_index WHERE embedding IS NOT NULL"
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """SELECT source_file, title, content, keywords, embedding, confidence
-                   FROM memory_index WHERE embedding IS NOT NULL AND project = ?""",
-                (project,),
-            ).fetchall()
+        rows = conn.execute(
+            f"""SELECT source_file, title, content, keywords, embedding, confidence
+               FROM memory_index WHERE {where_clause}""",
+            params,
+        ).fetchall()
     scored: list[tuple[float, dict]] = []
     for row in rows:
         row_vector = np.frombuffer(row["embedding"], dtype=np.float32)
@@ -3638,12 +3712,16 @@ def find_similar_lesson_groups(
     and B~C both clear the threshold, A/B/C come back as one group of three,
     not two overlapping pairs (Union-Find over the pairwise-similarity graph).
     Groups of size 1 (nothing similar enough) are dropped from the result.
+    Stage AS: rows already marked status='replaced' by a prior heal_memory()
+    merge are excluded too — their files are gone from memory/, and
+    reconsidering them would re-merge stale, already-archived content.
     """
 
     with contextlib.closing(_connect(db_path)) as conn:
         rows = conn.execute(
             """SELECT source_file, title, content, keywords, embedding FROM memory_index
                WHERE embedding IS NOT NULL AND source_file NOT IN ('MEMORY.md', 'decisions.md')
+                     AND status != 'replaced'
                ORDER BY source_file"""
         ).fetchall()
 
@@ -3682,7 +3760,10 @@ def heal_memory(db_path: Path = DB_PATH) -> dict:
     notes are moved there, never deleted (see decisions.md, 2026-07-27). Each
     group is independent and fail-soft — an unavailable ollama or a "no"
     verdict just leaves that group's files untouched; it doesn't stop the
-    rest of the sweep.
+    rest of the sweep. Stage AS: merged-away rows aren't dropped from
+    memory_index either — mark_memory_replaced() flips each to
+    status='replaced' with replaced_by pointing at the new merged file, so
+    the merge leaves an audit trail instead of a silent gap.
     """
 
     memory_dir = Path(__file__).resolve().parent / "memory"
@@ -3714,12 +3795,8 @@ def heal_memory(db_path: Path = DB_PATH) -> dict:
             encoding="utf-8",
         )
 
-        with contextlib.closing(_connect(db_path)) as conn:
-            for item in group:
-                conn.execute(
-                    "DELETE FROM memory_index WHERE source_file = ?", (item["source_file"],)
-                )
-            conn.commit()
+        for item in group:
+            mark_memory_replaced(item["source_file"], path.name, db_path=db_path)
 
         archived_dir.mkdir(exist_ok=True)
         for item in group:

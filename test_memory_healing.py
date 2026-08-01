@@ -97,14 +97,23 @@ class MemoryHealingTestCase(unittest.TestCase):
         self.assertEqual(1, len(healed_files))
 
         with contextlib.closing(mc._connect(self.db_path)) as conn:
-            remaining = {
-                row["source_file"]
-                for row in conn.execute("SELECT source_file FROM memory_index").fetchall()
+            rows = {
+                row["source_file"]: row
+                for row in conn.execute(
+                    "SELECT source_file, status, replaced_by FROM memory_index"
+                ).fetchall()
             }
-        self.assertNotIn("cola-a.md", remaining)
-        self.assertNotIn("cola-b.md", remaining)
-        self.assertIn(healed_files[0].name, remaining)
-        self.assertIn("deploy.md", remaining)  # the unrelated note is untouched
+        # Stage AS: merged-away rows stay in memory_index, marked 'replaced'
+        # with replaced_by pointing at the new merged file, instead of being
+        # deleted outright.
+        self.assertEqual("replaced", rows["cola-a.md"]["status"])
+        self.assertEqual(healed_files[0].name, rows["cola-a.md"]["replaced_by"])
+        self.assertEqual("replaced", rows["cola-b.md"]["status"])
+        self.assertEqual(healed_files[0].name, rows["cola-b.md"]["replaced_by"])
+        self.assertIn(healed_files[0].name, rows)
+        self.assertEqual("active", rows[healed_files[0].name]["status"])
+        self.assertIn("deploy.md", rows)  # the unrelated note is untouched
+        self.assertEqual("active", rows["deploy.md"]["status"])
 
     def test_heal_memory_leaves_files_untouched_on_no_verdict(self) -> None:
         self._seed_two_similar_and_one_unrelated()

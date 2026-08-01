@@ -19,6 +19,8 @@ import mc
 
 
 def daily_check() -> None:
+    mc.init_db()
+
     stale_count = mc.sweep_stale_sessions()
     print(f"[daily-check] swept {stale_count} stale session(s)")
 

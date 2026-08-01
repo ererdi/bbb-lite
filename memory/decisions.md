@@ -311,3 +311,5 @@
 - 2026-07-29 - Stage AQ: data-ownership matrix (docs/data-ownership-matrix.md) oluşturuldu - bizde sunucu olmadığı için tüm veriler 'local-only', sync/conflict senaryoları N/A. Bu madde Haroon'un sistemi için ANLAMLI (Mini/HOSNI ayrımı var), bizim için büyük ölçüde teorik - şablon olarak hazırlandı, gerçek kod ihtiyacı minimal (sadece db_health_check()).
 
 - 2026-07-29 - Stage AR: exact/alias/normalize katmanı eklendi (Haroon'un ekip belgesi, madde 5) - SADECE memory/log_lesson için, tasks/decisions/rules'a genişletilmedi (kapsam dışı, ayrı bir iş). normalize_term basit bir heuristik (gerçek bir dilbilimsel tekil/çoğul çözümleyici değil). "Human review for uncertain matches" de kapsam dışı - mevcut tam-otomatik felsefe korundu.
+
+- 2026-07-29 - Stage AS: memory_index'e content_hash, timestamps, status/replaced_by, version eklendi (Haroon'un ekip belgesi, madde 6). Owner alanı EKLENMEDİ (tek kullanıcı olduğu için anlamsız, kapsam dışı) - decisions.md'ye bu gerekçe not edildi. Ayrı bir 'audit history' tablosu açılmadı - version/updated_at/status zaten temel bir audit izi sağlıyor, tam log tablosu şimdilik gereksiz karmaşıklık.
