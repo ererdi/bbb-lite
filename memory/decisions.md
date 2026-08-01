@@ -309,3 +309,5 @@
 - 2026-07-29 - Stage AP: task tamamlama Codex'in 3. maddesine gore sikilastirildi - subtask kontrolu, test-kaniti zorunlulugu (require_test_evidence), ready_for_review ara durumu eklendi. Tam 5 durum (pending/in_progress/blocked/ ready_for_review/verified_complete) yerine 4 kullanildi - 'verified_complete' ile 'done' ayni sey sayildi, isim degismedi (geriye donuk uyumluluk icin).
 
 - 2026-07-29 - Stage AQ: data-ownership matrix (docs/data-ownership-matrix.md) oluşturuldu - bizde sunucu olmadığı için tüm veriler 'local-only', sync/conflict senaryoları N/A. Bu madde Haroon'un sistemi için ANLAMLI (Mini/HOSNI ayrımı var), bizim için büyük ölçüde teorik - şablon olarak hazırlandı, gerçek kod ihtiyacı minimal (sadece db_health_check()).
+
+- 2026-07-29 - Stage AR: exact/alias/normalize katmanı eklendi (Haroon'un ekip belgesi, madde 5) - SADECE memory/log_lesson için, tasks/decisions/rules'a genişletilmedi (kapsam dışı, ayrı bir iş). normalize_term basit bir heuristik (gerçek bir dilbilimsel tekil/çoğul çözümleyici değil). "Human review for uncertain matches" de kapsam dışı - mevcut tam-otomatik felsefe korundu.

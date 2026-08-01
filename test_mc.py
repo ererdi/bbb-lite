@@ -47,6 +47,7 @@ class McTestCase(unittest.TestCase):
                 "decisions", "compact_snapshots", "documents",
                 "context_nodes", "context_edges",
                 "doc_index", "symbol_index",
+                "term_aliases",
             },
             names,
         )
@@ -1337,7 +1338,11 @@ class MemoryIndexTestCase(unittest.TestCase):
         self.assertEqual(1, count)
 
     def test_log_lesson_avoids_filename_collision(self) -> None:
-        first = mc.log_lesson("Same title", "First body.", db_path=self.db_path)
+        # Underscore vs space: same filename slug ("same-title"), but different
+        # normalize_term() output ("same_title" vs "same title" — underscore is a \w
+        # char so it isn't split on) — so this isn't caught by the Stage AR exact-match
+        # check, and still needs the suffix logic below it.
+        first = mc.log_lesson("Same_title", "First body.", db_path=self.db_path)
         with mock.patch("mc.ask_ollama", return_value="no"):
             second = mc.log_lesson("Same title", "Totally different unrelated body.", db_path=self.db_path)
         self.assertNotEqual(first.name, second.name)
@@ -1424,6 +1429,93 @@ class MemoryIndexTestCase(unittest.TestCase):
         self.assertEqual(0, retired_count)
         self.assertTrue((self.memory_dir / "MEMORY.md").exists())
         self.assertTrue((self.memory_dir / "decisions.md").exists())
+
+
+class StageARTermMatchingTestCase(unittest.TestCase):
+    """Stage AR: normalize_term / term_aliases / the 3 cheap checks in log_lesson().
+
+    Same isolation approach as MemoryIndexTestCase: mc.__file__ is patched into a temp
+    project dir so memory_dir resolves under it, never the real memory/ directory.
+    """
+
+    def setUp(self) -> None:
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        self.db_path = Path(tmp.name)
+        self.db_path.unlink()
+        mc.init_db(self.db_path)
+
+        self.project_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.project_dir.cleanup)
+        self.memory_dir = Path(self.project_dir.name) / "memory"
+        self.memory_dir.mkdir()
+
+        patcher = mock.patch.object(mc, "__file__", str(Path(self.project_dir.name) / "mc.py"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self) -> None:
+        self.db_path.unlink(missing_ok=True)
+
+    def test_normalize_term_lowercases_and_strips_punctuation(self) -> None:
+        self.assertEqual("simple moving average", mc.normalize_term("Simple, Moving-Average!"))
+
+    def test_normalize_term_collapses_whitespace(self) -> None:
+        self.assertEqual("a b", mc.normalize_term("  a    b  "))
+
+    def test_normalize_term_treats_smas_and_sma_as_equal(self) -> None:
+        self.assertEqual(mc.normalize_term("sma"), mc.normalize_term("SMAs"))
+
+    def test_normalize_term_does_not_strip_short_or_double_s_words(self) -> None:
+        # len <= 3 ("as") and a trailing "ss" ("class") are left alone by the heuristic.
+        self.assertEqual("as", mc.normalize_term("as"))
+        self.assertEqual("class", mc.normalize_term("class"))
+
+    def test_add_alias_returns_id_and_is_retrievable_via_match(self) -> None:
+        alias_id = mc.add_alias("Simple Moving Average", "SMA", db_path=self.db_path)
+        self.assertIsInstance(alias_id, int)
+        self.assertEqual(
+            "Simple Moving Average", mc._match_alias("The SMA crossed", db_path=self.db_path)
+        )
+
+    def test_log_lesson_exact_duplicate_skipped_without_asking_ollama(self) -> None:
+        mc.log_lesson("Guard blocks done", "The guard refuses raw done writes.", db_path=self.db_path)
+        with mock.patch("mc.ask_ollama") as mocked:
+            result = mc.log_lesson(
+                "guard   blocks, DONE!!",  # same fact after normalize_term, different spelling
+                "Some unrelated body text.",
+                db_path=self.db_path,
+            )
+        self.assertIsNone(result)
+        mocked.assert_not_called()
+        self.assertEqual(1, len(list(self.memory_dir.glob("lesson-*.md"))))
+
+    def test_log_lesson_alias_match_expands_title_without_asking_ollama(self) -> None:
+        mc.add_alias("Simple Moving Average", "SMA", db_path=self.db_path)
+        with mock.patch("mc.ask_ollama") as mocked:
+            result = mc.log_lesson(
+                "SMA crossover strategy",
+                "Buy when the fast SMA crosses above the slow one.",
+                db_path=self.db_path,
+            )
+        self.assertIsNotNone(result)
+        mocked.assert_not_called()
+        content = result.read_text(encoding="utf-8")
+        self.assertIn("SMA crossover strategy (Simple Moving Average)", content)
+
+    def test_log_lesson_falls_back_to_semantic_check_when_no_alias_or_exact_match(self) -> None:
+        # Different enough from "Guard blocks done" to dodge the exact-match check, but
+        # sharing enough keywords (guard/done/refuses/writes) that search_memory() still
+        # surfaces it as the nearest candidate, so the ask_ollama() branch actually runs.
+        mc.log_lesson("Guard blocks done", "The guard refuses raw done writes.", db_path=self.db_path)
+        with mock.patch("mc.ask_ollama", return_value="no") as mocked:
+            result = mc.log_lesson(
+                "Guard prevents done finalization",
+                "The guard refuses raw done writes forcibly.",
+                db_path=self.db_path,
+            )
+        self.assertIsNotNone(result)
+        mocked.assert_called_once()
 
 
 class SemanticSearchTestCase(unittest.TestCase):

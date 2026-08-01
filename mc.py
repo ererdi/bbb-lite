@@ -766,6 +766,14 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 created_at TEXT NOT NULL
             )"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS term_aliases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                canonical_term TEXT NOT NULL,
+                alias TEXT NOT NULL,
+                UNIQUE(alias)
+            )"""
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS graph_edges_src ON graph_edges(src, type)")
         conn.execute("CREATE INDEX IF NOT EXISTS graph_edges_dst ON graph_edges(dst, type)")
         conn.execute("CREATE INDEX IF NOT EXISTS graph_nodes_type ON graph_nodes(node_type)")
@@ -2829,6 +2837,65 @@ def _extract_keywords(text: str, *, limit: int = 20) -> str:
     return ", ".join(seen)
 
 
+def normalize_term(text: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace, and a naive per-word plural strip.
+
+    The plural handling is "drop a trailing 's' on words longer than 3
+    letters that don't already end in 'ss'" — a crude heuristic, not a real
+    linguistic stemmer (it happily mangles words like "bus" or "status" if
+    they were long enough to qualify). Good enough for catching "SMAs" vs
+    "sma", not for anything more subtle. See decisions.md, Stage AR.
+    """
+
+    text = re.sub(r"[^\w\s]", " ", text.lower())
+    words = []
+    for word in text.split():
+        if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+            word = word[:-1]
+        words.append(word)
+    return " ".join(words)
+
+
+def add_alias(canonical_term: str, alias: str, *, db_path: Path = DB_PATH) -> int:
+    """Register alias -> canonical_term for the log_lesson() alias-match check (Stage AR).
+
+    alias is stored normalize_term()-ed so lookups at match time are a plain
+    equality check. Re-adding the same alias (after normalization) with a
+    different canonical_term overwrites it rather than erroring, since alias
+    is UNIQUE.
+    """
+
+    normalized_alias = normalize_term(alias)
+    with contextlib.closing(_connect(db_path)) as conn:
+        cursor = conn.execute(
+            """INSERT INTO term_aliases (canonical_term, alias) VALUES (?, ?)
+               ON CONFLICT(alias) DO UPDATE SET canonical_term = excluded.canonical_term
+               RETURNING id""",
+            (canonical_term, normalized_alias),
+        )
+        alias_id = cursor.fetchone()[0]
+        conn.commit()
+        return alias_id
+
+
+def _match_alias(title: str, *, db_path: Path = DB_PATH) -> str | None:
+    """Return the canonical_term for the first word in `title` that matches a known alias.
+
+    Word-level only, per the Stage AR spec ("one of the words in the new
+    title matches an alias") — not a substring or phrase match.
+    """
+
+    words = set(normalize_term(title).split())
+    if not words:
+        return None
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute("SELECT canonical_term, alias FROM term_aliases").fetchall()
+    for row in rows:
+        if row["alias"] in words:
+            return row["canonical_term"]
+    return None
+
+
 _CONFIDENCE_LEVELS = {"high": 0.9, "medium": 0.5, "low": 0.2}
 _DEFAULT_CONFIDENCE = 0.5
 
@@ -3493,31 +3560,58 @@ def classify(prompt: str, options: Iterable[str], *, model: str = "gemma:2b") ->
 def log_lesson(
     title: str, content: str, *, confidence: str = "medium", db_path: Path = DB_PATH
 ) -> Path | None:
-    """Write one lesson file to memory/ (one fact per file) — unless ask_ollama() judges it
-    a near-duplicate of the closest existing lesson found via search_memory(). Filesystem +
-    memory_index only, never any other DB table.
+    """Write one lesson file to memory/ (one fact per file) — unless it's caught as a
+    duplicate first. Filesystem + memory_index (+ read-only term_aliases) only, never any
+    other DB table.
 
-    Returns the new file's Path, or None if it was skipped as a likely duplicate.
+    Three cheap checks run before ever asking ollama (Stage AR):
+      1. Exact match: normalize_term(title) equals an existing lesson's title exactly
+         -> skipped outright, ollama is never called.
+      2. Alias match: a word in title matches a known alias -> canonical_term is appended
+         to title for context; this is informational only, it never blocks the write, and
+         it also skips straight past the semantic check below (no ollama call either).
+      3. Only when neither 1 nor 2 fired does the original ask_ollama()-based semantic
+         duplicate check (nearest hit via search_memory()) run, unchanged.
+
+    Returns the new file's Path, or None if it was skipped as a duplicate.
     """
 
     memory_dir = Path(__file__).resolve().parent / "memory"
     memory_dir.mkdir(exist_ok=True)
 
     index_memory_files(db_path)
-    candidates = search_memory(f"{title} {content}", limit=1, db_path=db_path)
-    if candidates:
-        existing = candidates[0]
-        verdict = ask_ollama(
-            f"Existing note: '{existing['title']}: {existing['content']}'\n"
-            f"New note: '{title}: {content}'\n"
-            "Are these about the same fact? Answer only yes or no."
-        )
-        if verdict and "yes" in verdict.strip().lower():
+
+    normalized_new_title = normalize_term(title)
+    with contextlib.closing(_connect(db_path)) as conn:
+        existing_titles = conn.execute(
+            "SELECT source_file, title FROM memory_index"
+        ).fetchall()
+    for row in existing_titles:
+        if normalize_term(row["title"]) == normalized_new_title:
             print(
-                f"[mc.log_lesson] muhtemelen tekrar, eklenmedi: "
-                f"{title!r} ~ {existing['source_file']}"
+                f"[mc.log_lesson] exact duplicate, skipped: "
+                f"{title!r} == {row['source_file']}"
             )
             return None
+
+    canonical_term = _match_alias(title, db_path=db_path)
+    if canonical_term is not None:
+        title = f"{title} ({canonical_term})"
+    else:
+        candidates = search_memory(f"{title} {content}", limit=1, db_path=db_path)
+        if candidates:
+            existing = candidates[0]
+            verdict = ask_ollama(
+                f"Existing note: '{existing['title']}: {existing['content']}'\n"
+                f"New note: '{title}: {content}'\n"
+                "Are these about the same fact? Answer only yes or no."
+            )
+            if verdict and "yes" in verdict.strip().lower():
+                print(
+                    f"[mc.log_lesson] muhtemelen tekrar, eklenmedi: "
+                    f"{title!r} ~ {existing['source_file']}"
+                )
+                return None
 
     slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-") or "lesson"
     date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
