@@ -317,3 +317,5 @@
 - 2026-07-29 - Stage AT: çelişki TESPİTİ eklendi (Haroon'un ekip belgesi, madde 7) - otomatik ÇÖZME değil, sadece görünür uyarı (human-review ruhuna uygun, ama bizde 'insana gönder' diye ayrı bir kuyruk yok, direkt session_start çıktısında gösteriliyor). 'Local vs server' senaryosu kapsam dışı - sunucu yok.
 
 - 2026-07-29 - Stage AU: failure visibility eklendi (Haroon'un ekip belgesi, madde 8) - health_events tablosu + get_health_state() 3 durumlu (healthy/degraded/blocked). 'Recovery required/validation failed/sync pending' durumları kapsam dışı - sunucu/sync olmadığı için anlamsız. ÖNEMLİ: mevcut fail-soft davranış DEĞİŞMEDİ, sadece artık loglanıyor - session'lar hâlâ hatalardan dolayı çökmüyor, sadece artık görünür.
+
+- 2026-07-30 - Stage AV: assistant_server.py artık sunum arayüzü olarak tüm özellikleri (görev yönetimi, sağlık durumu, session score, çelişki tespiti) gerçekten kullanıyor - önceden bunlar sadece Claude Code hook'larında çalışıyordu, chat arayüzünde hiç görünmüyordu.

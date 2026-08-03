@@ -73,6 +73,12 @@ _DECISION_PHRASES = (
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
+# Stage AV: real task commands, alongside the existing decision:/karar: pattern.
+_TASK_ADD_RE = re.compile(r"\b(?:task|g[öo]rev)\s*[:=-]\s*(?P<title>.+)", re.I | re.S)
+_TASK_COMPLETE_EN_RE = re.compile(r"\bcomplete\s+task\s+(?P<id>\d+)\b", re.I)
+_TASK_COMPLETE_TR_RE = re.compile(r"\b(?P<id>\d+)\s*numaral[ıi]\s+g[öo]revi\s+tamamla\b", re.I)
+_STATUS_COMMAND_WORDS = {"status", "durum"}
+
 
 def _json_safe(value):
     if isinstance(value, dict):
@@ -132,6 +138,27 @@ def _decision_text(message: str) -> str | None:
     return None
 
 
+def _task_add_title(message: str) -> str | None:
+    """Extract a task title from an explicit 'task: ...' / 'görev: ...' message."""
+
+    match = _TASK_ADD_RE.search(message)
+    if not match:
+        return None
+    title = _clip(match.group("title"), 200)
+    return title or None
+
+
+def _task_complete_id(message: str) -> int | None:
+    """Extract a task id from 'complete task N' or 'N numaralı görevi tamamla'."""
+
+    match = _TASK_COMPLETE_EN_RE.search(message) or _TASK_COMPLETE_TR_RE.search(message)
+    return int(match.group("id")) if match else None
+
+
+def _is_status_command(message: str) -> bool:
+    return message.strip().lower() in _STATUS_COMMAND_WORDS
+
+
 def run_claude(prompt: str, *, timeout: int = CLAUDE_TIMEOUT_SECONDS) -> str | None:
     """Call the user's authenticated Claude Code CLI. Fail-soft to None."""
 
@@ -172,17 +199,32 @@ def collect_context(message: str, session_id: str, *, db_path: Path = mc.DB_PATH
     graph_hits = _safe_call([], mc.graph_memory_search, message, limit=2, db_path=db_path)
     tasks = _safe_call([], mc.list_tasks, db_path=db_path)
     open_tasks = [task for task in tasks if task.get("status") != "done"][:5]
+    checkpoint = _safe_call(None, mc.latest_checkpoint, session_id, db_path=db_path)
+
+    # Stage AV: wire the previously hook-only health/score/conflict signals
+    # into the chat surface itself, so what's built is actually visible here.
+    health = _safe_call("unknown", mc.get_health_state, session_id, db_path=db_path)
+    score = _safe_call({}, mc.session_score, session_id, db_path=db_path)
+    current_task = (checkpoint or {}).get("current_task")
+    conflicts = (
+        _safe_call([], mc.detect_memory_conflicts, current_task, db_path=db_path)
+        if current_task
+        else []
+    )
 
     return {
         "session_id": session_id,
         "role": role,
         "permissions": mc.ROLE_PERMISSIONS.get(role, {}),
         "declared_role": declared,
-        "checkpoint": _safe_call(None, mc.latest_checkpoint, session_id, db_path=db_path),
+        "checkpoint": checkpoint,
         "keyword_memory": keyword_hits,
         "semantic_memory": semantic_hits,
         "graph_memory": graph_hits,
         "open_tasks": open_tasks,
+        "health": health,
+        "session_score": score,
+        "memory_conflicts": conflicts,
     }
 
 
@@ -218,6 +260,10 @@ def build_prompt(message: str, context: dict) -> str:
     ) or "- none"
     checkpoint = context["checkpoint"] or {}
     checkpoint_line = _clip(json.dumps(checkpoint, ensure_ascii=False), 500) if checkpoint else "none"
+    score = context.get("session_score") or {}
+    score_line = _clip(json.dumps(score, ensure_ascii=False), 300) if score else "unavailable"
+    conflicts = context.get("memory_conflicts") or []
+    conflict_lines = "\n".join(f"- {c.get('reason')}" for c in conflicts) or "- none"
 
     return f"""
 You are BBB-Lite, Erdi's local assistant prototype inspired by Haroon's BBB OS.
@@ -249,6 +295,11 @@ Session: {context['session_id']}
 Role: {context['role']}
 Permissions: {context['permissions']}
 Latest checkpoint: {checkpoint_line}
+Health state: {context.get('health', 'unknown')}
+Session score: {score_line}
+
+Memory conflicts:
+{conflict_lines}
 
 Open tasks:
 {open_tasks}
@@ -366,6 +417,94 @@ def _enforce_brozzer_contract(answer: str, message: str, context: dict, engine: 
     )
 
 
+def _status_footer(context: dict) -> str:
+    """One-line status line appended to every reply (Stage AV) - always visible,
+    never the main content."""
+
+    health = context.get("health") or "unknown"
+    overall_score = (context.get("session_score") or {}).get("overall_score")
+    score_text = f"{overall_score}/100" if isinstance(overall_score, int) else "n/a"
+    conflict_count = len(context.get("memory_conflicts") or [])
+    return f"[health: {health} | score: {score_text} | conflicts: {conflict_count}]"
+
+
+def _status_report(context: dict, *, session_id: str, db_path: Path) -> str:
+    """Full, non-summarized dump for the 'status'/'durum' command (Stage AV)."""
+
+    open_tasks = context.get("open_tasks") or []
+    task_lines = "\n".join(
+        f"- #{task.get('id')} [{task.get('status')}] {task.get('title')}" for task in open_tasks
+    ) or "- none"
+
+    recent_health_events = _safe_call(
+        [], mc.list_health_events, limit=3, session_id=session_id, db_path=db_path
+    )
+    event_lines = "\n".join(
+        f"- {event.get('created_at')} {event.get('component')}/{event.get('event')}: "
+        f"{event.get('detail') or '-'}"
+        for event in recent_health_events
+    ) or "- none"
+
+    conflicts = context.get("memory_conflicts") or []
+    conflict_lines = "\n".join(f"- {conflict.get('reason')}" for conflict in conflicts) or "- none"
+
+    score = context.get("session_score") or {}
+    score_line = json.dumps(score, ensure_ascii=False) if score else "unavailable"
+
+    return (
+        "STATUS REPORT\n\n"
+        f"Role: {context.get('role')}\n\n"
+        f"Open tasks:\n{task_lines}\n\n"
+        f"Health state: {context.get('health', 'unknown')}\n"
+        f"Recent health events (last 3):\n{event_lines}\n\n"
+        f"Session score: {score_line}\n\n"
+        f"Memory conflicts ({len(conflicts)}):\n{conflict_lines}"
+    )
+
+
+def _complete_task_via_chat(task_id: int, session_id: str, *, db_path: Path) -> str:
+    """Real mc.complete_task() call from chat (Stage AV) - errors are shown as-is,
+    proving the completion guard instead of hiding behind a friendly message."""
+
+    try:
+        evidence_id = mc.record_evidence(
+            "user_confirmation",
+            f"chat_complete_task_{task_id}",
+            "passed",
+            details={"session_id": session_id, "source": "assistant_console_chat"},
+            db_path=db_path,
+        )
+        result = mc.complete_task(
+            task_id,
+            session_id=session_id,
+            evidence_id=evidence_id,
+            completion_summary=f"Completed via assistant chat by session {session_id}.",
+            db_path=db_path,
+        )
+    except Exception as exc:
+        return f"[complete task failed: {exc}]"
+    return f"[task {result['task_id']} completed]"
+
+
+def _handle_task_commands(message: str, session_id: str, *, db_path: Path) -> str | None:
+    """Real task add/complete side effects for the chat surface (Stage AV).
+
+    Returns a confirmation/error line to append to the answer, or None if the
+    message triggered neither command.
+    """
+
+    title = _task_add_title(message)
+    if title:
+        task_id = mc.add_task(title, session_id=session_id, db_path=db_path)
+        return f"[task added, id={task_id}]"
+
+    task_id = _task_complete_id(message)
+    if task_id is not None:
+        return _complete_task_via_chat(task_id, session_id, db_path=db_path)
+
+    return None
+
+
 def answer_message(message: str, session_id: str = DEFAULT_SESSION_ID, *, db_path: Path = mc.DB_PATH) -> dict:
     message = str(message or "").strip()
     if not message:
@@ -381,25 +520,35 @@ def answer_message(message: str, session_id: str = DEFAULT_SESSION_ID, *, db_pat
         role=context["role"],
         db_path=db_path,
     )
-    prompt = build_prompt(message, context)
-    answer = run_claude(prompt)
-    engine = "claude-cli"
-    if answer is None:
-        answer = _local_brozzer_answer(message, context)
-        engine = "local-guarded"
-        if os.environ.get("BBB_ASSISTANT_USE_OLLAMA") == "1":
-            ollama_answer = _clean_model_output(mc.ask_ollama(prompt, db_path=db_path))
-            if ollama_answer:
-                answer = ollama_answer
-                engine = "ollama"
-    if answer is None:
-        answer = (
-            "Cevap motoruna ulaşamadım. Claude CLI oturum açmamış/limitli olabilir; "
-            "Ollama da yanıt vermedi. Yine de Mission Control, role, memory ve "
-            "checkpoint context'i toplandı."
-        )
-        engine = "unavailable"
-    answer = _enforce_brozzer_contract(answer, message, context, engine)
+    if _is_status_command(message):
+        answer = _status_report(context, session_id=session_id, db_path=db_path)
+        engine = "status-command"
+    else:
+        prompt = build_prompt(message, context)
+        answer = run_claude(prompt)
+        engine = "claude-cli"
+        if answer is None:
+            answer = _local_brozzer_answer(message, context)
+            engine = "local-guarded"
+            if os.environ.get("BBB_ASSISTANT_USE_OLLAMA") == "1":
+                ollama_answer = _clean_model_output(mc.ask_ollama(prompt, db_path=db_path))
+                if ollama_answer:
+                    answer = ollama_answer
+                    engine = "ollama"
+        if answer is None:
+            answer = (
+                "Cevap motoruna ulaşamadım. Claude CLI oturum açmamış/limitli olabilir; "
+                "Ollama da yanıt vermedi. Yine de Mission Control, role, memory ve "
+                "checkpoint context'i toplandı."
+            )
+            engine = "unavailable"
+        answer = _enforce_brozzer_contract(answer, message, context, engine)
+
+        task_note = _handle_task_commands(message, session_id, db_path=db_path)
+        if task_note:
+            answer = f"{answer}\n\n{task_note}"
+
+    answer = f"{answer}\n\n{_status_footer(context)}"
     checkpoint_risk = "low" if engine != "unavailable" else "model_unavailable"
 
     # Stage AU: this was already fail-soft via _safe_call (a failed checkpoint

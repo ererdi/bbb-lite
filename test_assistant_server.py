@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import sys
@@ -36,21 +37,23 @@ class AssistantAnswerTestCase(unittest.TestCase):
         for patcher in patches:
             self.addCleanup(patcher.stop)
 
-    def _mock_context(self):
-        return mock.patch(
-            "assistant_server.collect_context",
-            return_value={
-                "session_id": "web",
-                "role": "brozzer",
-                "permissions": {"code": False, "data": False},
-                "declared_role": None,
-                "checkpoint": None,
-                "keyword_memory": [],
-                "semantic_memory": [],
-                "graph_memory": [],
-                "open_tasks": [],
-            },
-        )
+    def _mock_context(self, **overrides):
+        base = {
+            "session_id": "web",
+            "role": "brozzer",
+            "permissions": {"code": False, "data": False},
+            "declared_role": None,
+            "checkpoint": None,
+            "keyword_memory": [],
+            "semantic_memory": [],
+            "graph_memory": [],
+            "open_tasks": [],
+            "health": "healthy",
+            "session_score": {"overall_score": 83},
+            "memory_conflicts": [],
+        }
+        base.update(overrides)
+        return mock.patch("assistant_server.collect_context", return_value=base)
 
     def test_empty_message_is_refused(self) -> None:
         self.assertEqual({"error": "message is required"}, assistant_server.answer_message(" "))
@@ -177,7 +180,12 @@ class CollectContextTestCase(unittest.TestCase):
             mock.patch("assistant_server.mc.semantic_search", return_value=[{"title": "sem"}]), \
             mock.patch("assistant_server.mc.graph_memory_search", return_value=[{"title": "graph"}]), \
             mock.patch("assistant_server.mc.list_tasks", return_value=[{"id": 1, "status": "todo"}]), \
-            mock.patch("assistant_server.mc.latest_checkpoint", return_value={"risk": "low"}):
+            mock.patch("assistant_server.mc.latest_checkpoint", return_value={"risk": "low"}), \
+            mock.patch("assistant_server.mc.get_health_state", return_value="healthy") as health, \
+            mock.patch(
+                "assistant_server.mc.session_score", return_value={"overall_score": 90}
+            ) as score, \
+            mock.patch("assistant_server.mc.detect_memory_conflicts") as conflicts:
             context = assistant_server.collect_context("you are the builder", "web")
         ensure.assert_called_once()
         set_role.assert_called_once_with("web", "builder", db_path=assistant_server.mc.DB_PATH)
@@ -185,6 +193,35 @@ class CollectContextTestCase(unittest.TestCase):
         self.assertEqual([{"title": "kw"}], context["keyword_memory"])
         self.assertEqual([{"title": "sem"}], context["semantic_memory"])
         self.assertEqual([{"title": "graph"}], context["graph_memory"])
+        self.assertEqual("healthy", context["health"])
+        self.assertEqual({"overall_score": 90}, context["session_score"])
+        self.assertEqual([], context["memory_conflicts"])
+        health.assert_called_once()
+        score.assert_called_once()
+        # checkpoint has no 'current_task', so conflict detection must not even run
+        conflicts.assert_not_called()
+
+    def test_collect_context_checks_conflicts_when_checkpoint_has_current_task(self) -> None:
+        with mock.patch("assistant_server.mc.init_db"), \
+            mock.patch("assistant_server.mc.ensure_session"), \
+            mock.patch("assistant_server.mc.set_role"), \
+            mock.patch("assistant_server.mc.get_role", return_value="brozzer"), \
+            mock.patch("assistant_server.mc.search_memory", return_value=[]), \
+            mock.patch("assistant_server.mc.semantic_search", return_value=[]), \
+            mock.patch("assistant_server.mc.graph_memory_search", return_value=[]), \
+            mock.patch("assistant_server.mc.list_tasks", return_value=[]), \
+            mock.patch(
+                "assistant_server.mc.latest_checkpoint",
+                return_value={"risk": "low", "current_task": "fix the bug"},
+            ), \
+            mock.patch("assistant_server.mc.get_health_state", return_value="healthy"), \
+            mock.patch("assistant_server.mc.session_score", return_value={}), \
+            mock.patch(
+                "assistant_server.mc.detect_memory_conflicts", return_value=[{"reason": "x"}]
+            ) as conflicts:
+            context = assistant_server.collect_context("hello", "web")
+        conflicts.assert_called_once_with("fix the bug", db_path=assistant_server.mc.DB_PATH)
+        self.assertEqual([{"reason": "x"}], context["memory_conflicts"])
 
 
 class PromptTestCase(unittest.TestCase):
@@ -286,6 +323,194 @@ class HandlerTestCase(unittest.TestCase):
             handler.do_POST()
         self.assertEqual([200], handler.responses)
         self.assertEqual("hi", handler.sent_json[0]["answer"])
+
+
+class TaskCommandParsingTestCase(unittest.TestCase):
+    def test_task_prefix_extracts_title(self) -> None:
+        self.assertEqual("fix the bug", assistant_server._task_add_title("task: fix the bug"))
+
+    def test_gorev_prefix_extracts_title(self) -> None:
+        self.assertEqual(
+            "dokümantasyon yaz", assistant_server._task_add_title("görev: dokümantasyon yaz")
+        )
+
+    def test_no_task_prefix_returns_none(self) -> None:
+        self.assertIsNone(assistant_server._task_add_title("just chatting about tasks"))
+
+    def test_complete_task_english_pattern(self) -> None:
+        self.assertEqual(7, assistant_server._task_complete_id("please complete task 7 now"))
+
+    def test_complete_task_turkish_pattern(self) -> None:
+        self.assertEqual(3, assistant_server._task_complete_id("3 numaralı görevi tamamla"))
+
+    def test_no_complete_pattern_returns_none(self) -> None:
+        self.assertIsNone(assistant_server._task_complete_id("what is task 7 about?"))
+
+    def test_status_command_recognized(self) -> None:
+        self.assertTrue(assistant_server._is_status_command("  Durum  "))
+        self.assertTrue(assistant_server._is_status_command("status"))
+        self.assertFalse(assistant_server._is_status_command("what is the status of x"))
+
+
+class TaskCommandExecutionTestCase(unittest.TestCase):
+    """Stage AV: task: / complete task N must call real mc.py functions, not just
+    produce suggestion text."""
+
+    def _mock_context(self, **overrides):
+        base = {
+            "session_id": "web",
+            "role": "builder",
+            "permissions": {"code": True, "data": True},
+            "declared_role": None,
+            "checkpoint": None,
+            "keyword_memory": [],
+            "semantic_memory": [],
+            "graph_memory": [],
+            "open_tasks": [{"id": 1, "status": "todo", "title": "existing"}],
+            "health": "healthy",
+            "session_score": {"overall_score": 83},
+            "memory_conflicts": [],
+        }
+        base.update(overrides)
+        return mock.patch("assistant_server.collect_context", return_value=base)
+
+    def _common_patches(self):
+        return [
+            mock.patch("assistant_server.run_claude", return_value="ok"),
+            mock.patch("assistant_server.mc.ask_ollama"),
+            mock.patch("assistant_server.mc.write_checkpoint"),
+            mock.patch("assistant_server.mc.record_turn"),
+            mock.patch("assistant_server.mc.record_event"),
+            mock.patch("assistant_server.mc.record_answer_quality", return_value=1),
+            mock.patch("assistant_server.mc.record_answer_receipt", return_value=3),
+        ]
+
+    def test_task_add_message_calls_mc_add_task(self) -> None:
+        patches = self._common_patches()
+        with self._mock_context(), \
+            mock.patch("assistant_server.mc.record_evidence", return_value=2), \
+            mock.patch("assistant_server.mc.add_task", return_value=42) as add_task, \
+            contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            result = assistant_server.answer_message("task: yeni test görevi", "web")
+
+        add_task.assert_called_once_with(
+            "yeni test görevi", session_id="web", db_path=assistant_server.mc.DB_PATH
+        )
+        self.assertIn("[task added, id=42]", result["answer"])
+
+    def test_complete_task_command_calls_complete_task_with_real_params(self) -> None:
+        patches = self._common_patches()
+        with self._mock_context(), \
+            mock.patch("assistant_server.mc.record_evidence", return_value=555) as record_evidence, \
+            mock.patch(
+                "assistant_server.mc.complete_task",
+                return_value={"ok": True, "task_id": 1, "status": "done"},
+            ) as complete_task, \
+            contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            result = assistant_server.answer_message("complete task 1", "web")
+
+        first_call = record_evidence.call_args_list[0]
+        self.assertEqual("user_confirmation", first_call.args[0])
+        complete_task.assert_called_once_with(
+            1,
+            session_id="web",
+            evidence_id=555,
+            completion_summary=mock.ANY,
+            db_path=assistant_server.mc.DB_PATH,
+        )
+        self.assertIn("[task 1 completed]", result["answer"])
+
+    def test_complete_task_guard_failure_is_shown_not_hidden(self) -> None:
+        """The evidence recorded from chat is kind='user_confirmation', not a test
+        run, so mc.py's require_test_evidence guard refuses it by design - and
+        that refusal must reach the user verbatim, not be swallowed."""
+
+        patches = self._common_patches()
+        with self._mock_context(), \
+            mock.patch("assistant_server.mc.record_evidence", return_value=1), \
+            mock.patch(
+                "assistant_server.mc.complete_task",
+                side_effect=ValueError("completion evidence must include test execution"),
+            ), \
+            contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            result = assistant_server.answer_message("complete task 9", "web")
+
+        self.assertIn(
+            "[complete task failed: completion evidence must include test execution]",
+            result["answer"],
+        )
+
+    def test_footer_appears_on_every_answer(self) -> None:
+        patches = self._common_patches()
+        with self._mock_context(
+            health="degraded", session_score={"overall_score": 55}, memory_conflicts=[{"reason": "x"}]
+        ), \
+            mock.patch("assistant_server.mc.record_evidence", return_value=1), \
+            contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            result = assistant_server.answer_message("hello", "web")
+
+        self.assertIn("[health: degraded | score: 55/100 | conflicts: 1]", result["answer"])
+
+
+class StatusCommandTestCase(unittest.TestCase):
+    def _mock_context(self):
+        return mock.patch(
+            "assistant_server.collect_context",
+            return_value={
+                "session_id": "web",
+                "role": "builder",
+                "permissions": {"code": True, "data": True},
+                "declared_role": None,
+                "checkpoint": None,
+                "keyword_memory": [],
+                "semantic_memory": [],
+                "graph_memory": [],
+                "open_tasks": [{"id": 1, "status": "todo", "title": "t1"}],
+                "health": "degraded",
+                "session_score": {"overall_score": 70},
+                "memory_conflicts": [{"reason": "conflict-x"}],
+            },
+        )
+
+    def test_status_command_returns_full_detail_without_calling_the_model(self) -> None:
+        with self._mock_context(), \
+            mock.patch("assistant_server.run_claude") as claude, \
+            mock.patch(
+                "assistant_server.mc.list_health_events",
+                return_value=[
+                    {
+                        "created_at": "t",
+                        "component": "ollama",
+                        "event": "unavailable",
+                        "detail": None,
+                    }
+                ],
+            ) as health_events, \
+            mock.patch("assistant_server.mc.write_checkpoint"), \
+            mock.patch("assistant_server.mc.record_turn"), \
+            mock.patch("assistant_server.mc.record_event"), \
+            mock.patch("assistant_server.mc.record_answer_quality", return_value=1), \
+            mock.patch("assistant_server.mc.record_evidence", return_value=1), \
+            mock.patch("assistant_server.mc.record_answer_receipt", return_value=3):
+            result = assistant_server.answer_message("status", "web")
+
+        claude.assert_not_called()
+        self.assertEqual("status-command", result["engine"])
+        self.assertIn("STATUS REPORT", result["answer"])
+        self.assertIn("#1 [todo] t1", result["answer"])
+        self.assertIn("degraded", result["answer"])
+        self.assertIn("conflict-x", result["answer"])
+        health_events.assert_called_once_with(
+            limit=3, session_id="web", db_path=assistant_server.mc.DB_PATH
+        )
 
 
 if __name__ == "__main__":

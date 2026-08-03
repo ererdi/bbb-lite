@@ -1343,6 +1343,26 @@ def get_health_state(session_id: str | None = None, db_path: Path = DB_PATH) -> 
     return "degraded"
 
 
+def list_health_events(
+    limit: int = 20, session_id: str | None = None, db_path: Path = DB_PATH
+) -> list[dict]:
+    """Most recent health_events rows (Stage AV) — detail behind get_health_state()'s rollup."""
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        if session_id is None:
+            rows = conn.execute(
+                "SELECT * FROM health_events ORDER BY created_at DESC, id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT * FROM health_events WHERE session_id = ?
+                   ORDER BY created_at DESC, id DESC LIMIT ?""",
+                (session_id, limit),
+            ).fetchall()
+    return [dict(row) for row in reversed(rows)]
+
+
 def create_decision_packet(
     session_id: str,
     decision: str,

@@ -63,6 +63,25 @@ class HealthStateTestCase(unittest.TestCase):
             "degraded", mc.get_health_state(session_id="s-1", db_path=self.db_path)
         )
 
+    def test_list_health_events_returns_most_recent_first_then_reversed(self) -> None:
+        mc.log_health_event("ollama", "unavailable", db_path=self.db_path)
+        mc.log_health_event("checkpoint", "write_failed", db_path=self.db_path)
+        mc.log_health_event("db", "write_failed", db_path=self.db_path)
+
+        events = mc.list_health_events(limit=2, db_path=self.db_path)
+
+        self.assertEqual(2, len(events))
+        self.assertEqual(["checkpoint", "db"], [e["component"] for e in events])
+
+    def test_list_health_events_scopes_to_session(self) -> None:
+        mc.log_health_event("ollama", "unavailable", session_id="s-1", db_path=self.db_path)
+        mc.log_health_event("db", "write_failed", session_id="s-2", db_path=self.db_path)
+
+        events = mc.list_health_events(session_id="s-1", db_path=self.db_path)
+
+        self.assertEqual(1, len(events))
+        self.assertEqual("ollama", events[0]["component"])
+
     def test_log_health_event_never_raises_when_db_write_fails(self) -> None:
         bad_db_path = Path(tempfile.mkdtemp())  # a directory, not a file - connect() must fail
         try:
