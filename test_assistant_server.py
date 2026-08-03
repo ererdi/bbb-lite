@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -127,12 +128,35 @@ class AssistantAnswerTestCase(unittest.TestCase):
             mock.patch("assistant_server.mc.record_event"), \
             mock.patch(
                 "assistant_server.mc.create_decision_packet", return_value="packet-1"
-            ) as packet:
+            ) as packet, \
+            mock.patch("assistant_server.mc.log_lesson") as log_lesson:
             result = assistant_server.answer_message(
                 "decision: keep SQLite as local MC", "web"
             )
         self.assertEqual("packet-1", result["decision_packet_id"])
         packet.assert_called_once()
+        log_lesson.assert_called_once()
+
+    def test_decision_message_also_writes_a_searchable_memory_lesson(self) -> None:
+        """Stage AX: decision_packets alone isn't reachable via search_memory/
+        semantic_search (those read memory_index) - the same text must also go
+        through mc.log_lesson so a chat decision is actually findable later."""
+
+        with self._mock_context(), \
+            mock.patch("assistant_server.run_claude", return_value="stored"), \
+            mock.patch("assistant_server.mc.write_checkpoint"), \
+            mock.patch("assistant_server.mc.record_turn"), \
+            mock.patch("assistant_server.mc.record_event"), \
+            mock.patch("assistant_server.mc.create_decision_packet", return_value="packet-1"), \
+            mock.patch("assistant_server.mc.log_lesson") as log_lesson:
+            assistant_server.answer_message("decision: keep SQLite as local MC", "web")
+
+        log_lesson.assert_called_once_with(
+            "chat decision: keep SQLite as local MC",
+            "keep SQLite as local MC",
+            confidence="medium",
+            db_path=assistant_server.mc.DB_PATH,
+        )
 
 
 class HealthEventLoggingTestCase(AssistantAnswerTestCase):
@@ -351,6 +375,27 @@ class TaskCommandParsingTestCase(unittest.TestCase):
         self.assertTrue(assistant_server._is_status_command("status"))
         self.assertFalse(assistant_server._is_status_command("what is the status of x"))
 
+    def test_confirm_task_with_test_extracts_id_and_detail(self) -> None:
+        self.assertEqual(
+            (5, "unit tests pass"),
+            assistant_server._confirm_task_with_test_match(
+                "confirm task 5 with test: unit tests pass"
+            ),
+        )
+
+    def test_confirm_task_with_test_case_insensitive(self) -> None:
+        self.assertEqual(
+            (2, "pytest green"),
+            assistant_server._confirm_task_with_test_match(
+                "Confirm Task 2 WITH TEST: pytest green"
+            ),
+        )
+
+    def test_no_confirm_task_pattern_returns_none(self) -> None:
+        self.assertIsNone(
+            assistant_server._confirm_task_with_test_match("complete task 7 now")
+        )
+
 
 class TaskCommandExecutionTestCase(unittest.TestCase):
     """Stage AV: task: / complete task N must call real mc.py functions, not just
@@ -446,6 +491,50 @@ class TaskCommandExecutionTestCase(unittest.TestCase):
             result["answer"],
         )
 
+    def test_confirm_task_with_test_records_test_evidence_then_completes(self) -> None:
+        """Stage AX: unlike 'complete task N' (user_confirmation, refused by the
+        guard), 'confirm task N with test: ...' must record kind='test_run'
+        evidence and pass that evidence into complete_task."""
+
+        patches = self._common_patches()
+        with self._mock_context(), \
+            mock.patch("assistant_server.mc.record_evidence", return_value=777) as record_evidence, \
+            mock.patch(
+                "assistant_server.mc.complete_task",
+                return_value={"ok": True, "task_id": 4, "status": "done"},
+            ) as complete_task, \
+            contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            result = assistant_server.answer_message(
+                "confirm task 4 with test: pytest -k task_4 passed", "web"
+            )
+
+        first_call = record_evidence.call_args_list[0]
+        self.assertEqual(
+            mock.call(
+                "test_run",
+                "chat_test_4",
+                "passed",
+                details={
+                    "session_id": "web",
+                    "source": "assistant_console_chat",
+                    "detail": "pytest -k task_4 passed",
+                },
+                db_path=assistant_server.mc.DB_PATH,
+            ),
+            first_call,
+        )
+        complete_task.assert_called_once_with(
+            4,
+            session_id="web",
+            evidence_id=777,
+            completion_summary="pytest -k task_4 passed",
+            require_test_evidence=True,
+            db_path=assistant_server.mc.DB_PATH,
+        )
+        self.assertIn("[task 4 completed via test evidence id=777]", result["answer"])
+
     def test_footer_appears_on_every_answer(self) -> None:
         patches = self._common_patches()
         with self._mock_context(
@@ -511,6 +600,246 @@ class StatusCommandTestCase(unittest.TestCase):
         health_events.assert_called_once_with(
             limit=3, session_id="web", db_path=assistant_server.mc.DB_PATH
         )
+
+
+class ExistsCommandTestCase(unittest.TestCase):
+    def _mock_context(self):
+        return mock.patch(
+            "assistant_server.collect_context",
+            return_value={
+                "session_id": "web",
+                "role": "builder",
+                "permissions": {"code": True, "data": True},
+                "declared_role": None,
+                "checkpoint": None,
+                "keyword_memory": [],
+                "semantic_memory": [],
+                "graph_memory": [],
+                "open_tasks": [],
+                "health": "healthy",
+                "session_score": {"overall_score": 90},
+                "memory_conflicts": [],
+            },
+        )
+
+    def test_exists_query_extracted_from_english_prefix(self) -> None:
+        self.assertEqual(
+            "task queue helper", assistant_server._exists_query("exists: task queue helper")
+        )
+
+    def test_exists_query_extracted_from_turkish_prefix(self) -> None:
+        self.assertEqual(
+            "gorev kuyrugu", assistant_server._exists_query("var mı: gorev kuyrugu")
+        )
+
+    def test_exists_query_none_without_prefix(self) -> None:
+        self.assertIsNone(assistant_server._exists_query("does this exist somewhere"))
+
+    def test_exists_command_calls_cyg_exists_without_calling_claude(self) -> None:
+        with self._mock_context(), \
+            mock.patch("assistant_server.run_claude") as claude, \
+            mock.patch(
+                "assistant_server.mc.cyg_exists",
+                return_value={
+                    "exists": True,
+                    "score": 0.87,
+                    "match": {
+                        "symbol_name": "add_task",
+                        "source_table": "symbol_index",
+                    },
+                },
+            ) as cyg_exists, \
+            mock.patch("assistant_server.mc.write_checkpoint"), \
+            mock.patch("assistant_server.mc.record_turn"), \
+            mock.patch("assistant_server.mc.record_event"), \
+            mock.patch("assistant_server.mc.record_answer_quality", return_value=1), \
+            mock.patch("assistant_server.mc.record_evidence", return_value=1), \
+            mock.patch("assistant_server.mc.record_answer_receipt", return_value=3):
+            result = assistant_server.answer_message("exists: add_task helper", "web")
+
+        claude.assert_not_called()
+        self.assertEqual("exists-command", result["engine"])
+        self.assertIn("exists: True (score: 0.870)", result["answer"])
+        self.assertIn("add_task", result["answer"])
+        cyg_exists.assert_called_once_with(
+            "add_task helper", db_path=assistant_server.mc.DB_PATH
+        )
+
+
+class ProjectsCommandTestCase(unittest.TestCase):
+    def _mock_context(self):
+        return mock.patch(
+            "assistant_server.collect_context",
+            return_value={
+                "session_id": "web",
+                "role": "builder",
+                "permissions": {"code": True, "data": True},
+                "declared_role": None,
+                "checkpoint": None,
+                "keyword_memory": [],
+                "semantic_memory": [],
+                "graph_memory": [],
+                "open_tasks": [],
+                "health": "healthy",
+                "session_score": {"overall_score": 90},
+                "memory_conflicts": [],
+            },
+        )
+
+    def test_projects_command_recognized(self) -> None:
+        self.assertTrue(assistant_server._is_projects_command("  projects  "))
+        self.assertTrue(assistant_server._is_projects_command("projeler"))
+        self.assertFalse(assistant_server._is_projects_command("what are the projects here"))
+
+    def test_projects_command_lists_projects_without_calling_claude(self) -> None:
+        with self._mock_context(), \
+            mock.patch("assistant_server.run_claude") as claude, \
+            mock.patch(
+                "assistant_server.mc.list_projects",
+                return_value=[{"id": 1, "name": "bbb-lite", "status": "active"}],
+            ) as list_projects, \
+            mock.patch("assistant_server.mc.write_checkpoint"), \
+            mock.patch("assistant_server.mc.record_turn"), \
+            mock.patch("assistant_server.mc.record_event"), \
+            mock.patch("assistant_server.mc.record_answer_quality", return_value=1), \
+            mock.patch("assistant_server.mc.record_evidence", return_value=1), \
+            mock.patch("assistant_server.mc.record_answer_receipt", return_value=3):
+            result = assistant_server.answer_message("projects", "web")
+
+        claude.assert_not_called()
+        self.assertEqual("projects-command", result["engine"])
+        self.assertIn("#1 bbb-lite [active]", result["answer"])
+        list_projects.assert_called_once_with(db_path=assistant_server.mc.DB_PATH)
+
+
+class DecisionSearchableIntegrationTestCase(unittest.TestCase):
+    """Stage AX, no-mock proof: a chat 'decision: ...' message must end up
+    findable through the real mc.search_memory(), not just recorded as a
+    decision_packets row. Uses a real temp db and a real (isolated) memory/
+    directory - mc.log_lesson's memory_dir is hardcoded relative to mc.py's
+    own file, so mc.__file__ is patched to point into a temp project dir,
+    exactly like test_mc.py's log_lesson tests do."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        self.db_path = Path(tmp.name)
+        self.db_path.unlink()
+        assistant_server.mc.init_db(self.db_path)
+
+        self.project_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.project_dir.cleanup)
+        (Path(self.project_dir.name) / "memory").mkdir()
+        patcher = mock.patch.object(
+            assistant_server.mc, "__file__", str(Path(self.project_dir.name) / "mc.py")
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self) -> None:
+        self.db_path.unlink(missing_ok=True)
+
+    def _mock_context(self):
+        return mock.patch(
+            "assistant_server.collect_context",
+            return_value={
+                "session_id": "web",
+                "role": "builder",
+                "permissions": {"code": True, "data": True},
+                "declared_role": None,
+                "checkpoint": None,
+                "keyword_memory": [],
+                "semantic_memory": [],
+                "graph_memory": [],
+                "open_tasks": [],
+                "health": "healthy",
+                "session_score": {"overall_score": 90},
+                "memory_conflicts": [],
+            },
+        )
+
+    def test_decision_command_is_findable_via_search_memory(self) -> None:
+        with self._mock_context(), mock.patch("assistant_server.run_claude", return_value="stored"):
+            assistant_server.answer_message(
+                "decision: freeze the schema until Stage AX ships",
+                "web",
+                db_path=self.db_path,
+            )
+
+        hits = assistant_server.mc.search_memory(
+            "freeze schema Stage AX ships", db_path=self.db_path
+        )
+        self.assertTrue(hits, "decision text should be indexed and searchable")
+        self.assertTrue(
+            any("freeze the schema until Stage AX ships" in hit["content"] for hit in hits)
+        )
+
+
+class ConfirmTaskWithTestGuardIntegrationTestCase(unittest.TestCase):
+    """Stage AX, no-mock proof: 'confirm task N with test: ...' must genuinely
+    pass complete_task's require_test_evidence guard (real evidence row, real
+    task row), not just call mocked functions successfully."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        self.db_path = Path(tmp.name)
+        self.db_path.unlink()
+        assistant_server.mc.init_db(self.db_path)
+
+    def tearDown(self) -> None:
+        self.db_path.unlink(missing_ok=True)
+
+    def _mock_context(self, **overrides):
+        base = {
+            "session_id": "web",
+            "role": "builder",
+            "permissions": {"code": True, "data": True},
+            "declared_role": None,
+            "checkpoint": None,
+            "keyword_memory": [],
+            "semantic_memory": [],
+            "graph_memory": [],
+            "open_tasks": [],
+            "health": "healthy",
+            "session_score": {"overall_score": 90},
+            "memory_conflicts": [],
+        }
+        base.update(overrides)
+        return mock.patch("assistant_server.collect_context", return_value=base)
+
+    def test_confirm_task_with_test_really_completes_task_through_the_guard(self) -> None:
+        task_id = assistant_server.mc.add_task(
+            "ship stage AX", session_id="web", status="in_progress", db_path=self.db_path
+        )
+
+        with self._mock_context(), mock.patch("assistant_server.run_claude", return_value="ok"):
+            result = assistant_server.answer_message(
+                f"confirm task {task_id} with test: pytest full suite green",
+                "web",
+                db_path=self.db_path,
+            )
+
+        self.assertIn(f"[task {task_id} completed via test evidence id=", result["answer"])
+        tasks = {t["id"]: t for t in assistant_server.mc.list_tasks(db_path=self.db_path)}
+        self.assertEqual("done", tasks[task_id]["status"])
+
+    def test_old_complete_task_command_is_still_refused_by_the_guard(self) -> None:
+        """Confirms the two paths stay distinct: plain 'complete task N' has no
+        test evidence and must still be refused, exactly as before Stage AX."""
+
+        task_id = assistant_server.mc.add_task(
+            "ship stage AX v2", session_id="web", status="in_progress", db_path=self.db_path
+        )
+
+        with self._mock_context(), mock.patch("assistant_server.run_claude", return_value="ok"):
+            result = assistant_server.answer_message(
+                f"complete task {task_id}", "web", db_path=self.db_path
+            )
+
+        self.assertIn("[complete task failed:", result["answer"])
+        tasks = {t["id"]: t for t in assistant_server.mc.list_tasks(db_path=self.db_path)}
+        self.assertEqual("in_progress", tasks[task_id]["status"])
 
 
 if __name__ == "__main__":

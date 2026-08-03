@@ -319,3 +319,7 @@
 - 2026-07-29 - Stage AU: failure visibility eklendi (Haroon'un ekip belgesi, madde 8) - health_events tablosu + get_health_state() 3 durumlu (healthy/degraded/blocked). 'Recovery required/validation failed/sync pending' durumları kapsam dışı - sunucu/sync olmadığı için anlamsız. ÖNEMLİ: mevcut fail-soft davranış DEĞİŞMEDİ, sadece artık loglanıyor - session'lar hâlâ hatalardan dolayı çökmüyor, sadece artık görünür.
 
 - 2026-07-30 - Stage AV: assistant_server.py artık sunum arayüzü olarak tüm özellikleri (görev yönetimi, sağlık durumu, session score, çelişki tespiti) gerçekten kullanıyor - önceden bunlar sadece Claude Code hook'larında çalışıyordu, chat arayüzünde hiç görünmüyordu.
+
+- 2026-07-30 - Stage AW: assistant_server.py'ye exists: ve projects komutları eklendi (ucuz, salt-okunur). Dispatch ve context-map bilerek chat'e bağlanmadı - dispatch her çağrıda gerçek token harcar, context-map görsel bir araç (Canvas'ın işi). Sunum planı: chat arayüzü (rol, görev, karar, hafıza, sağlık, exists, projects) + Canvas (context-map, session/task görselleştirme) birlikte, iki ayrı pencere olarak gösterilecek.
+
+- 2026-07-30 - Stage AX: decision: komutu artık memory'ye de yazıyor (aranabilir); yeni 'confirm task N with test:' komutu gerçek test-kanıtıyla complete_task'ı geçerli şekilde tamamlıyor. Eski 'complete task N' hâlâ guard-demo amaçlı kalıyor, kasıtlı olarak reddediyor.

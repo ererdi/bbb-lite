@@ -79,6 +79,19 @@ _TASK_COMPLETE_EN_RE = re.compile(r"\bcomplete\s+task\s+(?P<id>\d+)\b", re.I)
 _TASK_COMPLETE_TR_RE = re.compile(r"\b(?P<id>\d+)\s*numaral[ıi]\s+g[öo]revi\s+tamamla\b", re.I)
 _STATUS_COMMAND_WORDS = {"status", "durum"}
 
+# Stage AW: cheap, read-only informational commands - no real Claude call.
+# Dispatch (CTO/architect/builder) and context-map are deliberately NOT wired
+# into chat here; see decisions.md for the reasoning.
+_EXISTS_RE = re.compile(r"^(?:exists|var\s*m[ıi])\s*[:=-]\s*(?P<query>.+)$", re.I | re.S)
+_PROJECTS_COMMAND_WORDS = {"projects", "projeler"}
+
+# Stage AX: "confirm task N with test: ..." - a real test-evidence completion
+# path, distinct from the intentionally-guard-rejected "complete task N".
+_CONFIRM_TASK_TEST_RE = re.compile(
+    r"\bconfirm\s+task\s+(?P<id>\d+)\s+with\s+test\s*:\s*(?P<detail>.+)",
+    re.I | re.S,
+)
+
 
 def _json_safe(value):
     if isinstance(value, dict):
@@ -157,6 +170,30 @@ def _task_complete_id(message: str) -> int | None:
 
 def _is_status_command(message: str) -> bool:
     return message.strip().lower() in _STATUS_COMMAND_WORDS
+
+
+def _exists_query(message: str) -> str | None:
+    """Extract the query from an explicit 'exists: ...' / 'var mı: ...' message."""
+
+    match = _EXISTS_RE.match(message.strip())
+    if not match:
+        return None
+    query = _clip(match.group("query"), 300)
+    return query or None
+
+
+def _is_projects_command(message: str) -> bool:
+    return message.strip().lower() in _PROJECTS_COMMAND_WORDS
+
+
+def _confirm_task_with_test_match(message: str) -> tuple[int, str] | None:
+    """Extract (task_id, detail) from 'confirm task N with test: <detail>'."""
+
+    match = _CONFIRM_TASK_TEST_RE.search(message)
+    if not match:
+        return None
+    detail = _clip(match.group("detail"), 300)
+    return int(match.group("id")), detail
 
 
 def run_claude(prompt: str, *, timeout: int = CLAUDE_TIMEOUT_SECONDS) -> str | None:
@@ -462,6 +499,38 @@ def _status_report(context: dict, *, session_id: str, db_path: Path) -> str:
     )
 
 
+def _exists_report(query: str, *, db_path: Path) -> str:
+    """Answer for the 'exists: <query>' / 'var mı: <query>' command (Stage AW).
+
+    Cheap and fast: mc.cyg_exists() only compares embeddings, no real Claude
+    call, so this is safe for a chat-turn shortcut.
+    """
+
+    result = _safe_call({"exists": False, "match": None, "score": None}, mc.cyg_exists, query, db_path=db_path)
+    exists = result.get("exists")
+    score = result.get("score")
+    score_text = f"{score:.3f}" if isinstance(score, float) else "n/a"
+    match = result.get("match") or {}
+    match_line = ""
+    if match:
+        label = match.get("symbol_name") or match.get("title") or match.get("file_path") or "match"
+        match_line = f"\nMatch: {label} (source={match.get('source_table', '?')})"
+    return f"exists: {exists} (score: {score_text}){match_line}"
+
+
+def _projects_report(*, db_path: Path) -> str:
+    """Answer for the 'projects' / 'projeler' command (Stage AW) - read-only."""
+
+    projects = _safe_call([], mc.list_projects, db_path=db_path)
+    if not projects:
+        return "Projects: none"
+    lines = "\n".join(
+        f"- #{project.get('id')} {project.get('name')} [{project.get('status')}]"
+        for project in projects
+    )
+    return f"Projects:\n{lines}"
+
+
 def _complete_task_via_chat(task_id: int, session_id: str, *, db_path: Path) -> str:
     """Real mc.complete_task() call from chat (Stage AV) - errors are shown as-is,
     proving the completion guard instead of hiding behind a friendly message."""
@@ -486,12 +555,47 @@ def _complete_task_via_chat(task_id: int, session_id: str, *, db_path: Path) -> 
     return f"[task {result['task_id']} completed]"
 
 
+def _confirm_task_with_test(task_id: int, detail: str, session_id: str, *, db_path: Path) -> str:
+    """Real test-evidence completion path (Stage AX): 'confirm task N with test: ...'.
+
+    Unlike _complete_task_via_chat (which deliberately has no test evidence and
+    is refused by complete_task's require_test_evidence guard), this creates a
+    genuine kind="test_run" evidence row first, so complete_task's guard is
+    satisfied honestly rather than bypassed.
+    """
+
+    try:
+        evidence_id = mc.record_evidence(
+            "test_run",
+            f"chat_test_{task_id}",
+            "passed",
+            details={"session_id": session_id, "source": "assistant_console_chat", "detail": detail},
+            db_path=db_path,
+        )
+        result = mc.complete_task(
+            task_id,
+            session_id=session_id,
+            evidence_id=evidence_id,
+            completion_summary=detail or f"Test passed for task {task_id}.",
+            require_test_evidence=True,
+            db_path=db_path,
+        )
+    except Exception as exc:
+        return f"[confirm task with test failed: {exc}]"
+    return f"[task {result['task_id']} completed via test evidence id={evidence_id}]"
+
+
 def _handle_task_commands(message: str, session_id: str, *, db_path: Path) -> str | None:
-    """Real task add/complete side effects for the chat surface (Stage AV).
+    """Real task add/complete side effects for the chat surface (Stage AV/AX).
 
     Returns a confirmation/error line to append to the answer, or None if the
-    message triggered neither command.
+    message triggered no task command.
     """
+
+    confirm_match = _confirm_task_with_test_match(message)
+    if confirm_match:
+        task_id, detail = confirm_match
+        return _confirm_task_with_test(task_id, detail, session_id, db_path=db_path)
 
     title = _task_add_title(message)
     if title:
@@ -520,9 +624,16 @@ def answer_message(message: str, session_id: str = DEFAULT_SESSION_ID, *, db_pat
         role=context["role"],
         db_path=db_path,
     )
+    exists_query = _exists_query(message)
     if _is_status_command(message):
         answer = _status_report(context, session_id=session_id, db_path=db_path)
         engine = "status-command"
+    elif exists_query:
+        answer = _exists_report(exists_query, db_path=db_path)
+        engine = "exists-command"
+    elif _is_projects_command(message):
+        answer = _projects_report(db_path=db_path)
+        engine = "projects-command"
     else:
         prompt = build_prompt(message, context)
         answer = run_claude(prompt)
@@ -596,6 +707,18 @@ def answer_message(message: str, session_id: str = DEFAULT_SESSION_ID, *, db_pat
             decision,
             source="chat",
             context_gist=_clip(answer, 240),
+            db_path=db_path,
+        )
+        # Stage AX: decision_packets alone isn't searchable by search_memory/
+        # semantic_search (those read memory_index) - mirror the same text
+        # into memory via log_lesson so a chat decision can actually be found
+        # later, not just stored.
+        _safe_call(
+            None,
+            mc.log_lesson,
+            f"chat decision: {_clip(decision, 60)}",
+            decision,
+            confidence="medium",
             db_path=db_path,
         )
 
