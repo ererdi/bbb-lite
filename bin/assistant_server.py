@@ -92,6 +92,12 @@ _CONFIRM_TASK_TEST_RE = re.compile(
     re.I | re.S,
 )
 
+# Stage AY: "start task N" / "işe başla N" - the todo -> in_progress half of
+# the loop that "confirm task N with test: ..." (in_progress/ready_for_review
+# -> done) could not previously reach from chat.
+_TASK_START_EN_RE = re.compile(r"\bstart\s+task\s+(?P<id>\d+)\b", re.I)
+_TASK_START_TR_RE = re.compile(r"\bi[şs]e\s+ba[şs]la\s+(?P<id>\d+)\b", re.I)
+
 
 def _json_safe(value):
     if isinstance(value, dict):
@@ -165,6 +171,13 @@ def _task_complete_id(message: str) -> int | None:
     """Extract a task id from 'complete task N' or 'N numaralı görevi tamamla'."""
 
     match = _TASK_COMPLETE_EN_RE.search(message) or _TASK_COMPLETE_TR_RE.search(message)
+    return int(match.group("id")) if match else None
+
+
+def _task_start_id(message: str) -> int | None:
+    """Extract a task id from 'start task N' or 'işe başla N'."""
+
+    match = _TASK_START_EN_RE.search(message) or _TASK_START_TR_RE.search(message)
     return int(match.group("id")) if match else None
 
 
@@ -585,6 +598,17 @@ def _confirm_task_with_test(task_id: int, detail: str, session_id: str, *, db_pa
     return f"[task {result['task_id']} completed via test evidence id={evidence_id}]"
 
 
+def _start_task_via_chat(task_id: int, session_id: str, *, db_path: Path) -> str:
+    """Real mc.start_task() call from chat (Stage AY) - errors (already
+    started/done) are shown as-is, same as the other task commands."""
+
+    try:
+        result = mc.start_task(task_id, session_id=session_id, db_path=db_path)
+    except Exception as exc:
+        return f"[start task failed: {exc}]"
+    return f"[task {result['task_id']} started]"
+
+
 def _handle_task_commands(message: str, session_id: str, *, db_path: Path) -> str | None:
     """Real task add/complete side effects for the chat surface (Stage AV/AX).
 
@@ -596,6 +620,10 @@ def _handle_task_commands(message: str, session_id: str, *, db_path: Path) -> st
     if confirm_match:
         task_id, detail = confirm_match
         return _confirm_task_with_test(task_id, detail, session_id, db_path=db_path)
+
+    start_id = _task_start_id(message)
+    if start_id is not None:
+        return _start_task_via_chat(start_id, session_id, db_path=db_path)
 
     title = _task_add_title(message)
     if title:

@@ -396,6 +396,15 @@ class TaskCommandParsingTestCase(unittest.TestCase):
             assistant_server._confirm_task_with_test_match("complete task 7 now")
         )
 
+    def test_start_task_english_pattern(self) -> None:
+        self.assertEqual(4, assistant_server._task_start_id("please start task 4"))
+
+    def test_start_task_turkish_pattern(self) -> None:
+        self.assertEqual(6, assistant_server._task_start_id("işe başla 6"))
+
+    def test_no_start_task_pattern_returns_none(self) -> None:
+        self.assertIsNone(assistant_server._task_start_id("what is task 4 about?"))
+
 
 class TaskCommandExecutionTestCase(unittest.TestCase):
     """Stage AV: task: / complete task N must call real mc.py functions, not just
@@ -838,6 +847,50 @@ class ConfirmTaskWithTestGuardIntegrationTestCase(unittest.TestCase):
             )
 
         self.assertIn("[complete task failed:", result["answer"])
+        tasks = {t["id"]: t for t in assistant_server.mc.list_tasks(db_path=self.db_path)}
+        self.assertEqual("in_progress", tasks[task_id]["status"])
+
+    def test_start_task_then_confirm_with_test_completes_the_full_chat_loop(self) -> None:
+        """Stage AY, no-mock proof: 'start task N' really moves a fresh 'todo'
+        task to 'in_progress' through the chat surface, and 'confirm task N
+        with test: ...' can then complete it - the full todo -> in_progress
+        -> done loop, entirely via chat."""
+
+        task_id = assistant_server.mc.add_task(
+            "ship stage AY", session_id="web", db_path=self.db_path
+        )  # default status="todo"
+
+        with self._mock_context(), mock.patch("assistant_server.run_claude", return_value="ok"):
+            start_result = assistant_server.answer_message(
+                f"start task {task_id}", "web", db_path=self.db_path
+            )
+        self.assertIn(f"[task {task_id} started]", start_result["answer"])
+        tasks = {t["id"]: t for t in assistant_server.mc.list_tasks(db_path=self.db_path)}
+        self.assertEqual("in_progress", tasks[task_id]["status"])
+
+        with self._mock_context(), mock.patch("assistant_server.run_claude", return_value="ok"):
+            confirm_result = assistant_server.answer_message(
+                f"confirm task {task_id} with test: pytest full suite green",
+                "web",
+                db_path=self.db_path,
+            )
+        self.assertIn(
+            f"[task {task_id} completed via test evidence id=", confirm_result["answer"]
+        )
+        tasks = {t["id"]: t for t in assistant_server.mc.list_tasks(db_path=self.db_path)}
+        self.assertEqual("done", tasks[task_id]["status"])
+
+    def test_starting_an_already_in_progress_task_via_chat_is_refused(self) -> None:
+        task_id = assistant_server.mc.add_task(
+            "ship stage AY v2", session_id="web", status="in_progress", db_path=self.db_path
+        )
+
+        with self._mock_context(), mock.patch("assistant_server.run_claude", return_value="ok"):
+            result = assistant_server.answer_message(
+                f"start task {task_id}", "web", db_path=self.db_path
+            )
+
+        self.assertIn("[start task failed:", result["answer"])
         tasks = {t["id"]: t for t in assistant_server.mc.list_tasks(db_path=self.db_path)}
         self.assertEqual("in_progress", tasks[task_id]["status"])
 

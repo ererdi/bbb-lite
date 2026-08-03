@@ -988,6 +988,38 @@ def add_task(
         return task_id
 
 
+def start_task(task_id: int, session_id: str | None = None, db_path: Path = DB_PATH) -> dict:
+    """Move a task from 'todo' to 'in_progress' (Stage AY).
+
+    The other half of the todo -> in_progress -> done loop that Stage AX's
+    "confirm task N with test: ..." chat command could complete but not
+    start. Raises ValueError if the task isn't currently 'todo' (including
+    already 'in_progress' or 'done') so a task can't be started twice or
+    restarted after completion. If session_id is given, records a 'started'
+    row in task_activity.
+    """
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"unknown task_id: {task_id}")
+        if row["status"] != "todo":
+            raise ValueError(
+                f"cannot start: task status is {row['status']!r}, expected 'todo'"
+            )
+        conn.execute(
+            "UPDATE tasks SET status = 'in_progress', updated_at = ? WHERE id = ?",
+            (_now(), task_id),
+        )
+        if session_id is not None:
+            conn.execute(
+                "INSERT INTO task_activity (task_id, session_id, activity, at) VALUES (?, ?, ?, ?)",
+                (task_id, session_id, "started", _now()),
+            )
+        conn.commit()
+    return {"ok": True, "task_id": task_id, "status": "in_progress"}
+
+
 def request_review(task_id: int, session_id: str, db_path: Path = DB_PATH) -> None:
     """Move a task from 'in_progress' to 'ready_for_review' (Stage AP).
 

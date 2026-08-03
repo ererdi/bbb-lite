@@ -323,3 +323,5 @@
 - 2026-07-30 - Stage AW: assistant_server.py'ye exists: ve projects komutları eklendi (ucuz, salt-okunur). Dispatch ve context-map bilerek chat'e bağlanmadı - dispatch her çağrıda gerçek token harcar, context-map görsel bir araç (Canvas'ın işi). Sunum planı: chat arayüzü (rol, görev, karar, hafıza, sağlık, exists, projects) + Canvas (context-map, session/task görselleştirme) birlikte, iki ayrı pencere olarak gösterilecek.
 
 - 2026-07-30 - Stage AX: decision: komutu artık memory'ye de yazıyor (aranabilir); yeni 'confirm task N with test:' komutu gerçek test-kanıtıyla complete_task'ı geçerli şekilde tamamlıyor. Eski 'complete task N' hâlâ guard-demo amaçlı kalıyor, kasıtlı olarak reddediyor.
+
+- 2026-07-30 - Stage AY: start_task() ve chat komutu 'start task N' eklendi - Stage AX'teki tam döngüyü (todo -> in_progress -> kanıtla tamamlama) artık tamamen chat üzerinden yapılabilir hale getiriyor.

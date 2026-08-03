@@ -158,6 +158,43 @@ class TaskCompletionGatingTestCase(unittest.TestCase):
         with self.assertRaises(ValueError):
             mc.request_review(task_id, "s1", db_path=self.db_path)
 
+    def test_start_task_moves_todo_to_in_progress(self) -> None:
+        task_id = mc.add_task("write tests", db_path=self.db_path)  # default "todo"
+        result = mc.start_task(task_id, session_id="s1", db_path=self.db_path)
+        self.assertEqual("in_progress", result["status"])
+        self.assertEqual("in_progress", mc.list_tasks(db_path=self.db_path)[0]["status"])
+
+    def test_start_task_records_started_activity_when_session_id_given(self) -> None:
+        task_id = mc.add_task("write tests", db_path=self.db_path)
+        mc.start_task(task_id, session_id="s1", db_path=self.db_path)
+        activity = [row["activity"] for row in mc.list_task_activity(db_path=self.db_path)]
+        self.assertIn("started", activity)
+
+    def test_start_task_refuses_already_in_progress(self) -> None:
+        task_id = mc.add_task("write tests", status="in_progress", db_path=self.db_path)
+        with self.assertRaises(ValueError) as ctx:
+            mc.start_task(task_id, session_id="s1", db_path=self.db_path)
+        self.assertIn("expected 'todo'", str(ctx.exception))
+        self.assertEqual("in_progress", mc.list_tasks(db_path=self.db_path)[0]["status"])
+
+    def test_start_task_refuses_already_done(self) -> None:
+        task_id = mc.add_task("write tests", status="in_progress", db_path=self.db_path)
+        evidence_id = _test_evidence_id(self.db_path)
+        mc.complete_task(
+            task_id,
+            session_id="s1",
+            evidence_id=evidence_id,
+            completion_summary="done",
+            db_path=self.db_path,
+        )
+        with self.assertRaises(ValueError):
+            mc.start_task(task_id, session_id="s1", db_path=self.db_path)
+
+    def test_start_task_without_session_id_does_not_record_activity(self) -> None:
+        task_id = mc.add_task("write tests", db_path=self.db_path)
+        mc.start_task(task_id, db_path=self.db_path)
+        self.assertEqual([], mc.list_task_activity(db_path=self.db_path))
+
     def test_restart_scenario_open_task_still_shows_up_after_new_session_start(self) -> None:
         """Mark a task in_progress, then simulate a restart (a fresh
         session_start-equivalent read via list_open_tasks) and prove the
