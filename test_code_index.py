@@ -206,6 +206,49 @@ class IndexDocsTestCase(unittest.TestCase):
         self.assertIn("plan.md", rows[0]["file_path"])
         self.assertEqual("Rollout Plan", rows[0]["title"])
 
+    def test_index_docs_skip_dirs_empty_list_also_indexes_memory_dir(self) -> None:
+        # memory/ is skipped by DEFAULT (bbb-lite's own memory_index
+        # convention) - but that default must be overridable for another
+        # project whose memory/ (if any) isn't memory_index's territory
+        # (see decisions.md, 2026-08-05, Stage BUS-2).
+        (self.root / "docs" / "plan.md").write_text(
+            "# Rollout Plan\n\nWe are rolling out the new widget pricing engine.\n",
+            encoding="utf-8",
+        )
+        (self.root / "memory" / "some-note.md").write_text(
+            "---\ntitle: A memory note\n---\n\nThis belongs to memory_index, not doc_index.\n",
+            encoding="utf-8",
+        )
+
+        count = mc.index_docs(root_dir=self.root, skip_dirs=[], db_path=self.db_path)
+
+        self.assertEqual(2, count)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            rows = conn.execute("SELECT file_path FROM doc_index").fetchall()
+        file_paths = {row["file_path"] for row in rows}
+        self.assertTrue(any("plan.md" in p for p in file_paths))
+        self.assertTrue(any("some-note.md" in p for p in file_paths))
+
+    def test_index_docs_skip_dirs_custom_value_replaces_default(self) -> None:
+        (self.root / "docs" / "plan.md").write_text(
+            "# Rollout Plan\n\nWe are rolling out the new widget pricing engine.\n",
+            encoding="utf-8",
+        )
+        (self.root / "memory" / "some-note.md").write_text(
+            "---\ntitle: A memory note\n---\n\nThis belongs to memory_index, not doc_index.\n",
+            encoding="utf-8",
+        )
+
+        # skip "docs" instead of the default "memory" - memory/ gets indexed,
+        # docs/ does not.
+        count = mc.index_docs(root_dir=self.root, skip_dirs=["docs"], db_path=self.db_path)
+
+        self.assertEqual(1, count)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            rows = conn.execute("SELECT file_path FROM doc_index").fetchall()
+        self.assertEqual(1, len(rows))
+        self.assertIn("some-note.md", rows[0]["file_path"])
+
     def test_search_docs_finds_semantically_close_query(self) -> None:
         (self.root / "docs" / "plan.md").write_text(
             "# Rollout Plan\n\nWe are rolling out the new widget pricing engine.\n",
@@ -267,6 +310,94 @@ class IndexDocsTestCase(unittest.TestCase):
 
         edges = mc.list_graph_edges("references", db_path=self.db_path)
         self.assertEqual(1, len(edges))
+
+
+class ExportSyncEdgesTestCase(unittest.TestCase):
+    """Stage BUS-2 prep: mc.export_sync_edges() reads our own calls/
+    references edges back out in Haroon's edges.jsonl shape, remapped to
+    their vocabulary (calls -> depends-on, references -> derived-from) -
+    see decisions.md, 2026-08-05."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        self.db_path = Path(tmp.name)
+        self.db_path.unlink()
+        mc.init_db(self.db_path)
+
+        self.project_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.project_dir.cleanup)
+        self.root = Path(self.project_dir.name)
+        (self.root / "docs").mkdir()
+        (self.root / "memory").mkdir()
+
+    def tearDown(self) -> None:
+        self.db_path.unlink(missing_ok=True)
+
+    def test_calls_edge_exported_as_depends_on(self) -> None:
+        (self.root / "widgets.py").write_text(
+            "def compute_widget_price(base_price, tax_rate):\n"
+            "    return round(base_price * (1 + tax_rate), 2)\n\n"
+            "def total_for_cart(base_price, tax_rate):\n"
+            "    return compute_widget_price(base_price, tax_rate)\n",
+            encoding="utf-8",
+        )
+        mc.index_symbols(root_dir=self.root, db_path=self.db_path)
+
+        exported = mc.export_sync_edges(project=self.root.name, db_path=self.db_path)
+
+        self.assertEqual(1, len(exported))
+        edge = exported[0]
+        self.assertEqual("depends-on", edge["type"])
+        self.assertIn("total_for_cart", edge["src"])
+        self.assertIn("compute_widget_price", edge["dst"])
+        self.assertEqual(self.root.name, edge["project_id"])
+        # forward-slashed regardless of the indexing machine's OS - Haroon's
+        # side is Linux.
+        self.assertNotIn("\\", edge["src"])
+
+    def test_references_edge_exported_as_derived_from(self) -> None:
+        (self.root / "widgets.py").write_text(
+            "def compute_widget_price(base_price, tax_rate):\n"
+            '    """Return base_price plus tax."""\n'
+            "    return round(base_price * (1 + tax_rate), 2)\n",
+            encoding="utf-8",
+        )
+        mc.index_symbols(root_dir=self.root, db_path=self.db_path)
+        (self.root / "docs" / "plan.md").write_text(
+            "# Plan\n\ncompute_widget_price handles pricing.\n",
+            encoding="utf-8",
+        )
+        mc.index_docs(root_dir=self.root, db_path=self.db_path)
+
+        exported = mc.export_sync_edges(project=self.root.name, db_path=self.db_path)
+
+        self.assertEqual(1, len(exported))
+        edge = exported[0]
+        self.assertEqual("derived-from", edge["type"])
+        self.assertIn("plan.md", edge["src"])
+        self.assertIn("compute_widget_price", edge["dst"])
+
+    def test_output_fields_match_haroons_load_edges_reader(self) -> None:
+        # lib/bbb_graph_edges.py's load_edges() reads exactly these keys
+        # (src, dst, type, evidence, weight, project_id/project) off each
+        # jsonl line - nothing more, nothing less should be required.
+        (self.root / "widgets.py").write_text(
+            "def a():\n    return b()\n\ndef b():\n    return 1\n",
+            encoding="utf-8",
+        )
+        mc.index_symbols(root_dir=self.root, db_path=self.db_path)
+        exported = mc.export_sync_edges(project=self.root.name, db_path=self.db_path)
+        self.assertEqual(1, len(exported))
+        self.assertEqual(
+            {"src", "dst", "type", "evidence", "weight", "project_id"},
+            set(exported[0].keys()),
+        )
+
+    def test_no_edges_means_no_export(self) -> None:
+        (self.root / "widgets.py").write_text("x = 1\n", encoding="utf-8")
+        mc.index_symbols(root_dir=self.root, db_path=self.db_path)
+        self.assertEqual([], mc.export_sync_edges(db_path=self.db_path))
 
 
 if __name__ == "__main__":

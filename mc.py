@@ -3754,15 +3754,19 @@ def index_docs(
     root_dir: str | Path | None = None,
     extensions: tuple[str, ...] = (".md",),
     *,
+    skip_dirs: Iterable[str] | None = None,
     db_path: Path = DB_PATH,
 ) -> int:
     """Index project docs (e.g. docs/*.md) into doc_index.
 
-    Deliberately skips memory/ - memory/*.md is already covered by
+    skip_dirs defaults to ("memory",) - memory/*.md is already covered by
     memory_index/index_memory_files() (Stage C onward); duplicating it here
     would just be two indexes of the same files (see decisions.md,
-    2026-07-29). Stage AN (1/3): only ".md" does anything for now, same
-    placeholder shape as index_symbols().
+    2026-07-29). That default is a bbb-lite convention, not a universal
+    rule: pass skip_dirs=[] (or a different set) when pointing this at
+    another project whose memory/ (if any) means something else - see
+    decisions.md, 2026-08-05, Stage BUS-2. Stage AN (1/3): only ".md" does
+    anything for now, same placeholder shape as index_symbols().
 
     Stage BUS-1: also derives "references" edges into graph_edges - if a
     doc's text mentions a name that symbol_index already knows about (run
@@ -3774,7 +3778,8 @@ def index_docs(
     """
 
     root = Path(root_dir) if root_dir is not None else Path(__file__).resolve().parent
-    memory_dir = (root / "memory").resolve()
+    skip_dir_names = ("memory",) if skip_dirs is None else tuple(skip_dirs)
+    skip_dir_paths = [(root / name).resolve() for name in skip_dir_names]
     project = root.name
     count = 0
     with contextlib.closing(_connect(db_path)) as conn:
@@ -3797,7 +3802,8 @@ def index_docs(
                 rel_path = path.relative_to(root)
                 if _is_excluded_index_path(rel_path):
                     continue
-                if path.resolve().is_relative_to(memory_dir):
+                resolved = path.resolve()
+                if any(resolved.is_relative_to(skip_dir) for skip_dir in skip_dir_paths):
                     continue
                 try:
                     title, content = _parse_doc_file(path)
@@ -3887,6 +3893,70 @@ def find_callers(
                 }
             )
     return callers
+
+
+_SYNC_EDGE_TYPE_MAP = {"calls": "depends-on", "references": "derived-from"}
+
+
+def _sync_edge_ref(node_type: str, title: str, source_ref: str | None) -> str:
+    """Human-readable node ref for the exported jsonl - NOT our internal
+    slugified graph_nodes.node_id, since Haroon's edges.jsonl has no node
+    table of its own (see decisions.md, 2026-08-05, Stage BUS-2 prep).
+
+    Forward-slashed regardless of the indexing machine's OS - Haroon's side
+    is Linux, and a ref that only matches on Windows would silently fail to
+    resolve there."""
+
+    ref = source_ref.replace("\\", "/") if source_ref else source_ref
+    if node_type == "doc":
+        return ref or title
+    return f"{ref}::{title}" if ref else title
+
+
+def export_sync_edges(
+    *, project: str | None = None, db_path: Path = DB_PATH
+) -> list[dict]:
+    """Read this project's own auto-derived "calls"/"references" edges
+    (Stage BUS-1, written by index_symbols()/index_docs()) back out in
+    Haroon's edges.jsonl shape - src/dst/type/evidence/weight/project_id,
+    with type remapped to their vocabulary (calls -> depends-on,
+    references -> derived-from; see decisions.md, 2026-08-05, Stage BUS-2,
+    for why).
+
+    Read-only: writes nothing anywhere. bin/bbb-graph-edge-builder.py is the
+    caller that actually serializes this to a .jsonl file. Scoped to
+    authority IN ('auto-call-analysis', 'auto-doc-reference') so this never
+    re-exports the human-curated context map (add_curated_edge()) or the
+    memory-graph's keyword/wikilink edges - only the two edge types this
+    exporter was built for.
+    """
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            """SELECT e.type, e.evidence, e.weight,
+                      sn.node_type AS src_type, sn.title AS src_title, sn.source_ref AS src_ref,
+                      dn.node_type AS dst_type, dn.title AS dst_title, dn.source_ref AS dst_ref
+               FROM graph_edges e
+               JOIN graph_nodes sn ON sn.node_id = e.src
+               JOIN graph_nodes dn ON dn.node_id = e.dst
+               WHERE e.type IN ('calls', 'references')
+                 AND e.authority IN ('auto-call-analysis', 'auto-doc-reference')
+               ORDER BY e.src, e.dst, e.type"""
+        ).fetchall()
+
+    exported = []
+    for row in rows:
+        edge = {
+            "src": _sync_edge_ref(row["src_type"], row["src_title"], row["src_ref"]),
+            "dst": _sync_edge_ref(row["dst_type"], row["dst_title"], row["dst_ref"]),
+            "type": _SYNC_EDGE_TYPE_MAP[row["type"]],
+            "evidence": row["evidence"],
+            "weight": row["weight"],
+        }
+        if project:
+            edge["project_id"] = project
+        exported.append(edge)
+    return exported
 
 
 def search_symbols(

@@ -12,7 +12,9 @@ traceback, and never propagate.
 from __future__ import annotations
 
 import io
+import json
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -21,6 +23,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent / "bin"))
 
 import bbb_graph_doc_upsert
+import bbb_graph_edge_builder
 import bbb_graph_ingest
 import cyg_exists
 import cyg_search
@@ -178,6 +181,95 @@ class BbbGraphDocUpsertCliTestCase(unittest.TestCase):
              mock.patch("bbb_graph_doc_upsert.mc.init_db"):
             output = _run(bbb_graph_doc_upsert, ["notes.txt"])
         self.assertIn("unsupported extension", output)
+
+
+class BbbGraphEdgeBuilderCliTestCase(unittest.TestCase):
+    """Stage BUS-2 prep: bin/bbb_graph_edge_builder.py drafts a
+    Haroon-format edges.jsonl from mc.export_sync_edges() - never writes
+    graph/edges.jsonl (that's this project's own curated edge source)."""
+
+    def test_writes_jsonl_lines_from_exported_edges(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "edges-draft-for-haroon.jsonl"
+            with mock.patch("bbb_graph_edge_builder.mc.init_db"), mock.patch(
+                "bbb_graph_edge_builder.mc.index_symbols", return_value=2
+            ), mock.patch("bbb_graph_edge_builder.mc.index_docs", return_value=1), mock.patch(
+                "bbb_graph_edge_builder.mc.export_sync_edges",
+                return_value=[
+                    {
+                        "src": "widgets.py::total_for_cart",
+                        "dst": "widgets.py::compute_widget_price",
+                        "type": "depends-on",
+                        "evidence": "total_for_cart calls compute_widget_price()",
+                        "weight": 1.0,
+                        "project_id": "bbb-lite",
+                    }
+                ],
+            ):
+                output = _run(
+                    bbb_graph_edge_builder,
+                    ["--root", tmp, "--out", str(out_path), "--db", str(Path(tmp) / "mc.db")],
+                )
+
+            self.assertIn("wrote 1 edge(s)", output)
+            lines = out_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(1, len(lines))
+            edge = json.loads(lines[0])
+            self.assertEqual("depends-on", edge["type"])
+            self.assertEqual("widgets.py::total_for_cart", edge["src"])
+
+    def test_default_output_path_is_not_the_curated_edges_file(self) -> None:
+        # graph/edges.jsonl is load_graph_edges()'s curated=True source -
+        # the drafted, uncurated calls/references batch must never land there.
+        self.assertNotEqual("edges.jsonl", bbb_graph_edge_builder.DEFAULT_OUTPUT.name)
+
+    def test_skip_dirs_flag_is_parsed_and_passed_through(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "edges-draft-for-haroon.jsonl"
+            with mock.patch("bbb_graph_edge_builder.mc.init_db"), mock.patch(
+                "bbb_graph_edge_builder.mc.index_symbols", return_value=0
+            ), mock.patch(
+                "bbb_graph_edge_builder.mc.index_docs", return_value=0
+            ) as index_docs_mock, mock.patch(
+                "bbb_graph_edge_builder.mc.export_sync_edges", return_value=[]
+            ):
+                _run(
+                    bbb_graph_edge_builder,
+                    [
+                        "--root", tmp,
+                        "--out", str(out_path),
+                        "--db", str(Path(tmp) / "mc.db"),
+                        "--skip-dirs", "memory,state",
+                    ],
+                )
+            index_docs_mock.assert_called_once()
+            self.assertEqual(
+                ["memory", "state"], index_docs_mock.call_args.kwargs["skip_dirs"]
+            )
+
+    def test_skip_dirs_empty_string_means_no_dirs_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "edges-draft-for-haroon.jsonl"
+            with mock.patch("bbb_graph_edge_builder.mc.init_db"), mock.patch(
+                "bbb_graph_edge_builder.mc.index_symbols", return_value=0
+            ), mock.patch(
+                "bbb_graph_edge_builder.mc.index_docs", return_value=0
+            ) as index_docs_mock, mock.patch(
+                "bbb_graph_edge_builder.mc.export_sync_edges", return_value=[]
+            ):
+                _run(
+                    bbb_graph_edge_builder,
+                    [
+                        "--root", tmp,
+                        "--out", str(out_path),
+                        "--db", str(Path(tmp) / "mc.db"),
+                        "--skip-dirs", "",
+                    ],
+                )
+            self.assertEqual([], index_docs_mock.call_args.kwargs["skip_dirs"])
+        self.assertEqual(
+            "edges-draft-for-haroon.jsonl", bbb_graph_edge_builder.DEFAULT_OUTPUT.name
+        )
 
 
 if __name__ == "__main__":
