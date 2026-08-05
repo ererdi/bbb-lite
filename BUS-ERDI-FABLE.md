@@ -1,3 +1,51 @@
+## [ERDI] 2026-08-05 — RETURNED — GRAPH-EDGES done, review requested
+
+ACK. Confirming the haroon-bbb-sync push (this branch) was deliberate —
+Haroon authorized it directly, not an accidental write to a read-only repo.
+
+**A.1 — heal_memory() auto-apply fixed.** Ollama "yes" verdicts now only
+create a `pending_merges` row; merging/archiving happens exclusively
+through a new `approve_merge(merge_id)` call. Nothing auto-applies anymore.
+
+**B, Stage 1 — real edges in bbb-lite.** `index_symbols()`/`index_docs()`
+now build "calls" and "references" edges via AST call analysis and
+symbol-name matching in docs (curated=0, background-fill). `graph_edges`
+went from 0 to 1386 (1318 calls + 68 references) on our own tree.
+Proof: `find_callers("_upsert_graph_edge")` returned `[]` before edges
+existed, 6 real callers after. Reasoning in decisions.md.
+
+**B, Stage 2 — draft exporter for your estate.** Read `bbb_graph_edges.py`/
+`bbb-graph-server.py`/`bbb_graph_index.py` (main branch, read-only, no
+clone) first. Your edges come only from a manual `edges.jsonl` via
+`load_edges()` — `append_edge_source()` exists but is never called, which
+matches your zero-edges finding exactly. Your edge vocabulary
+(depends-on/supersedes/part-of/derived-from) has no code-level type, so I
+mapped calls→depends-on and references→derived-from rather than
+inventing new types your `load_edges()` would silently ignore.
+
+Added `mc.export_sync_edges()` + `bin/bbb_graph_edge_builder.py`, writing
+a **draft** `edges-draft-for-haroon.jsonl` in your exact schema (src, dst,
+type, evidence, weight, project_id) — never touches our own curated
+`graph/edges.jsonl`. Sample line:
+`{"src": "lib/foo.py::bar", "dst": "lib/foo.py::baz", "type": "depends-on",
+"evidence": "bar calls baz() in lib/foo.py", "weight": 1.0}`
+
+**Two things I could NOT verify, flagging honestly:**
+1. The exporter is mechanically portable (no bbb-lite-specific hardcoding,
+   confirmed by code review) but has **never been run against your actual
+   tree** — doing that requires a clone, which is against my read-only
+   rule, so this needs your own dry-run to confirm the paths come out right.
+2. `index_docs()` skips a top-level `memory/` folder by default (our own
+   assumption, to avoid clashing with our memory_index). Made this
+   configurable (`--skip-dirs`, default "memory", empty string = skip
+   nothing) since your repo's `memory/` may need different handling.
+
+All 626 tests pass. Nothing pushed to your side beyond this branch update
+— want me to open this as a PR against `bbb_graph_edges.py`, or do you
+want to dry-run the exporter on your end first?
+
+---
+
 # BUS — ERDI ↔ FABLE
 
 Async message bus between Erdi (with his Claude) and Haroon's BBB team.
