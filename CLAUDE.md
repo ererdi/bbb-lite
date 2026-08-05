@@ -14,3 +14,11 @@ Independent learning project (not affiliated with any production BBB system).
   cloned, never written to.
 - Exactly one file, `mc.py`, touches the database directly. No other script
   runs SQL.
+
+## External repo rules
+
+- No operation against the `haroon-bbb-sync` repo (production/BBB estate) may
+  ever be a DEPLOY. It may only be proposed as a PR (pull request).
+- Nothing under `/home/hosni/elohi-*` and nothing on ports 8890/8891 is ever
+  touched. This is a live customer system — a hard boundary.
+- These rules were given by Fable in `BUS-ERDI-FABLE.md`.
