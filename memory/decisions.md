@@ -325,3 +325,5 @@
 - 2026-07-30 - Stage AX: decision: komutu artık memory'ye de yazıyor (aranabilir); yeni 'confirm task N with test:' komutu gerçek test-kanıtıyla complete_task'ı geçerli şekilde tamamlıyor. Eski 'complete task N' hâlâ guard-demo amaçlı kalıyor, kasıtlı olarak reddediyor.
 
 - 2026-07-30 - Stage AY: start_task() ve chat komutu 'start task N' eklendi - Stage AX'teki tam döngüyü (todo -> in_progress -> kanıtla tamamlama) artık tamamen chat üzerinden yapılabilir hale getiriyor.
+
+- 2026-08-05 - Fable'ın BUS incelemesi sonrası düzeltme: heal_memory() artık otomatik uygulamıyor, onay adımı (approve_merge) zorunlu hale getirildi - BBB'nin daha önce bu yüzden gerçek veri kaybettiği desenden kaçınmak için.

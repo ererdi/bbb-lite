@@ -800,6 +800,17 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 created_at TEXT NOT NULL
             )"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS pending_merges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_files TEXT NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                resolved_at TEXT
+            )"""
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS health_events_created ON health_events(created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS graph_edges_src ON graph_edges(src, type)")
         conn.execute("CREATE INDEX IF NOT EXISTS graph_edges_dst ON graph_edges(dst, type)")
@@ -4011,25 +4022,40 @@ def find_similar_lesson_groups(
 
 
 def heal_memory(db_path: Path = DB_PATH) -> dict:
-    """Auto-merge lesson files ask_ollama judges to be about the same fact.
+    """Find lesson files ask_ollama judges to be about the same fact and
+    queue them as pending merge proposals — never merges anything itself.
 
-    Mirrors haroon-bbb-sync's memory/_archived-healed/ pattern: merged-away
-    notes are moved there, never deleted (see decisions.md, 2026-07-27). Each
-    group is independent and fail-soft — an unavailable ollama or a "no"
-    verdict just leaves that group's files untouched; it doesn't stop the
-    rest of the sweep. Stage AS: merged-away rows aren't dropped from
-    memory_index either — mark_memory_replaced() flips each to
-    status='replaced' with replaced_by pointing at the new merged file, so
-    the merge leaves an audit trail instead of a silent gap.
+    Fable's BUS review (see decisions.md, 2026-08-05) found the previous
+    version applied the merge — rewriting, archiving, and marking rows
+    'replaced' — the moment Ollama said "yes", with no human check in
+    between. That's the exact pattern that cost BBB real data before. Now a
+    "yes" verdict only inserts a pending_merges row; the actual file
+    rewrite/archive/mark_memory_replaced work happens exclusively inside
+    approve_merge(), which must be called by hand for a specific proposal.
+    Each group is independent and fail-soft — an unavailable ollama or a
+    "no" verdict just leaves that group untouched, and a group already
+    queued (a 'pending' row for the same set of files) is skipped without
+    asking ollama again, so re-running this daily doesn't spam duplicate
+    proposals.
     """
 
-    memory_dir = Path(__file__).resolve().parent / "memory"
-    archived_dir = memory_dir / "_archived-healed"
-
     groups = find_similar_lesson_groups(db_path=db_path)
-    merged = 0
+    proposed = 0
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        already_pending = {
+            row["source_files"]
+            for row in conn.execute(
+                "SELECT source_files FROM pending_merges WHERE status = 'pending'"
+            ).fetchall()
+        }
 
     for group in groups:
+        source_files = sorted(item["source_file"] for item in group)
+        key = json.dumps(source_files)
+        if key in already_pending:
+            continue
+
         notes_text = "\n".join(f"- {item['title']}: {item['content']}" for item in group)
         verdict = ask_ollama(
             f"these notes:\n{notes_text}\n"
@@ -4040,31 +4066,80 @@ def heal_memory(db_path: Path = DB_PATH) -> dict:
 
         title = group[0]["title"]
         content = "\n\n".join(item["content"].strip() for item in group)
-        slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-") or "lesson"
-        date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        path = memory_dir / f"lesson-{date}-{slug}-healed.md"
-        suffix = 2
-        while path.exists():
-            path = memory_dir / f"lesson-{date}-{slug}-healed-{suffix}.md"
-            suffix += 1
-        path.write_text(
-            f"---\ntitle: {title}\ndate: {date}\nconfidence: medium\n---\n\n{content}\n",
-            encoding="utf-8",
+
+        with contextlib.closing(_connect(db_path)) as conn:
+            conn.execute(
+                """INSERT INTO pending_merges (source_files, title, content, status, created_at)
+                   VALUES (?, ?, ?, 'pending', ?)""",
+                (key, title, content, _now()),
+            )
+            conn.commit()
+        proposed += 1
+
+    return {"groups_found": len(groups), "merged": proposed}
+
+
+def approve_merge(merge_id: int, db_path: Path = DB_PATH) -> dict:
+    """Apply one pending_merges proposal: this is the only function that
+    actually writes a healed file, archives the old ones, and marks the old
+    memory_index rows 'replaced'.
+
+    heal_memory() only proposes — nothing changes on disk or in
+    memory_index for a group until approve_merge() is called by hand for
+    its specific merge_id. Mirrors haroon-bbb-sync's memory/_archived-healed/
+    pattern: merged-away notes are moved there, never deleted (see
+    decisions.md, 2026-07-27). Raises ValueError if merge_id doesn't exist
+    or isn't currently 'pending' (already approved, or unknown id).
+    """
+
+    memory_dir = Path(__file__).resolve().parent / "memory"
+    archived_dir = memory_dir / "_archived-healed"
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        row = conn.execute(
+            "SELECT * FROM pending_merges WHERE id = ?", (merge_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"no pending_merges row with id {merge_id}")
+        if row["status"] != "pending":
+            raise ValueError(
+                f"pending_merges row {merge_id} is not pending (status={row['status']!r})"
+            )
+        source_files = json.loads(row["source_files"])
+        title = row["title"]
+        content = row["content"]
+
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-") or "lesson"
+    date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    path = memory_dir / f"lesson-{date}-{slug}-healed.md"
+    suffix = 2
+    while path.exists():
+        path = memory_dir / f"lesson-{date}-{slug}-healed-{suffix}.md"
+        suffix += 1
+    path.write_text(
+        f"---\ntitle: {title}\ndate: {date}\nconfidence: medium\n---\n\n{content}\n",
+        encoding="utf-8",
+    )
+
+    for source_file in source_files:
+        mark_memory_replaced(source_file, path.name, db_path=db_path)
+
+    archived_dir.mkdir(exist_ok=True)
+    for source_file in source_files:
+        old_path = memory_dir / source_file
+        if old_path.exists():
+            old_path.rename(archived_dir / source_file)
+
+    index_memory_files(db_path)
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        conn.execute(
+            "UPDATE pending_merges SET status = 'approved', resolved_at = ? WHERE id = ?",
+            (_now(), merge_id),
         )
+        conn.commit()
 
-        for item in group:
-            mark_memory_replaced(item["source_file"], path.name, db_path=db_path)
-
-        archived_dir.mkdir(exist_ok=True)
-        for item in group:
-            old_path = memory_dir / item["source_file"]
-            if old_path.exists():
-                old_path.rename(archived_dir / item["source_file"])
-
-        index_memory_files(db_path)
-        merged += 1
-
-    return {"groups_found": len(groups), "merged": merged}
+    return {"merged": True, "healed_file": path.name}
 
 
 def retire_low_confidence_lessons(threshold: float = 0.3, db_path: Path = DB_PATH) -> int:

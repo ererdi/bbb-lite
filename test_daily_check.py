@@ -34,7 +34,7 @@ class DailyCheckTestCase(unittest.TestCase):
         classify_mock.assert_not_called()
         self.assertIn("[daily-check] swept 0 stale session(s)", output)
         self.assertIn("[daily-check] indexed 5 memory file(s)", output)
-        self.assertIn("[daily-check] healed 0 of 0 similar group(s)", output)
+        self.assertIn("[daily-check] proposed 0 of 0 similar group(s) for merge", output)
         self.assertIn("[daily-check] retired 0 low-confidence lesson(s)", output)
         self.assertIn("[daily-check] floor clean, no judge call needed", output)
         self.assertNotIn("judge verdict", output)
@@ -54,7 +54,7 @@ class DailyCheckTestCase(unittest.TestCase):
             output = self._run()
         classify_mock.assert_called_once()
         self.assertIn("[daily-check] finding: 4 sessions marked stale", output)
-        self.assertIn("[daily-check] healed 1 of 2 similar group(s)", output)
+        self.assertIn("[daily-check] proposed 1 of 2 similar group(s) for merge", output)
         self.assertIn("[daily-check] retired 1 low-confidence lesson(s)", output)
         self.assertIn("[daily-check] judge verdict: needs-attention", output)
 

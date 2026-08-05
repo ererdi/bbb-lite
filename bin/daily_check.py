@@ -32,8 +32,9 @@ def daily_check() -> None:
     try:
         heal_result = mc.heal_memory()
         print(
-            f"[daily-check] healed {heal_result['merged']} of "
-            f"{heal_result['groups_found']} similar group(s)"
+            f"[daily-check] proposed {heal_result['merged']} of "
+            f"{heal_result['groups_found']} similar group(s) for merge "
+            "(pending mc.approve_merge())"
         )
     except Exception:
         print("[daily-check] memory healing skipped (error)")

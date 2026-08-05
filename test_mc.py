@@ -47,7 +47,7 @@ class McTestCase(unittest.TestCase):
                 "decisions", "compact_snapshots", "documents",
                 "context_nodes", "context_edges",
                 "doc_index", "symbol_index",
-                "term_aliases", "health_events",
+                "term_aliases", "health_events", "pending_merges",
             },
             names,
         )
