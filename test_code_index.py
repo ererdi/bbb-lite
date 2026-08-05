@@ -105,6 +105,70 @@ class IndexSymbolsTestCase(unittest.TestCase):
         self.assertTrue(results)
         self.assertEqual("compute_widget_price", results[0]["symbol_name"])
 
+    def _write_caller_module(self) -> None:
+        (self.root / "checkout.py").write_text(
+            "from widgets import compute_widget_price\n\n"
+            "def total_for_cart(base_price, tax_rate):\n"
+            '    """Wraps compute_widget_price for a cart line."""\n'
+            "    return compute_widget_price(base_price, tax_rate)\n",
+            encoding="utf-8",
+        )
+
+    def test_index_symbols_writes_calls_edge_for_direct_call(self) -> None:
+        self._write_sample_module()
+        self._write_caller_module()
+        mc.index_symbols(root_dir=self.root, db_path=self.db_path)
+
+        edges = mc.list_graph_edges("calls", db_path=self.db_path)
+        self.assertEqual(1, len(edges))
+        edge = edges[0]
+        # node_ids are slugified ("_" -> "-") by _graph_node_id/_slug.
+        self.assertIn("total-for-cart", edge["src"])
+        self.assertIn("compute-widget-price", edge["dst"])
+        self.assertEqual(0, edge["curated"])
+
+    def test_index_symbols_skips_ambiguous_call_names(self) -> None:
+        # Two unrelated classes both define a "build" method - a call to
+        # "build" cannot be safely wired to either one project-wide.
+        (self.root / "a.py").write_text(
+            "class A:\n    def build(self):\n        return 1\n",
+            encoding="utf-8",
+        )
+        (self.root / "b.py").write_text(
+            "class B:\n    def build(self):\n        return 2\n",
+            encoding="utf-8",
+        )
+        (self.root / "caller.py").write_text(
+            "def run(thing):\n    return thing.build()\n",
+            encoding="utf-8",
+        )
+        mc.index_symbols(root_dir=self.root, db_path=self.db_path)
+        edges = mc.list_graph_edges("calls", db_path=self.db_path)
+        self.assertEqual(0, len(edges))
+
+    def test_index_symbols_calls_edges_are_idempotent(self) -> None:
+        self._write_sample_module()
+        self._write_caller_module()
+        mc.index_symbols(root_dir=self.root, db_path=self.db_path)
+        mc.index_symbols(root_dir=self.root, db_path=self.db_path)
+        edges = mc.list_graph_edges("calls", db_path=self.db_path)
+        self.assertEqual(1, len(edges))
+
+    def test_find_callers_returns_nothing_without_edges_but_finds_with_them(self) -> None:
+        self._write_sample_module()
+        self._write_caller_module()
+
+        # Before index_symbols() runs, symbol_index/graph_edges are empty -
+        # there is no data path from "compute_widget_price" to its callers.
+        before = mc.find_callers("compute_widget_price", db_path=self.db_path)
+        self.assertEqual([], before)
+
+        mc.index_symbols(root_dir=self.root, db_path=self.db_path)
+
+        after = mc.find_callers("compute_widget_price", db_path=self.db_path)
+        self.assertEqual(1, len(after))
+        self.assertEqual("total_for_cart", after[0]["symbol_name"])
+
 
 class IndexDocsTestCase(unittest.TestCase):
     def setUp(self) -> None:
@@ -151,6 +215,58 @@ class IndexDocsTestCase(unittest.TestCase):
         results = mc.search_docs("launching a pricing feature", db_path=self.db_path)
         self.assertTrue(results)
         self.assertIn("plan.md", results[0]["file_path"])
+
+    def _write_sample_module_and_symbols(self) -> None:
+        (self.root / "widgets.py").write_text(
+            "def compute_widget_price(base_price, tax_rate):\n"
+            '    """Return base_price plus tax."""\n'
+            "    return round(base_price * (1 + tax_rate), 2)\n",
+            encoding="utf-8",
+        )
+        mc.index_symbols(root_dir=self.root, db_path=self.db_path)
+
+    def test_index_docs_writes_references_edge_for_known_symbol(self) -> None:
+        self._write_sample_module_and_symbols()
+        (self.root / "docs" / "plan.md").write_text(
+            "# Rollout Plan\n\n"
+            "compute_widget_price is the single source of truth for pricing.\n",
+            encoding="utf-8",
+        )
+
+        mc.index_docs(root_dir=self.root, db_path=self.db_path)
+
+        edges = mc.list_graph_edges("references", db_path=self.db_path)
+        self.assertEqual(1, len(edges))
+        edge = edges[0]
+        # node_ids are slugified ("_"/"." -> "-", "/" -> "-") by _graph_node_id/_slug.
+        self.assertIn("plan-md", edge["src"])
+        self.assertIn("compute-widget-price", edge["dst"])
+        self.assertEqual(0, edge["curated"])
+
+    def test_index_docs_no_reference_edge_for_unmentioned_symbol(self) -> None:
+        self._write_sample_module_and_symbols()
+        (self.root / "docs" / "plan.md").write_text(
+            "# Rollout Plan\n\nThis text never names any indexed symbol.\n",
+            encoding="utf-8",
+        )
+
+        mc.index_docs(root_dir=self.root, db_path=self.db_path)
+
+        edges = mc.list_graph_edges("references", db_path=self.db_path)
+        self.assertEqual(0, len(edges))
+
+    def test_index_docs_references_edges_are_idempotent(self) -> None:
+        self._write_sample_module_and_symbols()
+        (self.root / "docs" / "plan.md").write_text(
+            "# Rollout Plan\n\ncompute_widget_price handles pricing.\n",
+            encoding="utf-8",
+        )
+
+        mc.index_docs(root_dir=self.root, db_path=self.db_path)
+        mc.index_docs(root_dir=self.root, db_path=self.db_path)
+
+        edges = mc.list_graph_edges("references", db_path=self.db_path)
+        self.assertEqual(1, len(edges))
 
 
 if __name__ == "__main__":

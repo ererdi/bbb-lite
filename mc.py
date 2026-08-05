@@ -3497,11 +3497,50 @@ def _is_excluded_index_path(path: Path) -> bool:
     )
 
 
+class _DirectCallVisitor(ast.NodeVisitor):
+    """Collects callee names for one function/class body, without descending
+    into a nested def/class - that nested symbol gets its own call list when
+    _extract_python_symbols() visits it separately (Stage BUS-1)."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def visit_Call(self, node: ast.Call) -> None:
+        func = node.func
+        if isinstance(func, ast.Name):
+            self.calls.append(func.id)
+        elif isinstance(func, ast.Attribute):
+            self.calls.append(func.attr)
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        return
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        return
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        return
+
+
+def _direct_calls(node: ast.AST) -> list[str]:
+    """Callee names (ast.Call func names/attrs) called directly inside
+    node's own body - see _DirectCallVisitor for the nested-def boundary."""
+
+    visitor = _DirectCallVisitor()
+    visitor.generic_visit(node)  # visits node's children, not node itself
+    return visitor.calls
+
+
 def _extract_python_symbols(tree: ast.AST) -> list[dict]:
     """Every function/class def in a parsed Python module, dotted-qualified by
     enclosing scope (e.g. "ClassName.method_name") so two classes in the same
     file can each have a method of the same name without colliding on
-    symbol_index's UNIQUE(file_path, symbol_name)."""
+    symbol_index's UNIQUE(file_path, symbol_name).
+
+    Each symbol also carries "calls": the callee names (ast.Call analysis,
+    Stage BUS-1) found directly in its body - index_symbols() resolves these
+    into "calls" graph_edges."""
 
     symbols: list[dict] = []
     scope_stack: list[str] = []
@@ -3514,6 +3553,7 @@ def _extract_python_symbols(tree: ast.AST) -> list[dict]:
                     "name": qualified_name,
                     "type": symbol_type,
                     "docstring": ast.get_docstring(node),
+                    "calls": _direct_calls(node),
                 }
             )
             scope_stack.append(node.name)
@@ -3551,26 +3591,74 @@ def index_symbols(
     this run - the same "last folder name" convention resolve_project() uses
     (Stage AG), since there is no other session/file -> project mapping in
     the schema.
+
+    Stage BUS-1: also derives "calls" edges into graph_edges from each
+    symbol's direct ast.Call names (see decisions.md, 2026-08-05, for why
+    "calls" and not "imports"). A call is only wired when its callee name
+    resolves to exactly one symbol project-wide - ambiguous names (e.g. a
+    common method name defined on several classes) are silently skipped
+    rather than risking a wrong edge. Written with a plain _upsert_graph_edge
+    (curated=0), not add_curated_edge() - that gate is for the human-curated
+    context map (Stage AC/Z), not background call-graph inference.
     """
 
     root = Path(root_dir) if root_dir is not None else Path(__file__).resolve().parent
     project = root.name
     count = 0
-    with contextlib.closing(_connect(db_path)) as conn:
-        for ext in extensions:
-            if ext != ".py":
+    files: list[tuple[str, list[dict]]] = []
+    for ext in extensions:
+        if ext != ".py":
+            continue
+        for path in sorted(root.rglob(f"*{ext}")):
+            if _is_excluded_index_path(path.relative_to(root)):
                 continue
-            for path in sorted(root.rglob(f"*{ext}")):
-                if _is_excluded_index_path(path.relative_to(root)):
-                    continue
-                try:
-                    tree = ast.parse(path.read_text(encoding="utf-8"))
-                except (SyntaxError, UnicodeDecodeError, OSError):
-                    continue
-                rel_path = str(path.relative_to(root))
-                for symbol in _extract_python_symbols(tree):
-                    _upsert_symbol_row(conn, rel_path, symbol, project)
-                    count += 1
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+            except (SyntaxError, UnicodeDecodeError, OSError):
+                continue
+            rel_path = str(path.relative_to(root))
+            files.append((rel_path, _extract_python_symbols(tree)))
+
+    # Project-wide name index built before any edges are written, so a call
+    # in file A can resolve to a symbol defined in file B.
+    name_index: dict[str, list[tuple[str, str]]] = {}
+    for rel_path, symbols in files:
+        for symbol in symbols:
+            simple_name = symbol["name"].rsplit(".", 1)[-1]
+            name_index.setdefault(simple_name, []).append((rel_path, symbol["name"]))
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        for rel_path, symbols in files:
+            for symbol in symbols:
+                _upsert_symbol_row(conn, rel_path, symbol, project)
+                count += 1
+                caller_id = _graph_node_id("symbol", f"{rel_path}:{symbol['name']}")
+                for called_name in symbol.get("calls", []):
+                    targets = name_index.get(called_name)
+                    if not targets or len(targets) != 1:
+                        continue
+                    callee_path, callee_name = targets[0]
+                    callee_id = _graph_node_id("symbol", f"{callee_path}:{callee_name}")
+                    _upsert_graph_node(
+                        conn, caller_id, "symbol", symbol["name"],
+                        source_ref=rel_path, metadata={"source": "symbol_index"},
+                    )
+                    _upsert_graph_node(
+                        conn, callee_id, "symbol", callee_name,
+                        source_ref=callee_path, metadata={"source": "symbol_index"},
+                    )
+                    _upsert_graph_edge(
+                        conn,
+                        caller_id,
+                        callee_id,
+                        "calls",
+                        evidence=f"{symbol['name']} calls {called_name}() in {rel_path}",
+                        source_ref=rel_path,
+                        authority="auto-call-analysis",
+                        currentness="current",
+                        confidence="inferred",
+                        curated=False,
+                    )
         conn.commit()
     return count
 
@@ -3675,6 +3763,14 @@ def index_docs(
     would just be two indexes of the same files (see decisions.md,
     2026-07-29). Stage AN (1/3): only ".md" does anything for now, same
     placeholder shape as index_symbols().
+
+    Stage BUS-1: also derives "references" edges into graph_edges - if a
+    doc's text mentions a name that symbol_index already knows about (run
+    index_symbols() first), a doc -> symbol edge is written (curated=0, see
+    decisions.md 2026-08-05). Unlike index_symbols()'s "calls" edges,
+    references does NOT require a unique name match: prose is inherently
+    fuzzy about which of several same-named methods it means, so every
+    matching symbol gets an edge rather than none.
     """
 
     root = Path(root_dir) if root_dir is not None else Path(__file__).resolve().parent
@@ -3682,6 +3778,18 @@ def index_docs(
     project = root.name
     count = 0
     with contextlib.closing(_connect(db_path)) as conn:
+        symbol_targets: dict[str, list[tuple[str, str]]] = {}
+        for row in conn.execute(
+            "SELECT DISTINCT file_path, symbol_name FROM symbol_index WHERE project = ?",
+            (project,),
+        ).fetchall():
+            simple_name = row["symbol_name"].rsplit(".", 1)[-1]
+            if len(simple_name) < 3:
+                continue  # too short/generic to mean anything found in prose
+            symbol_targets.setdefault(simple_name, []).append(
+                (row["file_path"], row["symbol_name"])
+            )
+
         for ext in extensions:
             if ext != ".md":
                 continue
@@ -3697,8 +3805,88 @@ def index_docs(
                     continue
                 _upsert_doc_row(conn, str(rel_path), title, content, project)
                 count += 1
+                doc_id = _graph_node_id("doc", str(rel_path))
+                for simple_name, targets in symbol_targets.items():
+                    if not re.search(rf"\b{re.escape(simple_name)}\b", content):
+                        continue
+                    _upsert_graph_node(
+                        conn, doc_id, "doc", title,
+                        source_ref=str(rel_path), metadata={"source": "doc_index"},
+                    )
+                    for target_path, target_name in targets:
+                        symbol_id = _graph_node_id("symbol", f"{target_path}:{target_name}")
+                        _upsert_graph_node(
+                            conn, symbol_id, "symbol", target_name,
+                            source_ref=target_path, metadata={"source": "symbol_index"},
+                        )
+                        _upsert_graph_edge(
+                            conn,
+                            doc_id,
+                            symbol_id,
+                            "references",
+                            evidence=f"'{simple_name}' mentioned in {rel_path}",
+                            source_ref=str(rel_path),
+                            authority="auto-doc-reference",
+                            currentness="current",
+                            confidence="inferred",
+                            curated=False,
+                        )
         conn.commit()
     return count
+
+
+def find_callers(
+    symbol_name: str, *, file_path: str | None = None, db_path: Path = DB_PATH
+) -> list[dict]:
+    """Everything that calls symbol_name, via the "calls" edges index_symbols()
+    writes (Stage BUS-1). Answers "what calls X" using graph_edges + the
+    generic traverse_graph() (direction="in") - no bespoke traversal logic.
+
+    Matches graph_nodes.title (the symbol's dotted-qualified name, e.g. plain
+    "helper" or "ClassName.method"); file_path narrows to one file when the
+    same name exists in more than one place.
+    """
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        if file_path is None:
+            rows = conn.execute(
+                "SELECT node_id FROM graph_nodes WHERE node_type = 'symbol' AND title = ?",
+                (symbol_name,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT node_id FROM graph_nodes WHERE node_type = 'symbol' "
+                "AND title = ? AND source_ref = ?",
+                (symbol_name, file_path),
+            ).fetchall()
+        target_ids = [row["node_id"] for row in rows]
+
+    hits: list[dict] = []
+    seen: set[str] = set()
+    for target_id in target_ids:
+        for hit in traverse_graph(
+            target_id, edge_types=["calls"], direction="in", hops=1, db_path=db_path
+        ):
+            if hit["node"] not in seen:
+                seen.add(hit["node"])
+                hits.append(hit)
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        callers = []
+        for hit in hits:
+            node_row = conn.execute(
+                "SELECT title, source_ref FROM graph_nodes WHERE node_id = ?",
+                (hit["node"],),
+            ).fetchone()
+            callers.append(
+                {
+                    "symbol_name": node_row["title"] if node_row else hit["node"],
+                    "file_path": node_row["source_ref"] if node_row else None,
+                    "node_id": hit["node"],
+                    "evidence": hit["evidence"],
+                }
+            )
+    return callers
 
 
 def search_symbols(
