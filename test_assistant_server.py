@@ -674,6 +674,118 @@ class ExistsCommandTestCase(unittest.TestCase):
             "add_task helper", db_path=assistant_server.mc.DB_PATH
         )
 
+    def test_callers_query_extracted_from_prefix(self) -> None:
+        self.assertEqual(
+            "add_task", assistant_server._callers_query("callers: add_task")
+        )
+
+    def test_callers_query_none_without_prefix(self) -> None:
+        self.assertIsNone(assistant_server._callers_query("who calls add_task"))
+
+    def test_callers_command_calls_find_callers_without_calling_claude(self) -> None:
+        with self._mock_context(), \
+            mock.patch("assistant_server.run_claude") as claude, \
+            mock.patch(
+                "assistant_server.mc.find_callers",
+                return_value=[
+                    {
+                        "symbol_name": "start_task",
+                        "file_path": "mc.py",
+                        "node_id": "symbol:mc-py-start-task",
+                        "evidence": "start_task calls add_task() in mc.py",
+                    },
+                ],
+            ) as find_callers, \
+            mock.patch("assistant_server.mc.write_checkpoint"), \
+            mock.patch("assistant_server.mc.record_turn"), \
+            mock.patch("assistant_server.mc.record_event"), \
+            mock.patch("assistant_server.mc.record_answer_quality", return_value=1), \
+            mock.patch("assistant_server.mc.record_evidence", return_value=1), \
+            mock.patch("assistant_server.mc.record_answer_receipt", return_value=3):
+            result = assistant_server.answer_message("callers: add_task", "web")
+
+        claude.assert_not_called()
+        self.assertEqual("callers-command", result["engine"])
+        self.assertIn("callers of 'add_task' (1):", result["answer"])
+        self.assertIn("start_task (mc.py)", result["answer"])
+        find_callers.assert_called_once_with("add_task", db_path=assistant_server.mc.DB_PATH)
+
+    def test_callers_command_reports_none_found(self) -> None:
+        with self._mock_context(), \
+            mock.patch("assistant_server.run_claude") as claude, \
+            mock.patch("assistant_server.mc.find_callers", return_value=[]), \
+            mock.patch("assistant_server.mc.write_checkpoint"), \
+            mock.patch("assistant_server.mc.record_turn"), \
+            mock.patch("assistant_server.mc.record_event"), \
+            mock.patch("assistant_server.mc.record_answer_quality", return_value=1), \
+            mock.patch("assistant_server.mc.record_evidence", return_value=1), \
+            mock.patch("assistant_server.mc.record_answer_receipt", return_value=3):
+            result = assistant_server.answer_message("callers: nobody_calls_this", "web")
+
+        claude.assert_not_called()
+        self.assertIn("none found", result["answer"])
+
+    def test_depends_query_extracted_from_prefix(self) -> None:
+        self.assertEqual(
+            "bbb-lite-assistant", assistant_server._depends_query("depends: bbb-lite-assistant")
+        )
+
+    def test_depends_query_none_without_prefix(self) -> None:
+        self.assertIsNone(assistant_server._depends_query("what does this depend on"))
+
+    def test_depends_command_calls_graph_depends_on_without_calling_claude(self) -> None:
+        with self._mock_context(), \
+            mock.patch("assistant_server.run_claude") as claude, \
+            mock.patch(
+                "assistant_server.mc.graph_depends_on",
+                return_value=[
+                    {
+                        "node": "mission-control",
+                        "type": "depends-on",
+                        "hop": 1,
+                        "evidence": "tasks.status='done' is guarded...",
+                        "weight": 1.0,
+                        "source_ref": "edges.jsonl",
+                        "authority": "trusted-typed",
+                        "updated_at": "2026-07-26T00:00:00",
+                        "currentness": "current",
+                        "confidence": "verified",
+                        "curated": True,
+                        "via": "bbb-lite-assistant",
+                    },
+                ],
+            ) as graph_depends_on, \
+            mock.patch("assistant_server.mc.write_checkpoint"), \
+            mock.patch("assistant_server.mc.record_turn"), \
+            mock.patch("assistant_server.mc.record_event"), \
+            mock.patch("assistant_server.mc.record_answer_quality", return_value=1), \
+            mock.patch("assistant_server.mc.record_evidence", return_value=1), \
+            mock.patch("assistant_server.mc.record_answer_receipt", return_value=3):
+            result = assistant_server.answer_message("depends: bbb-lite-assistant", "web")
+
+        claude.assert_not_called()
+        self.assertEqual("depends-command", result["engine"])
+        self.assertIn("'bbb-lite-assistant' depends on (1):", result["answer"])
+        self.assertIn("mission-control (depends-on, hop=1)", result["answer"])
+        graph_depends_on.assert_called_once_with(
+            "bbb-lite-assistant", db_path=assistant_server.mc.DB_PATH
+        )
+
+    def test_depends_command_reports_none_found(self) -> None:
+        with self._mock_context(), \
+            mock.patch("assistant_server.run_claude") as claude, \
+            mock.patch("assistant_server.mc.graph_depends_on", return_value=[]), \
+            mock.patch("assistant_server.mc.write_checkpoint"), \
+            mock.patch("assistant_server.mc.record_turn"), \
+            mock.patch("assistant_server.mc.record_event"), \
+            mock.patch("assistant_server.mc.record_answer_quality", return_value=1), \
+            mock.patch("assistant_server.mc.record_evidence", return_value=1), \
+            mock.patch("assistant_server.mc.record_answer_receipt", return_value=3):
+            result = assistant_server.answer_message("depends: nothing-declared", "web")
+
+        claude.assert_not_called()
+        self.assertIn("none found", result["answer"])
+
 
 class ProjectsCommandTestCase(unittest.TestCase):
     def _mock_context(self):

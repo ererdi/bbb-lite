@@ -85,6 +85,14 @@ _STATUS_COMMAND_WORDS = {"status", "durum"}
 _EXISTS_RE = re.compile(r"^(?:exists|var\s*m[ıi])\s*[:=-]\s*(?P<query>.+)$", re.I | re.S)
 _PROJECTS_COMMAND_WORDS = {"projects", "projeler"}
 
+# "callers: <symbol>" -> mc.find_callers() ("calls" edges from index_symbols()).
+# "depends: <node>" -> mc.graph_depends_on() (curated "depends-on" edges from
+# graph/edges.jsonl) - a different, hand-curated graph, not the auto-detected
+# call graph, so the two commands can legitimately return "none" for the same
+# name if it's only known to one of the two edge sets.
+_CALLERS_RE = re.compile(r"^callers\s*[:=-]\s*(?P<query>.+)$", re.I | re.S)
+_DEPENDS_RE = re.compile(r"^depends\s*[:=-]\s*(?P<query>.+)$", re.I | re.S)
+
 # Stage AX: "confirm task N with test: ..." - a real test-evidence completion
 # path, distinct from the intentionally-guard-rejected "complete task N".
 _CONFIRM_TASK_TEST_RE = re.compile(
@@ -197,6 +205,26 @@ def _exists_query(message: str) -> str | None:
 
 def _is_projects_command(message: str) -> bool:
     return message.strip().lower() in _PROJECTS_COMMAND_WORDS
+
+
+def _callers_query(message: str) -> str | None:
+    """Extract the symbol name from an explicit 'callers: ...' message."""
+
+    match = _CALLERS_RE.match(message.strip())
+    if not match:
+        return None
+    query = _clip(match.group("query"), 300)
+    return query or None
+
+
+def _depends_query(message: str) -> str | None:
+    """Extract the node name from an explicit 'depends: ...' message."""
+
+    match = _DEPENDS_RE.match(message.strip())
+    if not match:
+        return None
+    query = _clip(match.group("query"), 300)
+    return query or None
 
 
 def _confirm_task_with_test_match(message: str) -> tuple[int, str] | None:
@@ -531,6 +559,40 @@ def _exists_report(query: str, *, db_path: Path) -> str:
     return f"exists: {exists} (score: {score_text}){match_line}"
 
 
+def _callers_report(symbol_name: str, *, db_path: Path) -> str:
+    """Answer for the 'callers: <symbol>' command.
+
+    mc.find_callers() walks the "calls" edges index_symbols() derives from
+    real ast.Call detection - answers "what calls X" against the code as
+    actually indexed, not a guess.
+    """
+
+    callers = _safe_call([], mc.find_callers, symbol_name, db_path=db_path)
+    if not callers:
+        return f"callers of '{symbol_name}': none found (not indexed, or nothing calls it)"
+    lines = "\n".join(
+        f"- {c.get('symbol_name')} ({c.get('file_path')})" for c in callers
+    )
+    return f"callers of '{symbol_name}' ({len(callers)}):\n{lines}"
+
+
+def _depends_report(node: str, *, db_path: Path) -> str:
+    """Answer for the 'depends: <node>' command.
+
+    mc.graph_depends_on() walks the curated "depends-on" edges loaded from
+    graph/edges.jsonl (mc.load_graph_edges()) - a hand-curated component
+    graph, distinct from the auto-detected "calls" edges 'callers:' reads.
+    """
+
+    deps = _safe_call([], mc.graph_depends_on, node, db_path=db_path)
+    if not deps:
+        return f"'{node}' depends on: none found (not in the curated dependency graph)"
+    lines = "\n".join(
+        f"- {d.get('node')} ({d.get('type')}, hop={d.get('hop')})" for d in deps
+    )
+    return f"'{node}' depends on ({len(deps)}):\n{lines}"
+
+
 def _projects_report(*, db_path: Path) -> str:
     """Answer for the 'projects' / 'projeler' command (Stage AW) - read-only."""
 
@@ -653,12 +715,20 @@ def answer_message(message: str, session_id: str = DEFAULT_SESSION_ID, *, db_pat
         db_path=db_path,
     )
     exists_query = _exists_query(message)
+    callers_query = _callers_query(message)
+    depends_query = _depends_query(message)
     if _is_status_command(message):
         answer = _status_report(context, session_id=session_id, db_path=db_path)
         engine = "status-command"
     elif exists_query:
         answer = _exists_report(exists_query, db_path=db_path)
         engine = "exists-command"
+    elif callers_query:
+        answer = _callers_report(callers_query, db_path=db_path)
+        engine = "callers-command"
+    elif depends_query:
+        answer = _depends_report(depends_query, db_path=db_path)
+        engine = "depends-command"
     elif _is_projects_command(message):
         answer = _projects_report(db_path=db_path)
         engine = "projects-command"
