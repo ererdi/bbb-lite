@@ -405,6 +405,28 @@ class TaskCommandParsingTestCase(unittest.TestCase):
     def test_no_start_task_pattern_returns_none(self) -> None:
         self.assertIsNone(assistant_server._task_start_id("what is task 4 about?"))
 
+    def test_remind_prefix_extracts_payload(self) -> None:
+        self.assertEqual(
+            "call Muayyad | 2026-08-10 | Erdi, Haroon",
+            assistant_server._remind_payload("remind: call Muayyad | 2026-08-10 | Erdi, Haroon"),
+        )
+
+    def test_no_remind_prefix_returns_none(self) -> None:
+        self.assertIsNone(assistant_server._remind_payload("just chatting about reminders"))
+
+    def test_parse_remind_payload_splits_and_trims(self) -> None:
+        description, due_date, people = assistant_server._parse_remind_payload(
+            " call Muayyad  | 2026-08-10 |  Erdi ,  Haroon "
+        )
+        self.assertEqual("call Muayyad", description)
+        self.assertEqual("2026-08-10", due_date)
+        self.assertEqual(["Erdi", "Haroon"], people)
+
+    def test_parse_remind_payload_bad_date_raises_value_error(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            assistant_server._parse_remind_payload("call Muayyad | next-tuesday | Erdi")
+        self.assertIn("next-tuesday", str(ctx.exception))
+
 
 class TaskCommandExecutionTestCase(unittest.TestCase):
     """Stage AV: task: / complete task N must call real mc.py functions, not just
@@ -543,6 +565,52 @@ class TaskCommandExecutionTestCase(unittest.TestCase):
             db_path=assistant_server.mc.DB_PATH,
         )
         self.assertIn("[task 4 completed via test evidence id=777]", result["answer"])
+
+    def test_remind_command_calls_mc_create_reminder(self) -> None:
+        patches = self._common_patches()
+        create_result = {
+            "task_id": 9,
+            "due_date": "2026-08-10",
+            "people": {
+                "Erdi": {"node_id": "person:erdi", "name": "Erdi", "created": False},
+                "Haroon": {"node_id": "person:haroon", "name": "Haroon", "created": True},
+            },
+        }
+        with self._mock_context(), \
+            mock.patch("assistant_server.mc.record_evidence", return_value=2), \
+            mock.patch(
+                "assistant_server.mc.create_reminder", return_value=create_result
+            ) as create_reminder, \
+            contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            result = assistant_server.answer_message(
+                "remind: call Muayyad | 2026-08-10 | Erdi, Haroon", "web"
+            )
+
+        create_reminder.assert_called_once_with(
+            "call Muayyad", "2026-08-10", ["Erdi", "Haroon"],
+            session_id="web", db_path=assistant_server.mc.DB_PATH,
+        )
+        self.assertIn("[reminder added, task id=9]", result["answer"])
+        self.assertIn("Erdi (existing)", result["answer"])
+        self.assertIn("Haroon (new)", result["answer"])
+
+    def test_remind_command_bad_date_shows_clean_error_not_crash(self) -> None:
+        patches = self._common_patches()
+        with self._mock_context(), \
+            mock.patch("assistant_server.mc.record_evidence", return_value=2), \
+            mock.patch("assistant_server.mc.create_reminder") as create_reminder, \
+            contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            result = assistant_server.answer_message(
+                "remind: call Muayyad | next-tuesday | Erdi", "web"
+            )
+
+        create_reminder.assert_not_called()
+        self.assertIn("[remind failed:", result["answer"])
+        self.assertIn("next-tuesday", result["answer"])
 
     def test_footer_appears_on_every_answer(self) -> None:
         patches = self._common_patches()

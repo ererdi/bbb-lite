@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import uuid
+from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -106,6 +107,10 @@ _CONFIRM_TASK_TEST_RE = re.compile(
 _TASK_START_EN_RE = re.compile(r"\bstart\s+task\s+(?P<id>\d+)\b", re.I)
 _TASK_START_TR_RE = re.compile(r"\bi[şs]e\s+ba[şs]la\s+(?P<id>\d+)\b", re.I)
 
+# Stage AZ: "remind: <description> | <YYYY-MM-DD> | <name1, name2, ...>" - a
+# dated reminder wired to person graph nodes, alongside task:/decision:.
+_REMIND_RE = re.compile(r"\bremind\s*[:=-]\s*(?P<rest>.+)", re.I | re.S)
+
 
 def _json_safe(value):
     if isinstance(value, dict):
@@ -187,6 +192,42 @@ def _task_start_id(message: str) -> int | None:
 
     match = _TASK_START_EN_RE.search(message) or _TASK_START_TR_RE.search(message)
     return int(match.group("id")) if match else None
+
+
+def _remind_payload(message: str) -> str | None:
+    """Extract the raw '<desc> | <date> | <people>' text from 'remind: ...'."""
+
+    match = _REMIND_RE.search(message)
+    if not match:
+        return None
+    rest = match.group("rest").strip()
+    return rest or None
+
+
+def _parse_remind_payload(rest: str) -> tuple[str, str, list[str]]:
+    """Split a remind payload into (description, due_date, people).
+
+    Raises ValueError with a message safe to show the user directly - the
+    chat handler shows it verbatim instead of a traceback, same as the
+    complete-task guard failures already do.
+    """
+
+    parts = [part.strip() for part in rest.split("|")]
+    if len(parts) != 3:
+        raise ValueError(
+            "expected 'remind: <description> | <YYYY-MM-DD> | <name1, name2, ...>'"
+        )
+    description, due_date, people_raw = parts
+    if not description:
+        raise ValueError("reminder description is empty")
+    try:
+        date.fromisoformat(due_date)
+    except ValueError:
+        raise ValueError(f"could not parse date '{due_date}', expected YYYY-MM-DD") from None
+    people = [name.strip() for name in people_raw.split(",") if name.strip()]
+    if not people:
+        raise ValueError("remind needs at least one person name")
+    return description, due_date, people
 
 
 def _is_status_command(message: str) -> bool:
@@ -671,12 +712,42 @@ def _start_task_via_chat(task_id: int, session_id: str, *, db_path: Path) -> str
     return f"[task {result['task_id']} started]"
 
 
+def _remind_via_chat(rest: str, session_id: str, *, db_path: Path) -> str:
+    """Real mc.create_reminder() call from chat (Stage AZ): 'remind: ...'.
+
+    A malformed payload or unparseable date is shown to the user verbatim
+    (via _parse_remind_payload's ValueError), same as the other task-command
+    guard failures - never a bare traceback.
+    """
+
+    try:
+        description, due_date, people = _parse_remind_payload(rest)
+    except ValueError as exc:
+        return f"[remind failed: {exc}]"
+
+    try:
+        result = mc.create_reminder(description, due_date, people, session_id=session_id, db_path=db_path)
+    except Exception as exc:
+        return f"[remind failed: {exc}]"
+
+    people_summary = ", ".join(
+        f"{name} ({'new' if info.get('created') else 'existing'})"
+        for name, info in result.get("people", {}).items()
+    )
+    return f"[reminder added, task id={result['task_id']}] {people_summary}"
+
+
 def _handle_task_commands(message: str, session_id: str, *, db_path: Path) -> str | None:
-    """Real task add/complete side effects for the chat surface (Stage AV/AX).
+    """Real task add/complete/remind side effects for the chat surface
+    (Stage AV/AX/AZ).
 
     Returns a confirmation/error line to append to the answer, or None if the
     message triggered no task command.
     """
+
+    remind_payload = _remind_payload(message)
+    if remind_payload is not None:
+        return _remind_via_chat(remind_payload, session_id, db_path=db_path)
 
     confirm_match = _confirm_task_with_test_match(message)
     if confirm_match:
