@@ -1994,5 +1994,105 @@ class StageAQDbHealthCheckTestCase(McTestCase):
         )
 
 
+class RemindersTestCase(McTestCase):
+    """Dated reminders (Stage BUS): tasks.due_date + person-node dedup +
+    'involves' edges — the real version of Haroon's Muayyad meeting example."""
+
+    def test_get_or_create_person_node_dedups_same_name(self) -> None:
+        first = mc.get_or_create_person_node("Haroon", db_path=self.db_path)
+        second = mc.get_or_create_person_node("Haroon", db_path=self.db_path)
+        self.assertTrue(first["created"])
+        self.assertFalse(second["created"])
+        self.assertEqual(first["node_id"], second["node_id"])
+
+    def test_get_or_create_person_node_dedups_case_and_whitespace(self) -> None:
+        first = mc.get_or_create_person_node("Haroon", db_path=self.db_path)
+        second = mc.get_or_create_person_node(" haroon ", db_path=self.db_path)
+        self.assertFalse(second["created"])
+        self.assertEqual(first["node_id"], second["node_id"])
+
+    def test_get_or_create_person_node_new_name_is_created(self) -> None:
+        result = mc.get_or_create_person_node("Muayyad", db_path=self.db_path)
+        self.assertTrue(result["created"])
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT node_type, title FROM graph_nodes WHERE node_id = ?",
+                (result["node_id"],),
+            ).fetchone()
+        self.assertEqual("person", row["node_type"])
+        self.assertEqual("Muayyad", row["title"])
+
+    def test_create_reminder_sets_due_date_on_task(self) -> None:
+        result = mc.create_reminder(
+            "follow up with Muayyad", "2026-08-10", ["Muayyad"], db_path=self.db_path
+        )
+        task = next(t for t in mc.list_tasks(db_path=self.db_path) if t["id"] == result["task_id"])
+        self.assertEqual("2026-08-10", task["due_date"])
+
+    def test_create_reminder_erdi_exists_haroon_is_new(self) -> None:
+        mc.get_or_create_person_node("Erdi", db_path=self.db_path)
+        result = mc.create_reminder(
+            "sync with Erdi and Haroon", "2026-08-10", ["Erdi", "Haroon"], db_path=self.db_path,
+        )
+        self.assertFalse(result["people"]["Erdi"]["created"])
+        self.assertTrue(result["people"]["Haroon"]["created"])
+
+    def test_create_reminder_adds_involves_edge_per_person(self) -> None:
+        result = mc.create_reminder("plan trip", "2026-08-10", ["Erdi"], db_path=self.db_path)
+        task_node_id = mc._graph_node_id("task", str(result["task_id"]))
+        person_node_id = result["people"]["Erdi"]["node_id"]
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT type FROM graph_edges WHERE src = ? AND dst = ?",
+                (task_node_id, person_node_id),
+            ).fetchone()
+        self.assertEqual("involves", row["type"])
+
+    def test_create_reminder_does_not_duplicate_person_across_reminders(self) -> None:
+        first = mc.create_reminder("reminder one", "2026-08-10", ["Muayyad"], db_path=self.db_path)
+        second = mc.create_reminder("reminder two", "2026-08-11", ["Muayyad"], db_path=self.db_path)
+        self.assertTrue(first["people"]["Muayyad"]["created"])
+        self.assertFalse(second["people"]["Muayyad"]["created"])
+        self.assertEqual(
+            first["people"]["Muayyad"]["node_id"], second["people"]["Muayyad"]["node_id"],
+        )
+
+    def test_list_upcoming_reminders_within_window(self) -> None:
+        today = datetime.now(timezone.utc).date()
+        mc.create_reminder(
+            "due soon", (today + timedelta(days=2)).isoformat(), [], db_path=self.db_path
+        )
+        mc.create_reminder(
+            "due later", (today + timedelta(days=30)).isoformat(), [], db_path=self.db_path
+        )
+        mc.add_task("no due date", db_path=self.db_path)
+        titles = {
+            t["title"] for t in mc.list_upcoming_reminders(within_days=7, db_path=self.db_path)
+        }
+        self.assertEqual({"due soon"}, titles)
+
+    def test_list_upcoming_reminders_excludes_overdue_and_done(self) -> None:
+        today = datetime.now(timezone.utc).date()
+        mc.create_reminder(
+            "overdue", (today - timedelta(days=1)).isoformat(), [], db_path=self.db_path
+        )
+        done = mc.create_reminder(
+            "already done", (today + timedelta(days=1)).isoformat(), [], db_path=self.db_path
+        )
+        mc.start_task(done["task_id"], db_path=self.db_path)
+        evidence_id = _passing_evidence_id(self.db_path)
+        mc.complete_task(
+            done["task_id"],
+            session_id="s1",
+            evidence_id=evidence_id,
+            completion_summary="handled",
+            db_path=self.db_path,
+        )
+        titles = {
+            t["title"] for t in mc.list_upcoming_reminders(within_days=7, db_path=self.db_path)
+        }
+        self.assertEqual(set(), titles)
+
+
 if __name__ == "__main__":
     unittest.main()

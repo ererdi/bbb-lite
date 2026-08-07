@@ -490,6 +490,8 @@ def init_db(db_path: Path = DB_PATH) -> None:
             conn.execute("ALTER TABLE tasks ADD COLUMN sprint_id INTEGER")
         if "parent_task_id" not in existing_task_columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN parent_task_id INTEGER")
+        if "due_date" not in existing_task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN due_date TEXT")
         conn.execute(
             """CREATE TABLE IF NOT EXISTS memory_index (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -969,6 +971,7 @@ def add_task(
     *,
     sprint_id: int | None = None,
     parent_task_id: int | None = None,
+    due_date: str | None = None,
     session_id: str | None = None,
     db_path: Path = DB_PATH,
 ) -> int:
@@ -978,16 +981,18 @@ def add_task(
     tasks created before Stage L's projects/sprints hierarchy existed).
     parent_task_id is optional (Stage AP) — set it to make this task a
     subtask; complete_task() refuses to close a parent while any of its
-    subtasks are still open. If session_id is given, records a 'created' row
-    in task_activity so tasks_touched_by_session() can later find it.
+    subtasks are still open. due_date is an optional "YYYY-MM-DD" string
+    (Stage BUS reminder work) — nullable, no format enforcement here.
+    If session_id is given, records a 'created' row in task_activity so
+    tasks_touched_by_session() can later find it.
     """
 
     with contextlib.closing(_connect(db_path)) as conn:
         cur = conn.execute(
             """INSERT INTO tasks
-                   (title, status, created_at, updated_at, sprint_id, parent_task_id)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (title, status, _now(), _now(), sprint_id, parent_task_id),
+                   (title, status, created_at, updated_at, sprint_id, parent_task_id, due_date)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (title, status, _now(), _now(), sprint_id, parent_task_id, due_date),
         )
         task_id = cur.lastrowid
         if session_id is not None:
@@ -4501,6 +4506,104 @@ def add_curated_edge(
             requires_dual_approval=True,
         )
         conn.commit()
+
+
+def get_or_create_person_node(name: str, db_path: Path = DB_PATH) -> dict:
+    """Find-or-create a node_type='person' graph node for `name`.
+
+    Dedup is via _graph_node_id("person", name) — the same lowercased,
+    non-alnum-collapsed slug _upsert_graph_node()/index_symbols() already use
+    for "symbol"/"doc" nodes, so "Haroon" and "haroon" resolve to the same
+    node_id ("person:haroon") without a separate normalization step. Written
+    with a plain _upsert_graph_node (curated=0), not propose_node()/
+    approve_node() — that human-approval gate is for the curated context map
+    (Stage AC/Z), not for people mentioned in reminders.
+    """
+
+    node_id = _graph_node_id("person", name)
+    display_name = name.strip()
+    with contextlib.closing(_connect(db_path)) as conn:
+        existing = conn.execute(
+            "SELECT node_id FROM graph_nodes WHERE node_id = ?", (node_id,)
+        ).fetchone()
+        created = existing is None
+        _upsert_graph_node(conn, node_id, "person", display_name, source_ref="reminder")
+        conn.commit()
+    return {"node_id": node_id, "name": display_name, "created": created}
+
+
+def create_reminder(
+    description: str,
+    due_date: str,
+    people: list[str],
+    *,
+    session_id: str | None = None,
+    db_path: Path = DB_PATH,
+) -> dict:
+    """Create a dated reminder task and wire it to the people it involves.
+
+    This is the real version of the "Muayyad" example Haroon described in
+    the meeting: a reminder isn't just a task with a due date, it also needs
+    to know WHO it's about, so a later "what's due for Muayyad" query has
+    something to traverse. Each name in `people` goes through
+    get_or_create_person_node() (dedup, not a fresh node per call) and gets
+    an "involves" edge from the task's own graph node to the person node —
+    see decisions.md for why "involves" and not an existing GRAPH_EDGE_TYPES
+    value.
+    """
+
+    task_id = add_task(description, due_date=due_date, session_id=session_id, db_path=db_path)
+    task_node_id = _graph_node_id("task", str(task_id))
+    people_result: dict[str, dict] = {}
+    with contextlib.closing(_connect(db_path)) as conn:
+        _upsert_graph_node(
+            conn, task_node_id, "task", description,
+            source_ref="tasks", metadata={"task_id": task_id, "due_date": due_date},
+        )
+        for name in people:
+            person_node_id = _graph_node_id("person", name)
+            display_name = name.strip()
+            existing = conn.execute(
+                "SELECT node_id FROM graph_nodes WHERE node_id = ?", (person_node_id,)
+            ).fetchone()
+            created = existing is None
+            _upsert_graph_node(conn, person_node_id, "person", display_name, source_ref="reminder")
+            _upsert_graph_edge(
+                conn,
+                task_node_id,
+                person_node_id,
+                "involves",
+                evidence=description,
+                source_ref="reminder",
+                authority="reminder",
+                currentness="current",
+                confidence="stated",
+                curated=False,
+            )
+            people_result[name] = {"node_id": person_node_id, "name": display_name, "created": created}
+        conn.commit()
+    return {"task_id": task_id, "due_date": due_date, "people": people_result}
+
+
+def list_upcoming_reminders(within_days: int = 7, db_path: Path = DB_PATH) -> list[dict]:
+    """Open (status != 'done') tasks with due_date in [today, today+within_days].
+
+    String comparison on "YYYY-MM-DD" is safe (lexicographic order == date
+    order). Reminders already past due drop out of the window on purpose —
+    this answers "what's coming up", not "what's overdue".
+    """
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    horizon = (datetime.now(timezone.utc).date() + timedelta(days=within_days)).isoformat()
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            """SELECT * FROM tasks
+               WHERE status != 'done' AND due_date IS NOT NULL AND due_date != ''
+                 AND due_date >= ? AND due_date <= ?
+               ORDER BY due_date""",
+            (today, horizon),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def list_context_map(only_approved: bool = True, db_path: Path = DB_PATH) -> dict:
