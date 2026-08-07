@@ -854,6 +854,99 @@ class ExistsCommandTestCase(unittest.TestCase):
         claude.assert_not_called()
         self.assertIn("none found", result["answer"])
 
+    def test_mentions_query_extracted_from_prefix(self) -> None:
+        self.assertEqual(
+            "find_callers", assistant_server._mentions_query("mentions: find_callers")
+        )
+
+    def test_mentions_query_none_without_prefix(self) -> None:
+        self.assertIsNone(assistant_server._mentions_query("what mentions find_callers"))
+
+    def test_mentions_command_for_symbol_returns_referencing_docs(self) -> None:
+        """A symbol name -> mc.find_mentions() should report docs mentioning it."""
+
+        with self._mock_context(), \
+            mock.patch("assistant_server.run_claude") as claude, \
+            mock.patch(
+                "assistant_server.mc.find_mentions",
+                return_value=[
+                    {
+                        "node_type": "doc",
+                        "title": "BUS-ERDI-FABLE",
+                        "file_path": "BUS-ERDI-FABLE.md",
+                        "node_id": "doc:bus-erdi-fable-md",
+                        "evidence": "'find_callers' mentioned in BUS-ERDI-FABLE.md",
+                    },
+                ],
+            ) as find_mentions, \
+            mock.patch("assistant_server.mc.write_checkpoint"), \
+            mock.patch("assistant_server.mc.record_turn"), \
+            mock.patch("assistant_server.mc.record_event"), \
+            mock.patch("assistant_server.mc.record_answer_quality", return_value=1), \
+            mock.patch("assistant_server.mc.record_evidence", return_value=1), \
+            mock.patch("assistant_server.mc.record_answer_receipt", return_value=3):
+            result = assistant_server.answer_message("mentions: find_callers", "web")
+
+        claude.assert_not_called()
+        self.assertEqual("mentions-command", result["engine"])
+        self.assertIn("mentions of 'find_callers' - documents mentioning (1):", result["answer"])
+        self.assertIn("BUS-ERDI-FABLE (BUS-ERDI-FABLE.md)", result["answer"])
+        find_mentions.assert_called_once_with("find_callers", db_path=assistant_server.mc.DB_PATH)
+
+    def test_mentions_command_for_doc_returns_referenced_symbols(self) -> None:
+        """A doc name -> mc.find_mentions() should report symbols it mentions."""
+
+        with self._mock_context(), \
+            mock.patch("assistant_server.run_claude") as claude, \
+            mock.patch(
+                "assistant_server.mc.find_mentions",
+                return_value=[
+                    {
+                        "node_type": "symbol",
+                        "title": "find_callers",
+                        "file_path": "mc.py",
+                        "node_id": "symbol:mc-py-find-callers",
+                        "evidence": "'find_callers' mentioned in BUS-ERDI-FABLE.md",
+                    },
+                    {
+                        "node_type": "symbol",
+                        "title": "index_docs",
+                        "file_path": "mc.py",
+                        "node_id": "symbol:mc-py-index-docs",
+                        "evidence": "'index_docs' mentioned in BUS-ERDI-FABLE.md",
+                    },
+                ],
+            ) as find_mentions, \
+            mock.patch("assistant_server.mc.write_checkpoint"), \
+            mock.patch("assistant_server.mc.record_turn"), \
+            mock.patch("assistant_server.mc.record_event"), \
+            mock.patch("assistant_server.mc.record_answer_quality", return_value=1), \
+            mock.patch("assistant_server.mc.record_evidence", return_value=1), \
+            mock.patch("assistant_server.mc.record_answer_receipt", return_value=3):
+            result = assistant_server.answer_message("mentions: BUS-ERDI-FABLE", "web")
+
+        claude.assert_not_called()
+        self.assertEqual("mentions-command", result["engine"])
+        self.assertIn("mentions of 'BUS-ERDI-FABLE' - symbols mentioned by (2):", result["answer"])
+        self.assertIn("find_callers (mc.py)", result["answer"])
+        self.assertIn("index_docs (mc.py)", result["answer"])
+        find_mentions.assert_called_once_with("BUS-ERDI-FABLE", db_path=assistant_server.mc.DB_PATH)
+
+    def test_mentions_command_reports_none_found(self) -> None:
+        with self._mock_context(), \
+            mock.patch("assistant_server.run_claude") as claude, \
+            mock.patch("assistant_server.mc.find_mentions", return_value=[]), \
+            mock.patch("assistant_server.mc.write_checkpoint"), \
+            mock.patch("assistant_server.mc.record_turn"), \
+            mock.patch("assistant_server.mc.record_event"), \
+            mock.patch("assistant_server.mc.record_answer_quality", return_value=1), \
+            mock.patch("assistant_server.mc.record_evidence", return_value=1), \
+            mock.patch("assistant_server.mc.record_answer_receipt", return_value=3):
+            result = assistant_server.answer_message("mentions: nothing_indexed_at_all", "web")
+
+        claude.assert_not_called()
+        self.assertIn("none found", result["answer"])
+
 
 class ProjectsCommandTestCase(unittest.TestCase):
     def _mock_context(self):

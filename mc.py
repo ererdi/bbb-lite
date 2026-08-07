@@ -3900,6 +3900,83 @@ def find_callers(
     return callers
 
 
+def find_mentions(name: str, *, db_path: Path = DB_PATH) -> list[dict]:
+    """Two-way lookup over the "references" edges index_docs() derives
+    (Stage BUS-1: doc -> symbol, when a doc's prose mentions a symbol_index
+    name). Same traverse_graph()-based pattern as find_callers(), but with
+    edge_types=["references"] and a direction chosen by what `name` matches:
+
+    - name matches a symbol (graph_nodes.title, exact) -> return the docs
+      that mention it (direction="in": doc -> symbol edges pointing at it).
+    - else name matches a doc, by title, source_ref, or filename/stem
+      (case-insensitive - doc names are typed more loosely than symbols)
+      -> return the symbols that doc mentions (direction="out").
+    - matches neither -> [].
+
+    Symbol lookup is tried first; like find_callers(), this does not
+    distinguish "name not indexed" from "indexed but zero mentions" - both
+    read as an empty result.
+    """
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        symbol_ids = [
+            row["node_id"]
+            for row in conn.execute(
+                "SELECT node_id FROM graph_nodes WHERE node_type = 'symbol' AND title = ?",
+                (name,),
+            ).fetchall()
+        ]
+        doc_ids: list[str] = []
+        if not symbol_ids:
+            needle = name.strip().lower()
+            for row in conn.execute(
+                "SELECT node_id, title, source_ref FROM graph_nodes WHERE node_type = 'doc'"
+            ).fetchall():
+                title = (row["title"] or "").lower()
+                source_ref = row["source_ref"] or ""
+                normalized_ref = source_ref.replace("\\", "/").lower()
+                basename = normalized_ref.rsplit("/", 1)[-1]
+                stem = Path(source_ref).stem.lower()
+                if needle in (title, normalized_ref, basename, stem):
+                    doc_ids.append(row["node_id"])
+
+    edge_types = ["references"]
+    if symbol_ids:
+        direction = "in"
+        target_ids = symbol_ids
+    else:
+        direction = "out"
+        target_ids = doc_ids
+
+    hits: list[dict] = []
+    seen: set[str] = set()
+    for target_id in target_ids:
+        for hit in traverse_graph(
+            target_id, edge_types=edge_types, direction=direction, hops=1, db_path=db_path
+        ):
+            if hit["node"] not in seen:
+                seen.add(hit["node"])
+                hits.append(hit)
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        mentions = []
+        for hit in hits:
+            node_row = conn.execute(
+                "SELECT node_type, title, source_ref FROM graph_nodes WHERE node_id = ?",
+                (hit["node"],),
+            ).fetchone()
+            mentions.append(
+                {
+                    "node_type": node_row["node_type"] if node_row else None,
+                    "title": node_row["title"] if node_row else hit["node"],
+                    "file_path": node_row["source_ref"] if node_row else None,
+                    "node_id": hit["node"],
+                    "evidence": hit["evidence"],
+                }
+            )
+    return mentions
+
+
 _SYNC_EDGE_TYPE_MAP = {"calls": "depends-on", "references": "derived-from"}
 
 

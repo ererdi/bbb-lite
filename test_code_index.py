@@ -311,6 +311,64 @@ class IndexDocsTestCase(unittest.TestCase):
         edges = mc.list_graph_edges("references", db_path=self.db_path)
         self.assertEqual(1, len(edges))
 
+    def test_find_mentions_for_symbol_returns_referencing_doc(self) -> None:
+        self._write_sample_module_and_symbols()
+        (self.root / "docs" / "plan.md").write_text(
+            "# Rollout Plan\n\n"
+            "compute_widget_price is the single source of truth for pricing.\n",
+            encoding="utf-8",
+        )
+        mc.index_docs(root_dir=self.root, db_path=self.db_path)
+
+        mentions = mc.find_mentions("compute_widget_price", db_path=self.db_path)
+
+        self.assertEqual(1, len(mentions))
+        self.assertEqual("doc", mentions[0]["node_type"])
+        self.assertEqual("Rollout Plan", mentions[0]["title"])
+        self.assertIn("plan.md", mentions[0]["file_path"])
+
+    def test_find_mentions_for_doc_title_returns_referenced_symbol(self) -> None:
+        self._write_sample_module_and_symbols()
+        (self.root / "docs" / "plan.md").write_text(
+            "# Rollout Plan\n\n"
+            "compute_widget_price is the single source of truth for pricing.\n",
+            encoding="utf-8",
+        )
+        mc.index_docs(root_dir=self.root, db_path=self.db_path)
+
+        mentions = mc.find_mentions("Rollout Plan", db_path=self.db_path)
+
+        self.assertEqual(1, len(mentions))
+        self.assertEqual("symbol", mentions[0]["node_type"])
+        self.assertEqual("compute_widget_price", mentions[0]["title"])
+
+    def test_find_mentions_for_doc_filename_stem_returns_referenced_symbol(self) -> None:
+        # Doc lookup is looser than symbol lookup on purpose: users are more
+        # likely to type the filename ("plan") than the "# heading" title.
+        self._write_sample_module_and_symbols()
+        (self.root / "docs" / "plan.md").write_text(
+            "# Rollout Plan\n\n"
+            "compute_widget_price is the single source of truth for pricing.\n",
+            encoding="utf-8",
+        )
+        mc.index_docs(root_dir=self.root, db_path=self.db_path)
+
+        mentions = mc.find_mentions("plan", db_path=self.db_path)
+
+        self.assertEqual(1, len(mentions))
+        self.assertEqual("symbol", mentions[0]["node_type"])
+        self.assertEqual("compute_widget_price", mentions[0]["title"])
+
+    def test_find_mentions_returns_empty_for_unknown_name(self) -> None:
+        self._write_sample_module_and_symbols()
+        (self.root / "docs" / "plan.md").write_text(
+            "# Rollout Plan\n\ncompute_widget_price handles pricing.\n",
+            encoding="utf-8",
+        )
+        mc.index_docs(root_dir=self.root, db_path=self.db_path)
+
+        self.assertEqual([], mc.find_mentions("nothing_indexed_at_all", db_path=self.db_path))
+
 
 class ExportSyncEdgesTestCase(unittest.TestCase):
     """Stage BUS-2 prep: mc.export_sync_edges() reads our own calls/

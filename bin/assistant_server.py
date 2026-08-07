@@ -94,6 +94,12 @@ _PROJECTS_COMMAND_WORDS = {"projects", "projeler"}
 _CALLERS_RE = re.compile(r"^callers\s*[:=-]\s*(?P<query>.+)$", re.I | re.S)
 _DEPENDS_RE = re.compile(r"^depends\s*[:=-]\s*(?P<query>.+)$", re.I | re.S)
 
+# "mentions: <symbol or doc>" -> mc.find_mentions() ("references" edges
+# index_docs() derives). Symbol input returns the docs that mention it; doc
+# input (title, file path, or filename/stem) returns the symbols it
+# mentions - see mc.find_mentions()'s docstring for the direction rule.
+_MENTIONS_RE = re.compile(r"^mentions\s*[:=-]\s*(?P<query>.+)$", re.I | re.S)
+
 # Stage AX: "confirm task N with test: ..." - a real test-evidence completion
 # path, distinct from the intentionally-guard-rejected "complete task N".
 _CONFIRM_TASK_TEST_RE = re.compile(
@@ -262,6 +268,16 @@ def _depends_query(message: str) -> str | None:
     """Extract the node name from an explicit 'depends: ...' message."""
 
     match = _DEPENDS_RE.match(message.strip())
+    if not match:
+        return None
+    query = _clip(match.group("query"), 300)
+    return query or None
+
+
+def _mentions_query(message: str) -> str | None:
+    """Extract the symbol/doc name from an explicit 'mentions: ...' message."""
+
+    match = _MENTIONS_RE.match(message.strip())
     if not match:
         return None
     query = _clip(match.group("query"), 300)
@@ -634,6 +650,23 @@ def _depends_report(node: str, *, db_path: Path) -> str:
     return f"'{node}' depends on ({len(deps)}):\n{lines}"
 
 
+def _mentions_report(name: str, *, db_path: Path) -> str:
+    """Answer for the 'mentions: <symbol or doc>' command.
+
+    mc.find_mentions() walks the "references" edges index_docs() derives
+    (doc -> symbol, from prose scanning) - answers "what mentions X" in
+    either direction, against the doc/symbol graph as actually indexed.
+    """
+
+    mentions = _safe_call([], mc.find_mentions, name, db_path=db_path)
+    if not mentions:
+        return f"mentions of '{name}': none found (not indexed, or nothing references it)"
+    kind = mentions[0].get("node_type")
+    label = "documents mentioning" if kind == "doc" else "symbols mentioned by"
+    lines = "\n".join(f"- {m.get('title')} ({m.get('file_path')})" for m in mentions)
+    return f"mentions of '{name}' - {label} ({len(mentions)}):\n{lines}"
+
+
 def _projects_report(*, db_path: Path) -> str:
     """Answer for the 'projects' / 'projeler' command (Stage AW) - read-only."""
 
@@ -788,6 +821,7 @@ def answer_message(message: str, session_id: str = DEFAULT_SESSION_ID, *, db_pat
     exists_query = _exists_query(message)
     callers_query = _callers_query(message)
     depends_query = _depends_query(message)
+    mentions_query = _mentions_query(message)
     if _is_status_command(message):
         answer = _status_report(context, session_id=session_id, db_path=db_path)
         engine = "status-command"
@@ -800,6 +834,9 @@ def answer_message(message: str, session_id: str = DEFAULT_SESSION_ID, *, db_pat
     elif depends_query:
         answer = _depends_report(depends_query, db_path=db_path)
         engine = "depends-command"
+    elif mentions_query:
+        answer = _mentions_report(mentions_query, db_path=db_path)
+        engine = "mentions-command"
     elif _is_projects_command(message):
         answer = _projects_report(db_path=db_path)
         engine = "projects-command"
