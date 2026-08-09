@@ -2048,6 +2048,80 @@ class RemindersTestCase(McTestCase):
             ).fetchone()
         self.assertEqual("involves", row["type"])
 
+
+class EntityDedupTestCase(McTestCase):
+    """Entity dedup (Stage BUS follow-up): get_or_create_entity_node()
+    generalizes get_or_create_person_node() past "person", and
+    link_entities() connects two entities with a 'relates-to' edge — the
+    "Genie the company + its client" example from Haroon's meeting."""
+
+    def test_get_or_create_person_node_still_dedups_same_name(self) -> None:
+        first = mc.get_or_create_person_node("Haroon", db_path=self.db_path)
+        second = mc.get_or_create_person_node("Haroon", db_path=self.db_path)
+        self.assertTrue(first["created"])
+        self.assertFalse(second["created"])
+        self.assertEqual(first["node_id"], second["node_id"])
+        self.assertEqual("person:haroon", first["node_id"])
+
+    def test_get_or_create_entity_node_dedups_same_name_same_type(self) -> None:
+        first = mc.get_or_create_entity_node("Genie", "organization", db_path=self.db_path)
+        second = mc.get_or_create_entity_node("Genie", "organization", db_path=self.db_path)
+        self.assertTrue(first["created"])
+        self.assertFalse(second["created"])
+        self.assertEqual(first["node_id"], second["node_id"])
+
+    def test_get_or_create_entity_node_different_types_do_not_collide(self) -> None:
+        person = mc.get_or_create_entity_node("Genie", "person", db_path=self.db_path)
+        org = mc.get_or_create_entity_node("Genie", "organization", db_path=self.db_path)
+        self.assertTrue(person["created"])
+        self.assertTrue(org["created"])
+        self.assertNotEqual(person["node_id"], org["node_id"])
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            rows = conn.execute(
+                "SELECT node_id, node_type FROM graph_nodes WHERE title = 'Genie' ORDER BY node_type"
+            ).fetchall()
+        self.assertEqual(2, len(rows))
+        self.assertEqual(["organization", "person"], [r["node_type"] for r in rows])
+
+    def test_get_or_create_entity_node_writes_correct_node_type(self) -> None:
+        result = mc.get_or_create_entity_node("Acme Client", "client", db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT node_type, title FROM graph_nodes WHERE node_id = ?",
+                (result["node_id"],),
+            ).fetchone()
+        self.assertEqual("client", row["node_type"])
+        self.assertEqual("Acme Client", row["title"])
+
+    def test_link_entities_creates_relates_to_edge_with_relation_as_evidence(self) -> None:
+        result = mc.link_entities(
+            "Genie", "works-with", "Erdi", type_a="organization", type_b="person",
+            db_path=self.db_path,
+        )
+        self.assertTrue(result["edge_created"])
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT type, evidence FROM graph_edges WHERE src = ? AND dst = ?",
+                (result["a"]["node_id"], result["b"]["node_id"]),
+            ).fetchone()
+        self.assertEqual("relates-to", row["type"])
+        self.assertEqual("works-with", row["evidence"])
+
+    def test_link_entities_dedups_entities_and_edge_on_second_call(self) -> None:
+        first = mc.link_entities(
+            "Genie", "works-with", "Erdi", type_a="organization", type_b="person",
+            db_path=self.db_path,
+        )
+        second = mc.link_entities(
+            "Genie", "works-with", "Erdi", type_a="organization", type_b="person",
+            db_path=self.db_path,
+        )
+        self.assertTrue(first["a"]["created"])
+        self.assertFalse(second["a"]["created"])
+        self.assertFalse(second["b"]["created"])
+        self.assertFalse(second["edge_created"])
+        self.assertEqual(first["a"]["node_id"], second["a"]["node_id"])
+
     def test_create_reminder_does_not_duplicate_person_across_reminders(self) -> None:
         first = mc.create_reminder("reminder one", "2026-08-10", ["Muayyad"], db_path=self.db_path)
         second = mc.create_reminder("reminder two", "2026-08-11", ["Muayyad"], db_path=self.db_path)

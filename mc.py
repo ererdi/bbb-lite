@@ -4585,28 +4585,90 @@ def add_curated_edge(
         conn.commit()
 
 
-def get_or_create_person_node(name: str, db_path: Path = DB_PATH) -> dict:
-    """Find-or-create a node_type='person' graph node for `name`.
+def get_or_create_entity_node(name: str, entity_type: str = "person", db_path: Path = DB_PATH) -> dict:
+    """Find-or-create a node_type=`entity_type` graph node for `name`.
 
-    Dedup is via _graph_node_id("person", name) — the same lowercased,
-    non-alnum-collapsed slug _upsert_graph_node()/index_symbols() already use
-    for "symbol"/"doc" nodes, so "Haroon" and "haroon" resolve to the same
-    node_id ("person:haroon") without a separate normalization step. Written
-    with a plain _upsert_graph_node (curated=0), not propose_node()/
-    approve_node() — that human-approval gate is for the curated context map
-    (Stage AC/Z), not for people mentioned in reminders.
+    Same logic as the former get_or_create_person_node(), generalized past
+    "person" (Haroon's "Genie the company + its client" meeting example —
+    dedup shouldn't only work for people). Dedup is via
+    _graph_node_id(entity_type, name) — the same lowercased, non-alnum-
+    collapsed slug _upsert_graph_node()/index_symbols() already use for
+    "symbol"/"doc" nodes, so "Haroon" and "haroon" resolve to the same
+    node_id ("person:haroon") without a separate normalization step. Note
+    the entity_type is part of the node_id, so the same name under two
+    different types ("person:genie" vs "organization:genie") are distinct
+    nodes on purpose — a person and a company can share a name without
+    colliding. Written with a plain _upsert_graph_node (curated=0), not
+    propose_node()/approve_node() — that human-approval gate is for the
+    curated context map (Stage AC/Z), not for entities mentioned in
+    reminders.
     """
 
-    node_id = _graph_node_id("person", name)
+    node_id = _graph_node_id(entity_type, name)
     display_name = name.strip()
     with contextlib.closing(_connect(db_path)) as conn:
         existing = conn.execute(
             "SELECT node_id FROM graph_nodes WHERE node_id = ?", (node_id,)
         ).fetchone()
         created = existing is None
-        _upsert_graph_node(conn, node_id, "person", display_name, source_ref="reminder")
+        _upsert_graph_node(conn, node_id, entity_type, display_name, source_ref="reminder")
         conn.commit()
     return {"node_id": node_id, "name": display_name, "created": created}
+
+
+def get_or_create_person_node(name: str, db_path: Path = DB_PATH) -> dict:
+    """Find-or-create a node_type='person' graph node for `name`.
+
+    Thin wrapper over get_or_create_entity_node(name, "person") kept for
+    backward compatibility — existing callers (create_reminder) and tests
+    depend on this exact name/signature.
+    """
+
+    return get_or_create_entity_node(name, "person", db_path=db_path)
+
+
+def link_entities(
+    name_a: str,
+    relation: str,
+    name_b: str,
+    type_a: str = "person",
+    type_b: str = "person",
+    db_path: Path = DB_PATH,
+) -> dict:
+    """Find-or-create two entity nodes and connect them with a 'relates-to' edge.
+
+    `relation` (e.g. "works-with") is stored in the edge's evidence field,
+    not as the edge type itself — GRAPH_EDGE_TYPES is a closed vocabulary of
+    structural relationships (supersedes/depends-on/...), and free-text
+    relations between arbitrary entities don't fit it; "relates-to" plays
+    the same role "involves" does for create_reminder()'s task->person
+    edges. Written with a plain _upsert_graph_edge (curated=0) — same
+    reasoning as get_or_create_entity_node, this is not the human-approved
+    context map.
+    """
+
+    a = get_or_create_entity_node(name_a, type_a, db_path=db_path)
+    b = get_or_create_entity_node(name_b, type_b, db_path=db_path)
+    with contextlib.closing(_connect(db_path)) as conn:
+        existing = conn.execute(
+            "SELECT 1 FROM graph_edges WHERE src = ? AND dst = ? AND type = ?",
+            (a["node_id"], b["node_id"], "relates-to"),
+        ).fetchone()
+        edge_created = existing is None
+        _upsert_graph_edge(
+            conn,
+            a["node_id"],
+            b["node_id"],
+            "relates-to",
+            evidence=relation,
+            source_ref="link_entities",
+            authority="link_entities",
+            currentness="current",
+            confidence="stated",
+            curated=False,
+        )
+        conn.commit()
+    return {"a": a, "b": b, "edge_created": edge_created}
 
 
 def create_reminder(
