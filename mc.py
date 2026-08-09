@@ -4668,6 +4668,10 @@ def list_upcoming_reminders(within_days: int = 7, db_path: Path = DB_PATH) -> li
     String comparison on "YYYY-MM-DD" is safe (lexicographic order == date
     order). Reminders already past due drop out of the window on purpose —
     this answers "what's coming up", not "what's overdue".
+
+    Each row also carries a "people" list (names from the "involves" graph
+    edges create_reminder() wires up) — [] for plain due_date tasks added
+    via add_task() rather than create_reminder().
     """
 
     today = datetime.now(timezone.utc).date().isoformat()
@@ -4680,7 +4684,18 @@ def list_upcoming_reminders(within_days: int = 7, db_path: Path = DB_PATH) -> li
                ORDER BY due_date""",
             (today, horizon),
         ).fetchall()
-    return [dict(row) for row in rows]
+        reminders = [dict(row) for row in rows]
+        for reminder in reminders:
+            task_node_id = _graph_node_id("task", str(reminder["id"]))
+            people_rows = conn.execute(
+                """SELECT gn.title FROM graph_edges ge
+                   JOIN graph_nodes gn ON gn.node_id = ge.dst
+                   WHERE ge.src = ? AND ge.type = 'involves'
+                   ORDER BY gn.title""",
+                (task_node_id,),
+            ).fetchall()
+            reminder["people"] = [r["title"] for r in people_rows]
+    return reminders
 
 
 def list_context_map(only_approved: bool = True, db_path: Path = DB_PATH) -> dict:

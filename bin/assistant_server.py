@@ -571,6 +571,15 @@ def _status_report(context: dict, *, session_id: str, db_path: Path) -> str:
         f"- #{task.get('id')} [{task.get('status')}] {task.get('title')}" for task in open_tasks
     ) or "- none"
 
+    upcoming_reminders = _safe_call(
+        [], mc.list_upcoming_reminders, within_days=30, db_path=db_path
+    )
+    reminder_lines = "\n".join(
+        f"- {reminder.get('due_date')} #{reminder.get('id')} {reminder.get('title')}"
+        + (f" ({', '.join(reminder.get('people') or [])})" if reminder.get("people") else "")
+        for reminder in upcoming_reminders
+    ) or "- none"
+
     recent_health_events = _safe_call(
         [], mc.list_health_events, limit=3, session_id=session_id, db_path=db_path
     )
@@ -590,6 +599,7 @@ def _status_report(context: dict, *, session_id: str, db_path: Path) -> str:
         "STATUS REPORT\n\n"
         f"Role: {context.get('role')}\n\n"
         f"Open tasks:\n{task_lines}\n\n"
+        f"Upcoming reminders (next 30 days):\n{reminder_lines}\n\n"
         f"Health state: {context.get('health', 'unknown')}\n"
         f"Recent health events (last 3):\n{event_lines}\n\n"
         f"Session score: {score_line}\n\n"

@@ -660,6 +660,18 @@ class StatusCommandTestCase(unittest.TestCase):
                     }
                 ],
             ) as health_events, \
+            mock.patch(
+                "assistant_server.mc.list_upcoming_reminders",
+                return_value=[
+                    {"id": 10, "title": "bankaya git", "due_date": "2026-08-15", "people": []},
+                    {
+                        "id": 11,
+                        "title": "bankaya git",
+                        "due_date": "2026-08-11",
+                        "people": ["Muayyad"],
+                    },
+                ],
+            ) as upcoming_reminders, \
             mock.patch("assistant_server.mc.write_checkpoint"), \
             mock.patch("assistant_server.mc.record_turn"), \
             mock.patch("assistant_server.mc.record_event"), \
@@ -672,10 +684,16 @@ class StatusCommandTestCase(unittest.TestCase):
         self.assertEqual("status-command", result["engine"])
         self.assertIn("STATUS REPORT", result["answer"])
         self.assertIn("#1 [todo] t1", result["answer"])
+        self.assertIn("Upcoming reminders (next 30 days):", result["answer"])
+        self.assertIn("- 2026-08-15 #10 bankaya git", result["answer"])
+        self.assertIn("- 2026-08-11 #11 bankaya git (Muayyad)", result["answer"])
         self.assertIn("degraded", result["answer"])
         self.assertIn("conflict-x", result["answer"])
         health_events.assert_called_once_with(
             limit=3, session_id="web", db_path=assistant_server.mc.DB_PATH
+        )
+        upcoming_reminders.assert_called_once_with(
+            within_days=30, db_path=assistant_server.mc.DB_PATH
         )
 
 

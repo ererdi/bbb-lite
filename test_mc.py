@@ -2071,6 +2071,25 @@ class RemindersTestCase(McTestCase):
         }
         self.assertEqual({"due soon"}, titles)
 
+    def test_list_upcoming_reminders_includes_people(self) -> None:
+        today = datetime.now(timezone.utc).date()
+        mc.create_reminder(
+            "call Muayyad",
+            (today + timedelta(days=2)).isoformat(),
+            ["Muayyad", "Erdi"],
+            db_path=self.db_path,
+        )
+        mc.add_task(
+            "plain due-date task, no create_reminder",
+            due_date=(today + timedelta(days=3)).isoformat(),
+            db_path=self.db_path,
+        )
+        by_title = {
+            r["title"]: r for r in mc.list_upcoming_reminders(within_days=7, db_path=self.db_path)
+        }
+        self.assertEqual({"Erdi", "Muayyad"}, set(by_title["call Muayyad"]["people"]))
+        self.assertEqual([], by_title["plain due-date task, no create_reminder"]["people"])
+
     def test_list_upcoming_reminders_excludes_overdue_and_done(self) -> None:
         today = datetime.now(timezone.utc).date()
         mc.create_reminder(
