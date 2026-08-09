@@ -4671,6 +4671,103 @@ def link_entities(
     return {"a": a, "b": b, "edge_created": edge_created}
 
 
+def link_decision_to_entity(
+    decision_packet_id: str,
+    entity_name: str,
+    entity_type: str = "organization",
+    db_path: Path = DB_PATH,
+) -> dict:
+    """Wire a decision_packets row into the graph - Haroon's third missing
+    piece: a decision recorded via create_decision_packet() otherwise sits
+    only in decision_packets, invisible to any graph traversal ("cold").
+
+    Mirrors create_reminder()'s task->person "involves" edge: make-or-find a
+    node_type='decision' graph node for the packet (node_id =
+    decision:<packet_id> - a uuid4 hex is already a valid _slug(), so this
+    round-trips exactly in get_decisions_for_entity() without a metadata
+    lookup), make-or-find the entity node via get_or_create_entity_node()
+    (same dedup as link_entities()), and connect them with a "concerns" edge
+    (curated=0 - not the human-approved context map, same trust level as
+    link_entities()'s "relates-to").
+    """
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        packet = conn.execute(
+            "SELECT * FROM decision_packets WHERE id = ?", (decision_packet_id,)
+        ).fetchone()
+    if packet is None:
+        raise ValueError(f"no decision_packet with id {decision_packet_id!r}")
+
+    decision_node_id = _graph_node_id("decision", decision_packet_id)
+    entity = get_or_create_entity_node(entity_name, entity_type, db_path=db_path)
+    with contextlib.closing(_connect(db_path)) as conn:
+        _upsert_graph_node(
+            conn,
+            decision_node_id,
+            "decision",
+            packet["decision"],
+            source_ref="decision_packets",
+            metadata={"decision_packet_id": decision_packet_id, "status": packet["status"]},
+        )
+        existing = conn.execute(
+            "SELECT 1 FROM graph_edges WHERE src = ? AND dst = ? AND type = ?",
+            (decision_node_id, entity["node_id"], "concerns"),
+        ).fetchone()
+        edge_created = existing is None
+        _upsert_graph_edge(
+            conn,
+            decision_node_id,
+            entity["node_id"],
+            "concerns",
+            evidence=packet["decision"],
+            source_ref="link_decision_to_entity",
+            authority="link_decision_to_entity",
+            currentness="current",
+            confidence="stated",
+            curated=False,
+        )
+        conn.commit()
+    return {
+        "decision_node_id": decision_node_id,
+        "decision_packet_id": decision_packet_id,
+        "entity": entity,
+        "edge_created": edge_created,
+    }
+
+
+def get_decisions_for_entity(
+    entity_name: str, entity_type: str = "organization", db_path: Path = DB_PATH
+) -> list[dict]:
+    """All decision_packets rows "concerns"-linked to an entity.
+
+    Walks graph_edges in the direction link_decision_to_entity() writes
+    (decision node -> entity node), then resolves each decision node back to
+    its decision_packets row. The packet id is recovered from the node_id
+    (decision:<packet_id>) rather than metadata_json, since a uuid4 hex is
+    already a valid slug and round-trips exactly - see
+    link_decision_to_entity(). Does not create the entity node if it doesn't
+    exist yet (unlike get_or_create_entity_node) - this is a read, an unknown
+    entity just has no decisions.
+    """
+
+    entity_node_id = _graph_node_id(entity_type, entity_name)
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            """SELECT src FROM graph_edges WHERE dst = ? AND type = 'concerns'
+               ORDER BY updated_at""",
+            (entity_node_id,),
+        ).fetchall()
+        decisions = []
+        for row in rows:
+            packet_id = row["src"].split(":", 1)[1]
+            packet = conn.execute(
+                "SELECT * FROM decision_packets WHERE id = ?", (packet_id,)
+            ).fetchone()
+            if packet is not None:
+                decisions.append(dict(packet))
+    return decisions
+
+
 def create_reminder(
     description: str,
     due_date: str,

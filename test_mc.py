@@ -2187,5 +2187,69 @@ class EntityDedupTestCase(McTestCase):
         self.assertEqual(set(), titles)
 
 
+class DecisionEntityLinkTestCase(McTestCase):
+    """Cold decision protection (Stage BA): link_decision_to_entity() wires a
+    decision_packets row into the graph via a "concerns" edge, and
+    get_decisions_for_entity() traverses it back - Haroon's third missing
+    piece from the meeting notes ("decisions can't just sit in a table,
+    unreachable from the graph")."""
+
+    def _packet(self, decision: str = "keep SQLite as local MC", session_id: str = "s1") -> str:
+        return mc.create_decision_packet(session_id, decision, db_path=self.db_path)
+
+    def test_link_decision_to_entity_creates_decision_node_and_concerns_edge(self) -> None:
+        packet_id = self._packet()
+        result = mc.link_decision_to_entity(packet_id, "Genie", db_path=self.db_path)
+        self.assertTrue(result["edge_created"])
+        self.assertEqual("organization:genie", result["entity"]["node_id"])
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT type, curated FROM graph_edges WHERE src = ? AND dst = ?",
+                (result["decision_node_id"], result["entity"]["node_id"]),
+            ).fetchone()
+        self.assertEqual("concerns", row["type"])
+        self.assertEqual(0, row["curated"])
+
+    def test_link_decision_to_entity_dedups_entity_and_edge_on_second_call(self) -> None:
+        packet_id = self._packet()
+        mc.get_or_create_entity_node("Genie", "organization", db_path=self.db_path)
+        first = mc.link_decision_to_entity(packet_id, "Genie", db_path=self.db_path)
+        second = mc.link_decision_to_entity(packet_id, "Genie", db_path=self.db_path)
+        self.assertFalse(first["entity"]["created"])
+        self.assertFalse(second["edge_created"])
+        self.assertEqual(first["decision_node_id"], second["decision_node_id"])
+
+    def test_link_decision_to_entity_unknown_packet_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            mc.link_decision_to_entity("does-not-exist", "Genie", db_path=self.db_path)
+
+    def test_get_decisions_for_entity_finds_linked_decision(self) -> None:
+        packet_id = self._packet("keep SQLite as local MC")
+        mc.link_decision_to_entity(packet_id, "Genie", db_path=self.db_path)
+        results = mc.get_decisions_for_entity("Genie", db_path=self.db_path)
+        self.assertEqual(1, len(results))
+        self.assertEqual(packet_id, results[0]["id"])
+        self.assertEqual("keep SQLite as local MC", results[0]["decision"])
+
+    def test_get_decisions_for_entity_ignores_unlinked_decisions(self) -> None:
+        self._packet("unrelated decision")
+        results = mc.get_decisions_for_entity("Genie", db_path=self.db_path)
+        self.assertEqual([], results)
+
+    def test_get_decisions_for_entity_only_returns_matching_entity_type(self) -> None:
+        packet_id = self._packet()
+        mc.link_decision_to_entity(packet_id, "Genie", entity_type="organization", db_path=self.db_path)
+        self.assertEqual(1, len(mc.get_decisions_for_entity("Genie", "organization", db_path=self.db_path)))
+        self.assertEqual([], mc.get_decisions_for_entity("Genie", "person", db_path=self.db_path))
+
+    def test_get_decisions_for_entity_finds_multiple_decisions(self) -> None:
+        first_id = self._packet("decision one")
+        second_id = self._packet("decision two")
+        mc.link_decision_to_entity(first_id, "Genie", db_path=self.db_path)
+        mc.link_decision_to_entity(second_id, "Genie", db_path=self.db_path)
+        results = mc.get_decisions_for_entity("Genie", db_path=self.db_path)
+        self.assertEqual({first_id, second_id}, {r["id"] for r in results})
+
+
 if __name__ == "__main__":
     unittest.main()

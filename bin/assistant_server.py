@@ -117,6 +117,12 @@ _TASK_START_TR_RE = re.compile(r"\bi[şs]e\s+ba[şs]la\s+(?P<id>\d+)\b", re.I)
 # dated reminder wired to person graph nodes, alongside task:/decision:.
 _REMIND_RE = re.compile(r"\bremind\s*[:=-]\s*(?P<rest>.+)", re.I | re.S)
 
+# Stage BA: "decision: <text> | <entity name>" - optional entity suffix that
+# links the resulting packet into the graph (mc.link_decision_to_entity) so
+# it isn't a Haroon-style "cold decision"; "decisions-for: <entity>" reads
+# it back (mc.get_decisions_for_entity).
+_DECISIONS_FOR_RE = re.compile(r"^decisions-for\s*[:=-]\s*(?P<entity>.+)$", re.I | re.S)
+
 
 def _json_safe(value):
     if isinstance(value, dict):
@@ -174,6 +180,32 @@ def _decision_text(message: str) -> str | None:
     if any(phrase in lower for phrase in _DECISION_PHRASES):
         return _clip(message, 500)
     return None
+
+
+def _split_decision_entity(decision_text: str) -> tuple[str, str | None]:
+    """Split an optional "| <entity name>" suffix off a decision: payload.
+
+    "decision: X | Genie" links the resulting packet to the "Genie" entity
+    node (mc.link_decision_to_entity) so it isn't a Haroon-style "cold"
+    decision, invisible to graph traversal; plain "decision: X" (no "|") is
+    unaffected - entity is None and nothing gets linked.
+    """
+
+    if "|" not in decision_text:
+        return decision_text.strip(), None
+    left, _, right = decision_text.rpartition("|")
+    entity = right.strip()
+    return left.strip(), (entity or None)
+
+
+def _decisions_for_query(message: str) -> str | None:
+    """Extract the entity name from an explicit 'decisions-for: ...' message."""
+
+    match = _DECISIONS_FOR_RE.match(message.strip())
+    if not match:
+        return None
+    entity = _clip(match.group("entity"), 200)
+    return entity or None
 
 
 def _task_add_title(message: str) -> str | None:
@@ -677,6 +709,23 @@ def _mentions_report(name: str, *, db_path: Path) -> str:
     return f"mentions of '{name}' - {label} ({len(mentions)}):\n{lines}"
 
 
+def _decisions_for_report(entity_name: str, *, db_path: Path) -> str:
+    """Answer for the 'decisions-for: <entity>' command (Stage BA).
+
+    mc.get_decisions_for_entity() walks the "concerns" edges
+    mc.link_decision_to_entity() writes - a decision only shows up here if it
+    was explicitly linked via 'decision: ... | <entity>', not a keyword guess.
+    """
+
+    decisions = _safe_call([], mc.get_decisions_for_entity, entity_name, db_path=db_path)
+    if not decisions:
+        return f"decisions for '{entity_name}': none found (not linked, or entity unknown)"
+    lines = "\n".join(
+        f"- {d.get('created_at')} [{d.get('status')}] {d.get('decision')}" for d in decisions
+    )
+    return f"decisions for '{entity_name}' ({len(decisions)}):\n{lines}"
+
+
 def _projects_report(*, db_path: Path) -> str:
     """Answer for the 'projects' / 'projeler' command (Stage AW) - read-only."""
 
@@ -832,6 +881,7 @@ def answer_message(message: str, session_id: str = DEFAULT_SESSION_ID, *, db_pat
     callers_query = _callers_query(message)
     depends_query = _depends_query(message)
     mentions_query = _mentions_query(message)
+    decisions_for_query = _decisions_for_query(message)
     if _is_status_command(message):
         answer = _status_report(context, session_id=session_id, db_path=db_path)
         engine = "status-command"
@@ -847,6 +897,9 @@ def answer_message(message: str, session_id: str = DEFAULT_SESSION_ID, *, db_pat
     elif mentions_query:
         answer = _mentions_report(mentions_query, db_path=db_path)
         engine = "mentions-command"
+    elif decisions_for_query:
+        answer = _decisions_for_report(decisions_for_query, db_path=db_path)
+        engine = "decisions-for-command"
     elif _is_projects_command(message):
         answer = _projects_report(db_path=db_path)
         engine = "projects-command"
@@ -916,6 +969,7 @@ def answer_message(message: str, session_id: str = DEFAULT_SESSION_ID, *, db_pat
     decision_packet_id = None
     decision = _decision_text(message)
     if decision:
+        decision, decision_entity = _split_decision_entity(decision)
         decision_packet_id = _safe_call(
             None,
             mc.create_decision_packet,
@@ -937,6 +991,17 @@ def answer_message(message: str, session_id: str = DEFAULT_SESSION_ID, *, db_pat
             confidence="medium",
             db_path=db_path,
         )
+        # Stage BA: "decision: ... | <entity>" - link the packet into the
+        # graph (mc.link_decision_to_entity) so it isn't a Haroon-style
+        # "cold decision", invisible to graph traversal.
+        if decision_entity and decision_packet_id:
+            _safe_call(
+                None,
+                mc.link_decision_to_entity,
+                decision_packet_id,
+                decision_entity,
+                db_path=db_path,
+            )
 
     score = mc.assess_answer_quality(
         message,

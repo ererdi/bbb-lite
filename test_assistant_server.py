@@ -1075,6 +1075,96 @@ class DecisionSearchableIntegrationTestCase(unittest.TestCase):
         )
 
 
+class DecisionEntityLinkIntegrationTestCase(unittest.TestCase):
+    """Stage BA, no-mock proof: 'decision: ... | <entity>' must really call
+    mc.link_decision_to_entity() (a "concerns" edge in the real graph
+    tables), and 'decisions-for: <entity>' must read it back through the
+    real mc.get_decisions_for_entity() - not just mocked calls. Same temp-db
+    + patched mc.__file__ setup as DecisionSearchableIntegrationTestCase."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        self.db_path = Path(tmp.name)
+        self.db_path.unlink()
+        assistant_server.mc.init_db(self.db_path)
+
+        self.project_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.project_dir.cleanup)
+        (Path(self.project_dir.name) / "memory").mkdir()
+        patcher = mock.patch.object(
+            assistant_server.mc, "__file__", str(Path(self.project_dir.name) / "mc.py")
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self) -> None:
+        self.db_path.unlink(missing_ok=True)
+
+    def _mock_context(self):
+        return mock.patch(
+            "assistant_server.collect_context",
+            return_value={
+                "session_id": "web",
+                "role": "builder",
+                "permissions": {"code": True, "data": True},
+                "declared_role": None,
+                "checkpoint": None,
+                "keyword_memory": [],
+                "semantic_memory": [],
+                "graph_memory": [],
+                "open_tasks": [],
+                "health": "healthy",
+                "session_score": {"overall_score": 90},
+                "memory_conflicts": [],
+            },
+        )
+
+    def test_decision_with_entity_suffix_is_findable_via_decisions_for(self) -> None:
+        with self._mock_context(), mock.patch("assistant_server.run_claude", return_value="stored"):
+            result = assistant_server.answer_message(
+                "decision: HOSNI yerine SQLite kullanıyoruz | Genie",
+                "web",
+                db_path=self.db_path,
+            )
+
+        packet_id = result["decision_packet_id"]
+        self.assertIsNotNone(packet_id)
+        # entity suffix must not leak into the stored decision text
+        packets = assistant_server.mc.list_decision_packets(db_path=self.db_path)
+        self.assertEqual("HOSNI yerine SQLite kullanıyoruz", packets[0]["decision"])
+
+        with self._mock_context(), mock.patch("assistant_server.run_claude", return_value="stored"):
+            lookup = assistant_server.answer_message(
+                "decisions-for: Genie", "web", db_path=self.db_path
+            )
+
+        self.assertEqual("decisions-for-command", lookup["engine"])
+        self.assertIn("HOSNI yerine SQLite kullanıyoruz", lookup["answer"])
+
+        decisions = assistant_server.mc.get_decisions_for_entity("Genie", db_path=self.db_path)
+        self.assertEqual([packet_id], [d["id"] for d in decisions])
+
+    def test_plain_decision_without_entity_suffix_creates_no_concerns_edge(self) -> None:
+        with self._mock_context(), mock.patch("assistant_server.run_claude", return_value="stored"):
+            assistant_server.answer_message(
+                "decision: keep SQLite as local MC", "web", db_path=self.db_path,
+            )
+
+        with contextlib.closing(assistant_server.mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM graph_edges WHERE type = 'concerns'"
+            ).fetchone()
+        self.assertEqual(0, row["n"])
+
+    def test_decisions_for_unknown_entity_reports_none_found(self) -> None:
+        with self._mock_context(), mock.patch("assistant_server.run_claude", return_value="stored"):
+            lookup = assistant_server.answer_message(
+                "decisions-for: NoSuchEntity", "web", db_path=self.db_path
+            )
+        self.assertIn("none found", lookup["answer"])
+
+
 class ConfirmTaskWithTestGuardIntegrationTestCase(unittest.TestCase):
     """Stage AX, no-mock proof: 'confirm task N with test: ...' must genuinely
     pass complete_task's require_test_evidence guard (real evidence row, real
