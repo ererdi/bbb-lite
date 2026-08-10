@@ -123,6 +123,17 @@ _REMIND_RE = re.compile(r"\bremind\s*[:=-]\s*(?P<rest>.+)", re.I | re.S)
 # it back (mc.get_decisions_for_entity).
 _DECISIONS_FOR_RE = re.compile(r"^decisions-for\s*[:=-]\s*(?P<entity>.+)$", re.I | re.S)
 
+# Stage BB: "compact:" / "clear-sim: <new_session_id>" - chat-triggered
+# simulations of Claude Code's own /compact and /clear mechanisms. Real
+# Claude Code context compaction does NOT exist in assistant_server.py (it's
+# a plain HTTP server, not the Claude Code CLI runtime) - these commands call
+# the exact same mc.py functions Stage R/AF proved under a genuine /compact
+# and /clear (mc.save_snapshot/compare_snapshots, mc.get_most_recent_role/
+# set_role/clear_recovery_verified) directly from chat, so the underlying
+# mechanism is real even though the trigger is simulated. See decisions.md,
+# 2026-08-09.
+_CLEAR_SIM_RE = re.compile(r"^clear-sim\s*[:=-]\s*(?P<session_id>.+)$", re.I | re.S)
+
 
 def _json_safe(value):
     if isinstance(value, dict):
@@ -206,6 +217,22 @@ def _decisions_for_query(message: str) -> str | None:
         return None
     entity = _clip(match.group("entity"), 200)
     return entity or None
+
+
+def _is_compact_command(message: str) -> bool:
+    """'compact' or 'compact:' - no payload, unlike the other prefix commands."""
+
+    return message.strip().lower().rstrip(":") == "compact"
+
+
+def _clear_sim_session_id(message: str) -> str | None:
+    """Extract the target session id from an explicit 'clear-sim: ...' message."""
+
+    match = _CLEAR_SIM_RE.match(message.strip())
+    if not match:
+        return None
+    session_id = _clip(match.group("session_id"), 200)
+    return session_id or None
 
 
 def _task_add_title(message: str) -> str | None:
@@ -739,6 +766,65 @@ def _projects_report(*, db_path: Path) -> str:
     return f"Projects:\n{lines}"
 
 
+def _compact_report(session_id: str, *, db_path: Path) -> str:
+    """Answer for the 'compact:' command (Stage BB) - a chat-triggered
+    simulation of Claude Code's own /compact mechanism.
+
+    assistant_server.py is a plain HTTP server; it has no real Claude Code
+    context window to compact. This calls the exact snapshot/diff functions
+    Stage R proved under a genuine /compact (mc.save_snapshot,
+    mc.compare_snapshots) back-to-back against the *current* MC state, so
+    the underlying loss-detection mechanism is real even though there is no
+    actual compaction event triggering it. A real /compact can still only be
+    exercised inside the Claude Code terminal itself (see decisions.md,
+    2026-08-09).
+    """
+
+    mc.save_snapshot(session_id, "pre", db_path=db_path)
+    mc.save_snapshot(session_id, "post", db_path=db_path)
+    findings = mc.compare_snapshots(session_id, db_path=db_path)
+    if findings:
+        lines = "\n".join(f"- {finding}" for finding in findings)
+        return f"compact simulation: DEGRADED\n{lines}"
+    snapshot = mc.compact_snapshot(session_id, db_path=db_path)
+    total = (
+        len(snapshot["tasks"])
+        + snapshot["decisions"]
+        + snapshot["checklist_items"]
+        + (1 if snapshot["role_declared"] else 0)
+    )
+    return f"compact simulation: {total}/{total} items intact"
+
+
+def _clear_sim_report(new_session_id: str, *, db_path: Path) -> str:
+    """Answer for the 'clear-sim: <new_session_id>' command (Stage BB) - a
+    chat-triggered simulation of Claude Code's own /clear mechanism.
+
+    Runs the real Stage AF role-inheritance logic (mc.get_most_recent_role
+    -> mc.set_role) against a brand-new session id, exactly as
+    hooks/session_start.py does on a genuine /clear, then reports
+    mc.clear_recovery_verified() for that new id. The live chat session
+    (whatever session_id this request actually came in on) is never touched
+    - this only ever writes to the new id given after the colon.
+    """
+
+    mc.ensure_session(new_session_id, db_path=db_path)
+    inherited = mc.get_most_recent_role(db_path=db_path)
+    if inherited:
+        mc.set_role(new_session_id, inherited, db_path=db_path)
+        role_line = f"role inherited: {inherited}"
+    else:
+        role_line = "NOTE: no previous role found, defaulting to brozzer"
+    verified = mc.clear_recovery_verified(new_session_id, db_path=db_path)
+    checkpoint_state = "present" if verified["latest_checkpoint"] else "none"
+    return (
+        f"clear-sim for '{new_session_id}':\n"
+        f"- {role_line}\n"
+        f"- verified: role={verified['role']}, verified_flag={verified['verified']}, "
+        f"{len(verified['open_task_ids'])} open tasks, checkpoint={checkpoint_state}"
+    )
+
+
 def _complete_task_via_chat(task_id: int, session_id: str, *, db_path: Path) -> str:
     """Real mc.complete_task() call from chat (Stage AV) - errors are shown as-is,
     proving the completion guard instead of hiding behind a friendly message."""
@@ -882,6 +968,7 @@ def answer_message(message: str, session_id: str = DEFAULT_SESSION_ID, *, db_pat
     depends_query = _depends_query(message)
     mentions_query = _mentions_query(message)
     decisions_for_query = _decisions_for_query(message)
+    clear_sim_session_id = _clear_sim_session_id(message)
     if _is_status_command(message):
         answer = _status_report(context, session_id=session_id, db_path=db_path)
         engine = "status-command"
@@ -900,6 +987,12 @@ def answer_message(message: str, session_id: str = DEFAULT_SESSION_ID, *, db_pat
     elif decisions_for_query:
         answer = _decisions_for_report(decisions_for_query, db_path=db_path)
         engine = "decisions-for-command"
+    elif _is_compact_command(message):
+        answer = _compact_report(session_id, db_path=db_path)
+        engine = "compact-command"
+    elif clear_sim_session_id:
+        answer = _clear_sim_report(clear_sim_session_id, db_path=db_path)
+        engine = "clear-sim-command"
     elif _is_projects_command(message):
         answer = _projects_report(db_path=db_path)
         engine = "projects-command"

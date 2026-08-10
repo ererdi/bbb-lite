@@ -1276,5 +1276,175 @@ class ConfirmTaskWithTestGuardIntegrationTestCase(unittest.TestCase):
         self.assertEqual("in_progress", tasks[task_id]["status"])
 
 
+class CompactAndClearSimParsingTestCase(unittest.TestCase):
+    def test_compact_command_recognized_with_and_without_colon(self) -> None:
+        self.assertTrue(assistant_server._is_compact_command("compact:"))
+        self.assertTrue(assistant_server._is_compact_command("  Compact  "))
+        self.assertFalse(assistant_server._is_compact_command("compact this please"))
+
+    def test_clear_sim_session_id_extracted_from_prefix(self) -> None:
+        self.assertEqual(
+            "test-session-99",
+            assistant_server._clear_sim_session_id("clear-sim: test-session-99"),
+        )
+
+    def test_clear_sim_session_id_none_without_prefix(self) -> None:
+        self.assertIsNone(assistant_server._clear_sim_session_id("please clear the sim"))
+
+
+class CompactSimulationIntegrationTestCase(unittest.TestCase):
+    """Stage BB, no-mock proof: 'compact:' must call the *real*
+    mc.save_snapshot/mc.compare_snapshots pair Stage R already proved under a
+    genuine /compact, not a mocked stand-in. There is no real Claude Code
+    context window here (see decisions.md, 2026-08-09), so this only proves
+    the underlying snapshot/diff mechanism, not an actual compaction event."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        self.db_path = Path(tmp.name)
+        self.db_path.unlink()
+        assistant_server.mc.init_db(self.db_path)
+
+    def tearDown(self) -> None:
+        self.db_path.unlink(missing_ok=True)
+
+    def _mock_context(self, **overrides):
+        base = {
+            "session_id": "web",
+            "role": "builder",
+            "permissions": {"code": True, "data": True},
+            "declared_role": None,
+            "checkpoint": None,
+            "keyword_memory": [],
+            "semantic_memory": [],
+            "graph_memory": [],
+            "open_tasks": [],
+            "health": "healthy",
+            "session_score": {"overall_score": 90},
+            "memory_conflicts": [],
+        }
+        base.update(overrides)
+        return mock.patch("assistant_server.collect_context", return_value=base)
+
+    def test_compact_command_writes_two_real_snapshot_rows_and_compares_them(self) -> None:
+        assistant_server.mc.add_task("seed task", session_id="web", db_path=self.db_path)
+        assistant_server.mc.set_role("web", "builder", db_path=self.db_path)
+
+        with self._mock_context(), mock.patch("assistant_server.run_claude", return_value="ok"):
+            result = assistant_server.answer_message("compact:", "web", db_path=self.db_path)
+
+        self.assertEqual("compact-command", result["engine"])
+        self.assertIn("compact simulation: ", result["answer"])
+        self.assertIn("items intact", result["answer"])
+
+        with contextlib.closing(assistant_server.mc._connect(self.db_path)) as conn:
+            rows = conn.execute(
+                "SELECT phase FROM compact_snapshots WHERE session_id = 'web' ORDER BY id"
+            ).fetchall()
+        self.assertEqual(["pre", "post"], [row["phase"] for row in rows])
+
+        # Real compare_snapshots() against the two rows just written must
+        # agree with what the chat answer reported: no loss.
+        self.assertEqual([], assistant_server.mc.compare_snapshots("web", db_path=self.db_path))
+
+    def test_compact_command_reports_real_findings_when_compare_detects_loss(self) -> None:
+        """Formats mc.compare_snapshots()'s real return shape (a list of
+        finding strings) into the DEGRADED answer - only the trigger
+        (mc.compare_snapshots itself) is stubbed here to force the loss
+        branch, since '_compact_report' takes its own pre/post snapshots
+        back-to-back and so cannot itself lose anything mid-call."""
+
+        with self._mock_context(), \
+            mock.patch("assistant_server.run_claude", return_value="ok"), \
+            mock.patch(
+                "assistant_server.mc.compare_snapshots",
+                return_value=["tasks: 5 -> 4, 1 missing (ids: [3])"],
+            ):
+            result = assistant_server.answer_message("compact:", "web", db_path=self.db_path)
+
+        self.assertEqual("compact-command", result["engine"])
+        self.assertIn("compact simulation: DEGRADED", result["answer"])
+        self.assertIn("tasks: 5 -> 4, 1 missing (ids: [3])", result["answer"])
+
+
+class ClearSimIntegrationTestCase(unittest.TestCase):
+    """Stage BB, no-mock proof: 'clear-sim: <new_id>' must call the *real*
+    Stage AF role-inheritance functions (mc.get_most_recent_role ->
+    mc.set_role) and mc.clear_recovery_verified against the new session id,
+    exactly like hooks/session_start.py does for a genuine /clear - and must
+    leave the live chat session_id untouched."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        self.db_path = Path(tmp.name)
+        self.db_path.unlink()
+        assistant_server.mc.init_db(self.db_path)
+
+    def tearDown(self) -> None:
+        self.db_path.unlink(missing_ok=True)
+
+    def _mock_context(self, **overrides):
+        base = {
+            "session_id": "web",
+            "role": "brozzer",
+            "permissions": {"code": False, "data": False},
+            "declared_role": None,
+            "checkpoint": None,
+            "keyword_memory": [],
+            "semantic_memory": [],
+            "graph_memory": [],
+            "open_tasks": [],
+            "health": "healthy",
+            "session_score": {"overall_score": 90},
+            "memory_conflicts": [],
+        }
+        base.update(overrides)
+        return mock.patch("assistant_server.collect_context", return_value=base)
+
+    def test_clear_sim_inherits_most_recent_role_into_the_new_id_only(self) -> None:
+        # Declared on a different, older session - proves get_most_recent_role()
+        # (not "whatever role the live session has") drives the inheritance,
+        # same as real Stage AF when the live session never declared a role.
+        assistant_server.mc.set_role("s-other", "architect", db_path=self.db_path)
+        self.assertFalse(assistant_server.mc.role_exists("web", db_path=self.db_path))
+
+        with self._mock_context(), mock.patch("assistant_server.run_claude", return_value="ok"):
+            result = assistant_server.answer_message(
+                "clear-sim: test-session-99", "web", db_path=self.db_path
+            )
+
+        self.assertEqual("clear-sim-command", result["engine"])
+        self.assertIn("role inherited: architect", result["answer"])
+        self.assertTrue(
+            assistant_server.mc.role_exists("test-session-99", db_path=self.db_path)
+        )
+        self.assertEqual(
+            "architect", assistant_server.mc.get_role("test-session-99", db_path=self.db_path)
+        )
+
+        # The live chat session_id ("web") must not have been touched.
+        self.assertFalse(assistant_server.mc.role_exists("web", db_path=self.db_path))
+
+        verified = assistant_server.mc.clear_recovery_verified(
+            "test-session-99", db_path=self.db_path
+        )
+        self.assertTrue(verified["verified"])
+        self.assertEqual("architect", verified["role"])
+
+    def test_clear_sim_with_no_prior_role_reports_the_honest_default_note(self) -> None:
+        with self._mock_context(), mock.patch("assistant_server.run_claude", return_value="ok"):
+            result = assistant_server.answer_message(
+                "clear-sim: test-session-100", "web", db_path=self.db_path
+            )
+
+        self.assertEqual("clear-sim-command", result["engine"])
+        self.assertIn("NOTE: no previous role found, defaulting to brozzer", result["answer"])
+        self.assertFalse(
+            assistant_server.mc.role_exists("test-session-100", db_path=self.db_path)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
