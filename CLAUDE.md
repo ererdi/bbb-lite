@@ -2,6 +2,8 @@
 
 Independent learning project (not affiliated with any production BBB system).
 
+For background on stakeholder history, see PROJECT-HISTORY.md.
+
 ## Rules
 
 - Code (variable names, comments) is written in English. Conversation with the
