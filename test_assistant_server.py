@@ -1012,6 +1012,58 @@ class ProjectsCommandTestCase(unittest.TestCase):
         list_projects.assert_called_once_with(db_path=assistant_server.mc.DB_PATH)
 
 
+class ReviewCommandTestCase(unittest.TestCase):
+    def _mock_context(self):
+        return mock.patch(
+            "assistant_server.collect_context",
+            return_value={
+                "session_id": "web",
+                "role": "builder",
+                "permissions": {"code": True, "data": True},
+                "declared_role": None,
+                "checkpoint": None,
+                "keyword_memory": [],
+                "semantic_memory": [],
+                "graph_memory": [],
+                "open_tasks": [],
+                "health": "healthy",
+                "session_score": {"overall_score": 90},
+                "memory_conflicts": [],
+            },
+        )
+
+    def test_review_command_recognized(self) -> None:
+        self.assertTrue(assistant_server._is_review_command("  review  "))
+        self.assertTrue(assistant_server._is_review_command("gözden geçir"))
+        self.assertFalse(assistant_server._is_review_command("please review this"))
+
+    def test_review_command_bundles_snapshot_without_calling_claude(self) -> None:
+        with self._mock_context(), \
+            mock.patch("assistant_server.run_claude") as claude, \
+            mock.patch(
+                "assistant_server.mc.review",
+                return_value={
+                    "inbox": [{"id": 5, "title": "untriaged task"}],
+                    "overdue": [{"id": 6, "title": "late task", "due_date": "2026-01-01"}],
+                    "upcoming": [{"id": 7, "title": "soon task", "due_date": "2026-12-31"}],
+                },
+            ) as review_mock, \
+            mock.patch("assistant_server.mc.write_checkpoint"), \
+            mock.patch("assistant_server.mc.record_turn"), \
+            mock.patch("assistant_server.mc.record_event"), \
+            mock.patch("assistant_server.mc.record_answer_quality", return_value=1), \
+            mock.patch("assistant_server.mc.record_evidence", return_value=1), \
+            mock.patch("assistant_server.mc.record_answer_receipt", return_value=3):
+            result = assistant_server.answer_message("review", "web")
+
+        claude.assert_not_called()
+        self.assertEqual("review-command", result["engine"])
+        self.assertIn("#5 untriaged task", result["answer"])
+        self.assertIn("#6 late task (due 2026-01-01)", result["answer"])
+        self.assertIn("#7 soon task (due 2026-12-31)", result["answer"])
+        review_mock.assert_called_once_with(db_path=assistant_server.mc.DB_PATH)
+
+
 class DecisionSearchableIntegrationTestCase(unittest.TestCase):
     """Stage AX, no-mock proof: a chat 'decision: ...' message must end up
     findable through the real mc.search_memory(), not just recorded as a

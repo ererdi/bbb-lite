@@ -85,6 +85,7 @@ _STATUS_COMMAND_WORDS = {"status", "durum"}
 # into chat here; see decisions.md for the reasoning.
 _EXISTS_RE = re.compile(r"^(?:exists|var\s*m[ıi])\s*[:=-]\s*(?P<query>.+)$", re.I | re.S)
 _PROJECTS_COMMAND_WORDS = {"projects", "projeler"}
+_REVIEW_COMMAND_WORDS = {"review", "gözden geçir"}
 
 # "callers: <symbol>" -> mc.find_callers() ("calls" edges from index_symbols()).
 # "depends: <node>" -> mc.graph_depends_on() (curated "depends-on" edges from
@@ -311,6 +312,10 @@ def _exists_query(message: str) -> str | None:
 
 def _is_projects_command(message: str) -> bool:
     return message.strip().lower() in _PROJECTS_COMMAND_WORDS
+
+
+def _is_review_command(message: str) -> bool:
+    return message.strip().lower() in _REVIEW_COMMAND_WORDS
 
 
 def _callers_query(message: str) -> str | None:
@@ -766,6 +771,30 @@ def _projects_report(*, db_path: Path) -> str:
     return f"Projects:\n{lines}"
 
 
+def _review_report(*, db_path: Path) -> str:
+    """Answer for the 'review' / 'gözden geçir' command (bbb-os-core parity
+    item 7) - a GTD-style bundle of inbox/overdue/upcoming, read-only."""
+
+    snapshot = _safe_call(
+        {"inbox": [], "overdue": [], "upcoming": []}, mc.review, db_path=db_path
+    )
+    def _section(title: str, items: list[dict], *, with_due: bool) -> list[str]:
+        section = [f"{title} ({len(items)}):"]
+        if not items:
+            section.append("- none")
+        elif with_due:
+            section.extend(f"- #{t.get('id')} {t.get('title')} (due {t.get('due_date')})" for t in items)
+        else:
+            section.extend(f"- #{t.get('id')} {t.get('title')}" for t in items)
+        return section
+
+    lines = []
+    lines.extend(_section("Inbox", snapshot["inbox"], with_due=False))
+    lines.extend(_section("Overdue", snapshot["overdue"], with_due=True))
+    lines.extend(_section("Upcoming", snapshot["upcoming"], with_due=True))
+    return "\n".join(lines)
+
+
 def _compact_report(session_id: str, *, db_path: Path) -> str:
     """Answer for the 'compact:' command (Stage BB) - a chat-triggered
     simulation of Claude Code's own /compact mechanism.
@@ -996,6 +1025,9 @@ def answer_message(message: str, session_id: str = DEFAULT_SESSION_ID, *, db_pat
     elif _is_projects_command(message):
         answer = _projects_report(db_path=db_path)
         engine = "projects-command"
+    elif _is_review_command(message):
+        answer = _review_report(db_path=db_path)
+        engine = "review-command"
     else:
         prompt = build_prompt(message, context)
         answer = run_claude(prompt)

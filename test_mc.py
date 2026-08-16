@@ -39,15 +39,15 @@ class McTestCase(unittest.TestCase):
         self.assertEqual(
             {
                 "sessions", "checkpoints", "tasks", "memory_index", "task_activity",
-                "task_completions",
+                "task_completions", "task_receipts",
                 "projects", "sprints", "roles", "turns", "decision_packets",
                 "dispatch_runs", "agent_outputs", "evidence", "events_log",
                 "capability_boundaries", "graph_nodes", "graph_edges",
                 "answer_quality_scores", "answer_receipts", "lifecycle_runs",
                 "decisions", "compact_snapshots", "documents",
                 "context_nodes", "context_edges",
-                "doc_index", "symbol_index",
-                "term_aliases", "health_events", "pending_merges",
+                "doc_index", "symbol_index", "reuse_receipts",
+                "term_aliases", "health_events", "pending_merges", "maintenance_runs",
             },
             names,
         )

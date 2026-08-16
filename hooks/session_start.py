@@ -40,6 +40,14 @@ def main() -> None:
             f"[bbb-lite] SYSTEM HEALTH: {health_state} - see health_events for details"
         )
 
+    # bbb-os-core parity item 3: hook-triggered maintenance battery, the
+    # daemon-free local analog of its "Living Contract" self-check. Fail-soft
+    # - a broken check must not itself block session start.
+    try:
+        mc.run_maintenance_checks(session_id)
+    except Exception:
+        pass
+
     # Look up any earlier session tied to this client_session_uuid BEFORE
     # ensure_session() below tags the *current* session_id with it - otherwise
     # the lookup would just find itself.

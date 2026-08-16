@@ -561,6 +561,19 @@ def init_db(db_path: Path = DB_PATH) -> None:
             )"""
         )
         conn.execute(
+            """CREATE TABLE IF NOT EXISTS reuse_receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                query TEXT NOT NULL,
+                match_source_table TEXT,
+                match_ref TEXT,
+                match_score REAL,
+                decision TEXT NOT NULL,
+                note TEXT,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
             """CREATE TABLE IF NOT EXISTS task_activity (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 task_id INTEGER NOT NULL,
@@ -578,6 +591,18 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 completed_by_role TEXT NOT NULL,
                 completion_summary TEXT NOT NULL,
                 completed_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS task_receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL,
+                task_completion_id INTEGER NOT NULL UNIQUE,
+                evidence_id INTEGER NOT NULL,
+                accepted_by_session TEXT NOT NULL,
+                accepted_by_role TEXT NOT NULL,
+                state_hash TEXT NOT NULL,
+                accepted_at TEXT NOT NULL
             )"""
         )
         conn.execute(
@@ -639,6 +664,21 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 session_id TEXT,
                 source TEXT NOT NULL,
                 details_json TEXT,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        existing_events_log_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(events_log)").fetchall()
+        }
+        if "outbox_status" not in existing_events_log_columns:
+            conn.execute("ALTER TABLE events_log ADD COLUMN outbox_status TEXT")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS maintenance_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                check_name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                detail TEXT,
                 created_at TEXT NOT NULL
             )"""
         )
@@ -822,6 +862,9 @@ def init_db(db_path: Path = DB_PATH) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS lifecycle_runs_session ON lifecycle_runs(session_id, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS decisions_session ON decisions(session_id, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS compact_snapshots_session ON compact_snapshots(session_id, phase, taken_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS reuse_receipts_session ON reuse_receipts(session_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS task_receipts_task ON task_receipts(task_id, accepted_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS maintenance_runs_created ON maintenance_runs(created_at)")
         for capability, reason in DEFAULT_CAPABILITY_BOUNDARIES.items():
             conn.execute(
                 """INSERT OR IGNORE INTO capability_boundaries
@@ -871,10 +914,10 @@ def find_session_by_client_uuid(
 
 
 ROLE_PERMISSIONS = {
-    "brozzer": {"code": False, "data": False},
-    "advisor": {"code": False, "data": True},
-    "architect": {"code": False, "data": True},
-    "builder": {"code": True, "data": True},
+    "brozzer": {"code": False, "data": False, "accept": False},
+    "advisor": {"code": False, "data": True, "accept": False},
+    "architect": {"code": False, "data": True, "accept": True},
+    "builder": {"code": True, "data": True, "accept": True},
 }
 
 
@@ -929,6 +972,10 @@ def can_write_code(session_id: str, db_path: Path = DB_PATH) -> bool:
 
 def can_write_data(session_id: str, db_path: Path = DB_PATH) -> bool:
     return ROLE_PERMISSIONS[get_role(session_id, db_path=db_path)]["data"]
+
+
+def can_accept_work(session_id: str, db_path: Path = DB_PATH) -> bool:
+    return ROLE_PERMISSIONS[get_role(session_id, db_path=db_path)]["accept"]
 
 
 def write_checkpoint(
@@ -1289,23 +1336,51 @@ def record_event(
     details: dict | None = None,
     db_path: Path = DB_PATH,
 ) -> int:
-    """Append one operational event; details are JSON so callers keep structure."""
+    """Append one operational event; details are JSON so callers keep structure.
+
+    outbox_status='pending' on every new row is the minimal local analog of
+    bbb-os-core's publication/outbox (bbb-lite has no live consumers to
+    publish to, so this just tags 'unread' vs 'read' on the log that already
+    exists - see list_pending_events()/mark_consumed())."""
 
     with contextlib.closing(_connect(db_path)) as conn:
         cur = conn.execute(
             """INSERT INTO events_log
-               (event_type, session_id, source, details_json, created_at)
-               VALUES (?, ?, ?, ?, ?)""",
+               (event_type, session_id, source, details_json, created_at, outbox_status)
+               VALUES (?, ?, ?, ?, ?, ?)""",
             (
                 event_type,
                 session_id,
                 source,
                 json.dumps(details or {}, ensure_ascii=False, sort_keys=True),
                 _now(),
+                "pending",
             ),
         )
         conn.commit()
         return cur.lastrowid
+
+
+def list_pending_events(limit: int = 20, db_path: Path = DB_PATH) -> list[dict]:
+    """events_log rows with outbox_status='pending', oldest-first. No consumer
+    exists yet (single local file, no server) - this just gives a future one
+    (even a manual mc.py CLI command) something to poll."""
+
+    return query_rows(
+        "SELECT * FROM events_log WHERE outbox_status = 'pending' ORDER BY created_at LIMIT ?",
+        (limit,),
+        db_path=db_path,
+    )
+
+
+def mark_consumed(event_id: int, db_path: Path = DB_PATH) -> None:
+    """Flip one events_log row from 'pending' to 'consumed'."""
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        conn.execute(
+            "UPDATE events_log SET outbox_status = 'consumed' WHERE id = ?", (event_id,)
+        )
+        conn.commit()
 
 
 def list_events(limit: int = 20, db_path: Path = DB_PATH) -> list[dict]:
@@ -2532,6 +2607,132 @@ def check_floor(db_path: Path = DB_PATH) -> list[str]:
     return findings
 
 
+_MAINTENANCE_CHECK_NAMES = (
+    "integrity",
+    "orphaned_graph_edges",
+    "orphaned_context_edges",
+    "overdue_reminders",
+    "memory_currentness_conflicts",
+)
+
+
+def run_maintenance_checks(session_id: str | None = None, *, db_path: Path = DB_PATH) -> list[dict]:
+    """Fixed local-assertion battery, triggered from hooks (SessionStart/Stop)
+    rather than a daemon/scheduler - the no-server equivalent of bbb-os-core's
+    "Living Contract" self-check (bbb-lite parity item 3).
+
+    Every check's pass/fail lands in maintenance_runs regardless of outcome;
+    only FAILURES also get a health_events row (component='maintenance') so
+    they surface via get_health_state() - passes deliberately don't, since
+    get_health_state() counts ANY recent health_events row toward its
+    degraded/blocked thresholds, and a row per passing check would push a
+    single clean run to 'blocked' (a false positive that would break the
+    exact mechanism this feature feeds).
+
+    Each check runs in its own try/except (matches the fail-soft pattern
+    already used for Stage AT's conflict check in hooks/session_start.py) so
+    one broken check can't abort the rest. Returns the list of
+    {"check_name", "status", "detail"} dicts recorded, for callers that want
+    to inspect the outcome directly instead of querying maintenance_runs.
+    """
+
+    results: list[dict] = []
+
+    def _record(check_name: str, status: str, detail: str | None) -> None:
+        with contextlib.closing(_connect(db_path)) as conn:
+            conn.execute(
+                """INSERT INTO maintenance_runs (session_id, check_name, status, detail, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (session_id, check_name, status, detail, _now()),
+            )
+            conn.commit()
+        if status == "fail":
+            log_health_event("maintenance", check_name, detail, session_id, db_path=db_path)
+        results.append({"check_name": check_name, "status": status, "detail": detail})
+
+    try:
+        with contextlib.closing(_connect(db_path)) as conn:
+            rows = conn.execute("PRAGMA integrity_check").fetchall()
+        ok = len(rows) == 1 and rows[0][0] == "ok"
+        _record("integrity", "pass" if ok else "fail", None if ok else str([tuple(r) for r in rows]))
+    except Exception as exc:
+        _record("integrity", "fail", f"check raised: {exc}")
+
+    try:
+        with contextlib.closing(_connect(db_path)) as conn:
+            count = conn.execute(
+                """SELECT COUNT(*) FROM graph_edges
+                   WHERE src NOT IN (SELECT node_id FROM graph_nodes)
+                      OR dst NOT IN (SELECT node_id FROM graph_nodes)"""
+            ).fetchone()[0]
+        _record(
+            "orphaned_graph_edges",
+            "pass" if count == 0 else "fail",
+            None if count == 0 else f"{count} graph_edges row(s) reference a missing node",
+        )
+    except Exception as exc:
+        _record("orphaned_graph_edges", "fail", f"check raised: {exc}")
+
+    try:
+        with contextlib.closing(_connect(db_path)) as conn:
+            count = conn.execute(
+                """SELECT COUNT(*) FROM context_edges
+                   WHERE from_node_id NOT IN (SELECT id FROM context_nodes)
+                      OR to_node_id NOT IN (SELECT id FROM context_nodes)"""
+            ).fetchone()[0]
+        _record(
+            "orphaned_context_edges",
+            "pass" if count == 0 else "fail",
+            None if count == 0 else f"{count} context_edges row(s) reference a missing node",
+        )
+    except Exception as exc:
+        _record("orphaned_context_edges", "fail", f"check raised: {exc}")
+
+    try:
+        overdue = list_overdue_reminders(db_path=db_path)
+        _record(
+            "overdue_reminders",
+            "pass" if not overdue else "fail",
+            None if not overdue else f"{len(overdue)} task(s) past due_date and still open",
+        )
+    except Exception as exc:
+        _record("overdue_reminders", "fail", f"check raised: {exc}")
+
+    try:
+        checkpoint = latest_checkpoint(session_id, db_path=db_path) if session_id else None
+        if checkpoint and checkpoint["current_task"]:
+            conflicts = detect_memory_conflicts(checkpoint["current_task"], db_path=db_path)
+            _record(
+                "memory_currentness_conflicts",
+                "pass" if not conflicts else "fail",
+                None if not conflicts else f"{len(conflicts)} conflicting memory record(s)",
+            )
+        # No checkpoint/current_task to check against - nothing to record,
+        # not a failure (matches session_start.py's own skip in that case).
+    except Exception as exc:
+        _record("memory_currentness_conflicts", "fail", f"check raised: {exc}")
+
+    return results
+
+
+def list_maintenance_runs(
+    limit: int = 20, session_id: str | None = None, db_path: Path = DB_PATH
+) -> list[dict]:
+    """Recent maintenance_runs rows, newest first, optionally for one session."""
+
+    if session_id is None:
+        return query_rows(
+            "SELECT * FROM maintenance_runs ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+            db_path=db_path,
+        )
+    return query_rows(
+        "SELECT * FROM maintenance_runs WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
+        (session_id, limit),
+        db_path=db_path,
+    )
+
+
 def mark_session_completed(session_id: str, db_path: Path = DB_PATH) -> None:
     with contextlib.closing(_connect(db_path)) as conn:
         conn.execute(
@@ -3012,7 +3213,7 @@ def complete_task(
             "INSERT INTO task_activity (task_id, session_id, activity, at) VALUES (?, ?, ?, ?)",
             (task_id, session_id, "completed", now),
         )
-        conn.execute(
+        completion_cursor = conn.execute(
             """INSERT INTO task_completions
                (task_id, session_id, evidence_id, completed_by_role, completion_summary, completed_at)
                VALUES (?, ?, ?, ?, ?, ?)""",
@@ -3025,7 +3226,112 @@ def complete_task(
         "status": "done",
         "evidence_id": evidence_id,
         "completed_by_role": completed_by_role,
+        "task_completion_id": completion_cursor.lastrowid,
     }
+
+
+def accept_task_completion(
+    task_completion_id: int,
+    *,
+    session_id: str,
+    db_path: Path = DB_PATH,
+) -> dict:
+    """Layer 'accepted, by which role, bound to what evidence/state' on top of
+    an existing task_completions row (bbb-os-core parity items 2/4/6:
+    reported != accepted, with the acceptance guard doubling as the local,
+    table-free equivalent of a certifier/acceptance-manifest, and role-gating
+    standing in for a hardcoded named approver). Does NOT touch tasks.status
+    - complete_task() already set that; this is a separate, optional
+    acceptance record.
+
+    Guard clauses, all raising ValueError:
+    - the accepting session's role must have ROLE_PERMISSIONS[...]['accept'] == True
+    - the completion's evidence row must still be status != 'fail' (re-checked
+      here, not just trusted from complete_task() time - evidence status can
+      change after the fact)
+    - get_health_state() must not be 'blocked'
+    - the same task_completion_id cannot be accepted twice (task_receipts.task_completion_id
+      is UNIQUE)
+
+    The accepting session need not differ from the reporting session -
+    bbb-lite is single-user, unlike bbb-os-core's multi-person live system.
+    """
+
+    if not can_accept_work(session_id, db_path=db_path):
+        raise ValueError(f"role {get_role(session_id, db_path=db_path)!r} cannot accept work")
+
+    completion_rows = query_rows(
+        "SELECT * FROM task_completions WHERE id = ?", (task_completion_id,), db_path=db_path
+    )
+    if not completion_rows:
+        raise ValueError(f"task_completion not found: {task_completion_id}")
+    completion = completion_rows[0]
+
+    evidence_rows = query_rows(
+        "SELECT * FROM evidence WHERE id = ?", (completion["evidence_id"],), db_path=db_path
+    )
+    if not evidence_rows:
+        raise ValueError(f"evidence not found: {completion['evidence_id']}")
+    if evidence_rows[0]["status"] == "fail":
+        raise ValueError("cannot accept a completion whose evidence now shows a failure")
+
+    if get_health_state(db_path=db_path) == "blocked":
+        raise ValueError("cannot accept work while system health is 'blocked'")
+
+    state_hash = hashlib.sha256(
+        json.dumps(
+            {
+                "task_id": completion["task_id"],
+                "evidence_id": completion["evidence_id"],
+                "completion_summary": completion["completion_summary"],
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+
+    accepted_by_role = get_role(session_id, db_path=db_path)
+    now = _now()
+    with contextlib.closing(_connect(db_path)) as conn:
+        try:
+            cursor = conn.execute(
+                """INSERT INTO task_receipts
+                   (task_id, task_completion_id, evidence_id, accepted_by_session,
+                    accepted_by_role, state_hash, accepted_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    completion["task_id"],
+                    task_completion_id,
+                    completion["evidence_id"],
+                    session_id,
+                    accepted_by_role,
+                    state_hash,
+                    now,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            raise ValueError(f"task_completion already accepted: {task_completion_id}")
+        conn.commit()
+    return {
+        "ok": True,
+        "task_receipt_id": cursor.lastrowid,
+        "task_id": completion["task_id"],
+        "accepted_by_role": accepted_by_role,
+        "state_hash": state_hash,
+    }
+
+
+def list_task_receipts(task_id: int | None = None, db_path: Path = DB_PATH) -> list[dict]:
+    """All task_receipts, or only task_id's if given, newest first."""
+
+    if task_id is None:
+        return query_rows(
+            "SELECT * FROM task_receipts ORDER BY accepted_at DESC", db_path=db_path
+        )
+    return query_rows(
+        "SELECT * FROM task_receipts WHERE task_id = ? ORDER BY accepted_at DESC",
+        (task_id,),
+        db_path=db_path,
+    )
 
 
 _STOPWORDS = {
@@ -4161,6 +4467,54 @@ def cyg_exists(
     return {"exists": exists, "match": best if exists else None, "score": score}
 
 
+_REUSE_DECISIONS = {"reuse", "build_new", "no_match"}
+
+
+def _match_ref(match: dict) -> tuple[str | None, str | None, float | None]:
+    """(match_source_table, match_ref, match_score) from a cyg_exists()/
+    cyg_similar() hit dict. A symbol hit has no row id (search_symbols()
+    deliberately excludes the embedding/id columns), so the ref is a natural
+    string key: "<file_path>::<symbol_name>" for a symbol hit, "<file_path>"
+    for a doc hit."""
+
+    source_table = match.get("source_table")
+    if "symbol_name" in match:
+        ref = f"{match['file_path']}::{match['symbol_name']}"
+    else:
+        ref = match.get("file_path")
+    return source_table, ref, match.get("similarity")
+
+
+def log_reuse_decision(
+    session_id: str,
+    query: str,
+    decision: str,
+    *,
+    match: dict | None = None,
+    note: str | None = None,
+    db_path: Path = DB_PATH,
+) -> int:
+    """Record what a caller did with a cyg_exists()/cyg_similar() hit (Stage
+    AN's reuse-before-build Golden Rule, now with a receipt instead of just a
+    search result). Log-only, not a gate — same detection != enforcement
+    split as detect_memory_conflicts()."""
+
+    if decision not in _REUSE_DECISIONS:
+        raise ValueError(f"unknown decision: {decision!r} (expected one of {sorted(_REUSE_DECISIONS)})")
+    match_source_table, match_ref, match_score = (
+        _match_ref(match) if match is not None else (None, None, None)
+    )
+    with contextlib.closing(_connect(db_path)) as conn:
+        cursor = conn.execute(
+            """INSERT INTO reuse_receipts
+               (session_id, query, match_source_table, match_ref, match_score, decision, note, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (session_id, query, match_source_table, match_ref, match_score, decision, note, _now()),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
 def ask_ollama(prompt: str, model: str = "gemma:2b", *, db_path: Path = DB_PATH) -> str | None:
     """Fail-soft call to a local ollama model; None (never raises) if it's unavailable.
 
@@ -4821,16 +5175,31 @@ def create_reminder(
     return {"task_id": task_id, "due_date": due_date, "people": people_result}
 
 
+def _enrich_reminders_with_people(conn: sqlite3.Connection, reminders: list[dict]) -> None:
+    """Attach a "people" list (names from the "involves" graph edges
+    create_reminder() wires up) to each reminder dict in place — [] for
+    plain due_date tasks added via add_task() rather than create_reminder().
+    Shared by list_upcoming_reminders() and list_overdue_reminders()."""
+
+    for reminder in reminders:
+        task_node_id = _graph_node_id("task", str(reminder["id"]))
+        people_rows = conn.execute(
+            """SELECT gn.title FROM graph_edges ge
+               JOIN graph_nodes gn ON gn.node_id = ge.dst
+               WHERE ge.src = ? AND ge.type = 'involves'
+               ORDER BY gn.title""",
+            (task_node_id,),
+        ).fetchall()
+        reminder["people"] = [r["title"] for r in people_rows]
+
+
 def list_upcoming_reminders(within_days: int = 7, db_path: Path = DB_PATH) -> list[dict]:
     """Open (status != 'done') tasks with due_date in [today, today+within_days].
 
     String comparison on "YYYY-MM-DD" is safe (lexicographic order == date
     order). Reminders already past due drop out of the window on purpose —
-    this answers "what's coming up", not "what's overdue".
-
-    Each row also carries a "people" list (names from the "involves" graph
-    edges create_reminder() wires up) — [] for plain due_date tasks added
-    via add_task() rather than create_reminder().
+    this answers "what's coming up", not "what's overdue" (see
+    list_overdue_reminders() for the mirror image).
     """
 
     today = datetime.now(timezone.utc).date().isoformat()
@@ -4844,17 +5213,52 @@ def list_upcoming_reminders(within_days: int = 7, db_path: Path = DB_PATH) -> li
             (today, horizon),
         ).fetchall()
         reminders = [dict(row) for row in rows]
-        for reminder in reminders:
-            task_node_id = _graph_node_id("task", str(reminder["id"]))
-            people_rows = conn.execute(
-                """SELECT gn.title FROM graph_edges ge
-                   JOIN graph_nodes gn ON gn.node_id = ge.dst
-                   WHERE ge.src = ? AND ge.type = 'involves'
-                   ORDER BY gn.title""",
-                (task_node_id,),
-            ).fetchall()
-            reminder["people"] = [r["title"] for r in people_rows]
+        _enrich_reminders_with_people(conn, reminders)
     return reminders
+
+
+def list_overdue_reminders(db_path: Path = DB_PATH) -> list[dict]:
+    """Open tasks whose due_date is in the past — the mirror image of
+    list_upcoming_reminders(), which explicitly excludes past-due by design
+    (bbb-os-core parity item 7, GTD-style 'overdue' view)."""
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            """SELECT * FROM tasks
+               WHERE status != 'done' AND due_date IS NOT NULL AND due_date != ''
+                 AND due_date < ?
+               ORDER BY due_date""",
+            (today,),
+        ).fetchall()
+        reminders = [dict(row) for row in rows]
+        _enrich_reminders_with_people(conn, reminders)
+    return reminders
+
+
+def list_inbox_tasks(db_path: Path = DB_PATH) -> list[dict]:
+    """Open tasks with no sprint_id — the minimal GTD 'inbox' analog
+    (bbb-os-core parity item 7): untriaged work not yet assigned to a
+    project/sprint. sprint_id is the only real task->project link that
+    exists today (tasks has no project_id column), so no schema change is
+    needed."""
+
+    return query_rows(
+        "SELECT * FROM tasks WHERE status != 'done' AND sprint_id IS NULL ORDER BY created_at",
+        db_path=db_path,
+    )
+
+
+def review(db_path: Path = DB_PATH) -> dict:
+    """{"inbox": [...], "overdue": [...], "upcoming": [...]} in one call — a
+    GTD-style review snapshot over existing tasks/reminders (bbb-os-core
+    parity item 7), no new table."""
+
+    return {
+        "inbox": list_inbox_tasks(db_path=db_path),
+        "overdue": list_overdue_reminders(db_path=db_path),
+        "upcoming": list_upcoming_reminders(db_path=db_path),
+    }
 
 
 def list_context_map(only_approved: bool = True, db_path: Path = DB_PATH) -> dict:

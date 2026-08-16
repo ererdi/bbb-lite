@@ -73,6 +73,36 @@ class CygExistsCliTestCase(unittest.TestCase):
             output = _run(cyg_exists, ["anything"])
         self.assertIn("nothing indexed yet", output)
 
+    def test_decision_flag_logs_reuse_receipt(self) -> None:
+        match = {
+            "source_table": "symbol_index",
+            "symbol_name": "calculate_monthly_invoice",
+            "file_path": "billing.py",
+        }
+        with mock.patch("cyg_exists.mc.init_db"), mock.patch(
+            "cyg_exists.mc.cyg_exists",
+            return_value={"exists": True, "score": 0.81, "match": match},
+        ), mock.patch("cyg_exists.mc.log_reuse_decision") as log_mock:
+            _run(cyg_exists, ["calculate", "invoice", "--decision", "reuse", "--session", "s1"])
+        log_mock.assert_called_once_with("s1", "calculate invoice", "reuse", match=match)
+
+    def test_decision_without_session_is_rejected(self) -> None:
+        with mock.patch("cyg_exists.mc.init_db"), mock.patch(
+            "cyg_exists.mc.cyg_exists"
+        ) as cyg_exists_mock, mock.patch("cyg_exists.mc.log_reuse_decision") as log_mock:
+            output = _run(cyg_exists, ["anything", "--decision", "build_new"])
+        self.assertIn("--decision requires --session", output)
+        cyg_exists_mock.assert_not_called()
+        log_mock.assert_not_called()
+
+    def test_decision_flag_logs_no_match_when_nothing_indexed(self) -> None:
+        with mock.patch("cyg_exists.mc.init_db"), mock.patch(
+            "cyg_exists.mc.cyg_exists",
+            return_value={"exists": False, "score": None, "match": None},
+        ), mock.patch("cyg_exists.mc.log_reuse_decision") as log_mock:
+            _run(cyg_exists, ["anything", "--decision", "no_match", "--session", "s1"])
+        log_mock.assert_called_once_with("s1", "anything", "no_match", match=None)
+
 
 class CygSimilarCliTestCase(unittest.TestCase):
     def test_lists_merged_hits(self) -> None:

@@ -391,3 +391,67 @@
   Test (4 parsing + 2 compact + 2 clear-sim = 8 yeni, hepsi geçti): compact:'in gerçek compact_snapshots tablosuna 'pre' ve 'post' satırı yazdığı ve mc.compare_snapshots()'in bağımsızca çağrılınca da aynı "kayıp yok" sonucunu verdiği (mock yok); DEGRADED formatlamasının mc.compare_snapshots()'in gerçek dönüş şeklini (bulgu string listesi) doğru bastığı (sadece bu testte compare_snapshots stub'landı, çünkü _compact_report kendi pre/post'unu arka arkaya aldığı için kendi çağrısı içinde gerçek bir kayıp senaryosu üretemez); clear-sim'in rolü BAŞKA bir session'dan (mock değil, gerçek mc.get_most_recent_role/set_role) doğru şekilde yeni id'ye miras aldırdığı VE canlı "web" session'ının role_exists=False kalarak dokunulmadığının kanıtlandığı; önceki rol hiç yoksa set_role çağrılmadan dürüst NOTE mesajının döndüğü doğrulandı.
 
 - 2026-08-10 - Halüsinasyon örüntüsü 3. kez doğrulandı (decision:/remind: komutları) - model her zaman "data izni yok, kaydedemedim" diyor ama komut GERÇEKTEN kaydediyor (bu sefer decision_packets, K3-seat kararı, packet id=0aa4959...). Bu artık tek seferlik değil, TUTARLI bir davranış - modelin kendi "izin" algısı, gerçek guard mantığıyla hiç örtüşmüyor. Sunumda gösterilecek net bir örnek.
+
+- 2026-08-12 - GitHub'da `TrustSourcing/bbb-os-core` adında yeni bir repo bulundu -
+  kullanıcı bunu "bbb-lite'ın mantıksal olarak gelişmiş hali" olarak tanımladı ve bbb-lite'ı
+  buna göre geliştirmek istedi. İnceleme sonucu bu repo'nun genel amaçlı bir şablon
+  OLMADIĞI, Haroon'un HOSNI adlı makinede çalışan CANLI continuity sistemi olduğu ortaya
+  çıktı: `hooks/core_hook.py` kanonik kimlik/politika/hafızayı bir HOSNI Mission Control
+  API'sinden enjekte ediyor (repo'nun kendi CLAUDE.md'si "NON-CANONICAL" diyor),
+  `PROVENANCE.md` doğrudan `/home/hosni/elohi-voice` ve "Lucy'nin CANLI beyni"ne referans
+  veriyor - yani bizim CLAUDE.md'deki sert sınırın (`/home/hosni/elohi-*`, port 8890/8891 -
+  asla dokunulmaz, canlı müşteri sistemi) bahsettiği ekosistemin ta kendisi. Ayrıca
+  SSH tünelleri, systemd daemon'lar, npm/React web katmanı, Whisper/Kokoro/Telegram
+  entegrasyonları içeriyor - bunların hiçbiri bbb-lite'ın "SQLite-only/tek dosya/sunucu
+  yok/stdlib-only" kurallarıyla uyuşmuyor.
+
+  Kullanıcıyla birlikte kapsam netleştirildi: bbb-os-core salt-okunur referans (haroon-bbb-sync
+  ile aynı kural - asla clone edilmez, asla yazılmaz), CLAUDE.md'nin sert kısıtları SABİT
+  kalır, hedef "%90+ mantıksal/özellik benzerliği" - mimari değil. voice/telegram/SSH/
+  HOSNI-gateway/daemon kısımları ve bir `phases` tablosu tamamen kapsam dışı bırakıldı.
+  Araştırma bbb-lite'ın zaten `evidence`/`answer_receipts`/`health_events`/
+  `decision_packets`/entity-decision graph gibi birçok bbb-os-core kavramını farklı adlarla
+  ÖNDEN uyguladığını, hatta graph/decision alanında bbb-os-core'un önünde olduğunu ortaya
+  çıkardı. Gerçek boşluklar 5 maddeye indirgendi ve hepsi SQLite-only/tek dosya (`mc.py`)
+  kısıtları içinde uygulandı:
+
+  1. **reuse_receipts** - `cyg_exists()`/`cyg_similar()` kararlarını (`reuse`/`build_new`/
+     `no_match`) loglayan yeni tablo + `log_reuse_decision()`; `bin/cyg_exists.py`'ye
+     `--decision`/`--session` bayrağı eklendi.
+  2. **task_receipts accept-step** (bbb-os-core'un "reported ≠ accepted" + certifier +
+     completion-authority üçü birden) - `complete_task()`'ın ÜSTÜNE eklenen ayrı, opsiyonel
+     bir kabul kaydı (`accept_task_completion()`), mevcut `task_activity`/`task_completions`/
+     `complete_task()` davranışı DEĞİŞTİRİLMEDİ. Yetkilendirme, bbb-os-core'un sabit-kodlanmış
+     tek onaylayıcı kişisi yerine mevcut `roles`/`ROLE_PERMISSIONS` mekanizmasına yeni bir
+     "accept" yetkisi eklenerek yapıldı (architect/builder=True, brozzer/advisor=False).
+     Kullanıcıyla onaylandı: kabul eden session'ın raporlayan session'dan farklı olması
+     ZORUNLU DEĞİL (bbb-lite tek kullanıcılı, bbb-os-core'un ayrımı çok-kişili canlı sistem
+     varsayımına dayanıyor).
+  3. **run_maintenance_checks()** (bbb-os-core'un daemon'lu "Living Contract" self-check'inin
+     daemon'suz hali) - `hooks/session_start.py` ve `hooks/stop_checkpoint.py`'ye fail-soft
+     bağlandı, yeni scheduler/süreç YOK. 5 kontrol: PRAGMA integrity_check, orphaned
+     graph_edges, orphaned context_edges, overdue reminders, memory currentness conflicts.
+     Önemli tasarım notu: geçen kontrolller `health_events`'e YAZILMIYOR - `get_health_state()`
+     son 1 saatteki HER health_events satırını sayıyor, geçen kontrolleri de yazmak tek
+     temiz bir çalıştırmayı yanlışlıkla "blocked" gösterirdi (regresyon testiyle kanıtlandı).
+     Sadece başarısız kontroller hem yeni `maintenance_runs` tablosuna hem `health_events`'e
+     yazılıyor.
+  4. **events_log.outbox_status** (bbb-os-core'un publication/outbox'ının minimal karşılığı) -
+     nullable kolon, `record_event()` yeni satırlara `'pending'` yazıyor, eski satırlar
+     `NULL` kalıyor (geriye dönük doldurulmuyor). `list_pending_events()`/`mark_consumed()`
+     eklendi ama gerçek bir tüketici/kuyruk sistemi KURULMADI - bbb-lite'ın tüketecek canlı
+     bir ikinci bileşeni yok, bu sadece ileride biri gelirse diye "okunmadı/okundu" etiketi.
+  5. **GTD inbox/review** (`list_inbox_tasks()`, `list_overdue_reminders()`, `review()`) -
+     yeni tablo yok; "inbox" için `tasks.sprint_id IS NULL` kullanıldı (plandaki ilk varsayım
+     `project_id` idi ama `tasks` tablosunda böyle bir kolon yok, proje bağlantısı sadece
+     `sprint_id -> sprints.project_id` üzerinden dolaylı - şema incelemesiyle düzeltildi).
+     `bin/assistant_server.py`'ye salt-okunur "review"/"gözden geçir" chat komutu eklendi.
+
+  Toplam ~60 yeni test (`test_reuse_receipts.py`, `test_task_acceptance.py`,
+  `test_events_outbox.py`, `test_gtd_inbox.py`, `test_maintenance_checks.py` + mevcut
+  dosyalara ekler), hepsi geçti. Yeni hook çağrısı (`run_maintenance_checks`) 9 ayrı hook
+  testinin `_BOUND_FUNCS` listesine eklenmek zorunda kaldı - eklenmeden önce bu testler
+  gerçek proje `mc.db`'sine karşı çalışıp orada bulduğu gerçek bir checkpoint yüzünden
+  `semantic_search` mock'unu beklenmedik şekilde tetikliyordu (test izolasyonu kırılıyordu).
+  Tam paket 915 test, hepsi yeşil (0 hata) - detaylar `.claude/plans/flickering-brewing-
+  bentley.md` planında.

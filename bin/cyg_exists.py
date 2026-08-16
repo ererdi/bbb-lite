@@ -25,8 +25,19 @@ def main() -> None:
     parser.add_argument(
         "--threshold", type=float, default=0.6, help="Similarity threshold (default 0.6)"
     )
+    parser.add_argument(
+        "--decision",
+        choices=["reuse", "build_new", "no_match"],
+        default=None,
+        help="Record what you did with this check as a reuse receipt (requires --session)",
+    )
+    parser.add_argument("--session", default=None, help="Session id, required with --decision")
     args = parser.parse_args()
     query = " ".join(args.query)
+
+    if args.decision and not args.session:
+        print("[cyg-exists] error: --decision requires --session")
+        return
 
     try:
         mc.init_db()
@@ -38,6 +49,8 @@ def main() -> None:
     print(f"[cyg-exists] query: {query!r}")
     if result["score"] is None:
         print("[cyg-exists] nothing indexed yet - run bin/bbb_graph_ingest.py first")
+        if args.decision:
+            mc.log_reuse_decision(args.session, query, args.decision, match=None)
         return
 
     print(
@@ -48,6 +61,9 @@ def main() -> None:
         match = result["match"]
         label = match.get("symbol_name") or match.get("title") or match["file_path"]
         print(f"[cyg-exists] match: {match['source_table']} - {label} ({match['file_path']})")
+
+    if args.decision:
+        mc.log_reuse_decision(args.session, query, args.decision, match=result["match"])
 
 
 if __name__ == "__main__":

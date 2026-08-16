@@ -31,7 +31,7 @@ import mc
 import stop_checkpoint
 
 
-_BOUND_FUNCS = ("write_checkpoint", "record_lifecycle_run")
+_BOUND_FUNCS = ("write_checkpoint", "record_lifecycle_run", "run_maintenance_checks")
 
 
 def _bind_to_test_db(db_path: Path) -> contextlib.ExitStack:

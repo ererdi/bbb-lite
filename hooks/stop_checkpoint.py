@@ -90,6 +90,14 @@ def main() -> None:
         details={"summary": summary[:120]},
     )
 
+    # bbb-os-core parity item 3: same maintenance battery as session_start.py,
+    # so drift introduced mid-session (e.g. new orphaned edges) is caught at
+    # Stop too, not only at the next Start. Fail-soft.
+    try:
+        mc.run_maintenance_checks(session_id)
+    except Exception:
+        pass
+
     _auto_commit(summary)
 
 

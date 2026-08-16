@@ -33,6 +33,7 @@ import session_start
 
 _BOUND_FUNCS = (
     "ensure_session",
+    "run_maintenance_checks",
     "record_lifecycle_run",
     "get_role",
     "can_write_code",
