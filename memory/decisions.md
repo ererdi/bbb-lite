@@ -455,3 +455,384 @@
   `semantic_search` mock'unu beklenmedik şekilde tetikliyordu (test izolasyonu kırılıyordu).
   Tam paket 915 test, hepsi yeşil (0 hata) - detaylar `.claude/plans/flickering-brewing-
   bentley.md` planında.
+
+- 2026-08-18 - bbb-os-core memory/db parity implementasyonunun Adım 1-4'ü tamamlandı
+  (`BBB-OS-CORE-MEMORY-DB-PARITY-IMPLEMENTATION-PLAN.md`, 2026-08-17 tarihli 8 maddelik
+  liste - kapsam sadece memory/db katmanı, `mc.py` tek dosya, SQLite-only). Adım 1:
+  `memory_index`'e `supersedes_id` + gerçek append-only versiyon geçmişi - içerik artık
+  yerinde UPDATE edilmiyor, değiştiğinde eski satır `status='superseded'` olup `content`'i
+  sabit kalıyor, yeni satır `supersedes_id` ile ona geri işaret ediyor. Adım 2:
+  `events_log`'a `attempts`/`max_attempts` + `mark_failed()` (outbox retry/dead-letter
+  sayacı). Adım 3: `memory_decisions` (immutable karar log'u, `BEFORE UPDATE`/
+  `BEFORE DELETE` trigger'larıyla `RAISE(ABORT)`) + `memory_hold` (state machine:
+  `open`/`claimed`/`resolved`/`expired`, terminal state kilidi, `claimed`'e her girişte
+  `claim_epoch` ilerlemesi zorunlu) - bbb-os-core'un `memory_promotion_decision`/
+  `memory_hold` çiftinin karşılığı; `detect_memory_conflicts()`/`detect_decision_conflicts()`
+  artık her tespitte bir `hold` kararı yazıp hold açıyor (idempotency_key ile tekrar
+  tespitte duplicate yaratmıyor), `approve_merge()` `dedupe`/`supersede` kararı yazan bir
+  sarmalayıcı oldu, yeni `reject_conflict()` eklendi. Adım 4: `memory_index.authority`
+  kolonu (`erdi`/`agent`/`inference`/`external`, bbb-os-core'un `haroon`/`team`/`agent`/
+  `external`/`inference` enum'unun tek-kullanıcıya indirgenmiş hali) + `memory_confirmations`
+  (immutable onay/düzeltme/red makbuzu) + `confirm_memory()`.
+
+  En önemli tasarım kararı (ve bir düzeltme): `confirm_memory()` ilk yazıldığında
+  `decision='rejected'` için `memory_index.status = 'rejected'` yazıyordu - bu değer
+  bbb-os-core'a bakılmadan icat edilmişti. Kontrol edildi: bbb-os-core'un
+  `sql/memory_fact.sql`'indeki `memory_fact.status` enum'u yalnızca
+  `('candidate','accepted','superseded','retracted','discarded')` - `'rejected'` diye bir
+  değer YOK; core'da red iki ayrı mekanizmayla yapılıyor (`retracted` - sadece
+  `accepted`'ten başlayan, ayrı bir immutable receipt tablosu gerektiren admin-only bir
+  CAS akışı; ve `memory_owner_confirmation_receipts.decision` - ki bu da `memory_fact.status`'a
+  hiç yazılmıyor, sadece `entity_alias` lifecycle'ını besliyor). Düzeltme: `confirm_memory()`
+  artık `decision='rejected'` VE `decision='corrected'` için ikisi de `memory_index.status =
+  'superseded'` yazıyor; hangi kararın (`rejected` mi `corrected` mi) verildiği
+  `memory_confirmations.decision` alanında immutable olarak kayıtlı kalıyor, `status` enum'u
+  ayrıca genişletilmedi. Gerekçe: bbb-lite'ın kendi status sözlüğüne core'da karşılığı
+  olmayan yeni bir değer eklemek yerine core'un davranışına (yeni bir state icat etmemek,
+  kararın *nedenini* ayrı bir immutable receipt'te tutmak) sadık kalmak - hem şema
+  drift'ini önlüyor hem ileride core'dan gerçek bir "rejected" karşılığı (örn. `discarded`)
+  taşınması gerekirse önceden icat edilmiş bir değerle çakışmıyor.
+
+  Test: 680 test, hepsi yeşil. Hiçbir şey commit edilmedi - tüm değişiklikler (`mc.py`,
+  `test_mc.py`) working tree'de duruyor, açık onay bekliyor. Adım 5-8 henüz başlamadı.
+
+- 2026-08-18 - Adım 5 (epistemic class + `memory_derivation`) tamamlandı - planın en
+  karmaşık ve "opsiyonel/düşük öncelikli" işaretli maddesi. `memory_index`'e
+  `epistemic_class` (`STATED`/`OBSERVED`/`IMPORTED`/`SUMMARY`/`DERIVED`/`SYNTHETIC`,
+  varsayılan `IMPORTED` - bugüne kadar var olan her satır bir dosyadan geldi, erdi'nin
+  chat'te doğrudan söylediği bir şey değil) + `source_span`/`source_digest` kolonları
+  eklendi. bbb-os-core'un kuralı birebir taşındı: `epistemic_class='STATED'` olan satır
+  hem `source_span` hem `source_digest` (sha256, 64 hex) dolu olmak zorunda - bu, tek bir
+  yardımcı kolon icat etmeden `source_digest`'in kendi `ALTER TABLE ADD COLUMN`'ına
+  binen bir `CHECK(epistemic_class != 'STATED' OR (source_span IS NOT NULL AND
+  length(source_digest) = 64))` ile uygulandı. Doğrulandı: SQLite, `ALTER TABLE ADD
+  COLUMN`'a eklenen bir `CHECK`'in tablodaki diğer (önceden var olan) kolonlara referans
+  vermesine izin veriyor - planın öngördüğü ayrı bir "dummy" kolon gerekmedi.
+
+  Yeni tablo `memory_derivation` (çıkarım kaydı: `child_id`, `parent_ids_json`,
+  `parent_set_digest`, `kind` (`ABSTRACTION`/`BEHAVIORAL_INFERENCE`), `producer`,
+  `confidence`, `status`, `created_at`, `revalidated_at`) - planın kendi SQL'i "en az 2
+  parent" kuralını sadece bir yorum satırı (`-- json array, length >= 2`) olarak
+  bırakmıştı; burada gerçek bir `CHECK(json_array_length(parent_ids_json) >= 2)` ile DB
+  seviyesinde uygulandı (SQLite'ın gömülü JSON1 uzantısı - `sqlite3.sqlite_version` 3.50,
+  `json_array_length` mevcut - doğrulanarak kullanıldı). Plandaki notla uyumlu: bugün
+  bbb-lite'ta çok-kaynaklı bir çıkarım akışı (`heal_memory()` sonrası ortak sonuç çıkarma
+  gibi) yok, o yüzden bu adımın teslimatı sadece şema - `memory_derivation`'a yazan bir
+  Python fonksiyonu YOK, testler ham SQL INSERT ile şemayı doğruluyor. Fonksiyonel
+  kullanım ayrı bir iş kalemi olarak plandaki gibi bırakıldı.
+
+  6 yeni test (`MemoryEpistemicClassDerivationTestCase`), artı `test_init_db_creates_tables`
+  tablo listesine `memory_derivation` eklendi. Tam paket 752 test, hepsi yeşil. Hiçbir şey
+  commit edilmedi - `mc.py`/`test_mc.py`/`memory/decisions.md` working tree'de duruyor,
+  açık onay bekliyor. Adım 6-8 henüz başlamadı.
+
+- 2026-08-18 - Adım 6 (memory-özel hijyen taraması) tamamlandı - ama önce planın kendi
+  metninde İKİ ayrı hata bulunup düzeltildi (kullanıcı onayıyla), implementasyona
+  bunlardan sonra geçildi.
+
+  **Hata 1 - handler sayısı:** plan metni "5 handler" diyordu, gerçek sayı `TrustSourcing/
+  bbb-os-core`'da (`sql/memory_p3b2.sql`, `memory_hygiene_receipt.handler` CHECK'i;
+  `lib/memory_p3b2_ops.py:891-893` `HYGIENE_HANDLERS` ile doğrulandı) **6**:
+  `vector_reconcile`, `expiry_sweep`, `dedup_orphans`, `conflict_proposals`,
+  `projection_coverage`, `archive_placement`. Kullanıcı kararı: sadece ilk 4 ile devam,
+  `projection_coverage` (`lib/memory_p3b2_ops.py:939-943` - `memory_projection_outbox`
+  state='completed' karşılığı arıyor) ve `archive_placement` (`:945-947`, tam bir
+  arşiv-generation alt sistemine bağlı - `build_archive_generation`/`record_archive_
+  scale_ramp`/`rollback_archive_generation`/`backup_and_verify_restore`,
+  `lib/memory_p3b2_ops.py:1069-1437`) kapsam dışı bırakıldı - ikisi de bbb-lite'ta
+  hiç olmayan ve planlanmayan bir outbox/projection tüketicisi ya da arşiv-generation
+  alt sistemi gerektiriyor; bu, planın kendi "mimari kapsam dışı" listesiyle (HTTP
+  gateway/SSH/Telegram/daemon/`phases`) aynı kategori.
+
+  **Hata 2 - `dedup_orphans` eşlemesi:** plan metni bunu "graph_edges/context_edges'te
+  yetim satırları bul (zaten kısmen var, genişlet)" diye tanımlıyordu - yanlış. Gerçek
+  `dedup_orphans` (`lib/memory_p3b2_ops.py:923-928`) graph/edge ile ilgisiz: aynı `key`
+  ile birden fazla `status='accepted'` `memory_fact` satırı var mı diye bakıyor (literal
+  "dedup", "orphan" kelimesi isim benzerliğinden kaynaklı bir yanlış çağrışım). Kullanıcı
+  kararı: bu maddeyi KAPAT, yeni kod yazma. Gerekçe: core'da bu kural (`sql/
+  memory_fact.sql`'de doğrulandı - `key` üzerinde UNIQUE index/trigger yok) SADECE
+  app-level'da zorlanıyor, dedup_orphans onun DB-seviyesinde bir telafi mekanizması.
+  bbb-lite ise Adım 1'de `idx_memory_index_active_source_file` (`mc.py:600-602`, partial
+  UNIQUE INDEX, `status='active'` olan satırlar için `source_file` üzerinde) ile bunu
+  zaten DB seviyesinde garanti altına almıştı - yani bbb-lite bu hata sınıfına yapısal
+  olarak bağışık. Bu "eksik özellik" değil, Adım 1'in zaten daha güçlü çözmüş olması;
+  `orphaned_graph_edges`/`orphaned_context_edges` (mevcut, `mc.py:3072-3097`) ise zaten
+  TAM ve eksiksiz - bunlar hiçbir bbb-os-core handler'ının karşılığı değil, bbb-lite'ın
+  kendi icadı, "genişletilecek" bir eksik yok.
+
+  **Uygulanan 3 yeni kontrol** (`run_maintenance_checks()`, `mc.py:3143-3203`), mevcut 5
+  kontrolün detay formatına (düz string özet, liste DEĞİL) uydurularak:
+  - `vector_reconcile` - `status='active' AND embedding IS NULL` olan `memory_index`
+    satırlarını sayıyor.
+  - `expiry_sweep` - `status IN ('replaced','superseded')` olan her satır için gerçek
+    `search_memory()`'yi (mock değil, varsayılan `include_replaced=False` ile) çağırıp
+    içeriğin hâlâ dönüp dönmediğini kontrol ediyor - bugün search_memory()'nin filtresi
+    doğru çalıştığı için bu her zaman "pass" döner, ama gelecekte o filtre bozulursa
+    (regresyon) bunu yakalayacak gerçek bir uçtan-uca kontrol.
+  - `conflict_proposals` - `memory_hold`'da `state='open' AND retry_after <= now()`
+    olan satırları buluyor.
+
+  **retry_after doldurma mekanizması eklendi** (Adım 3'ten beri boştu - `mc.py`
+  `record_memory_decision()`'ın `memory_hold` INSERT'i `retry_after` kolonunu hiç
+  yazmıyordu, doğrulandı: `grep retry_after` sadece şema satırı + bunu önceden bilerek
+  Adım 6'ya bırakan bir docstring notu (`expire_memory_hold()`, o zamanki haliyle)
+  veriyordu). Önce core'da bir emsal olup olmadığı kontrol edildi: `lib/
+  memory_fact_service.py`'de retry_after'ı gerçekten SET eden 3 ayrı çağrı noktası
+  (`persist_path_decision_from_connection:2452-2454`,
+  `apply_judged_fact_from_connection:2544-2546`, `persist_nonwrite:2923-2925`) var,
+  ÜÇÜ DE `dt.timedelta(minutes=15)` kullanıyor - tek bir yerde değil, tutarlı bir
+  kural. Kullanıcının "core'da emsal varsa onu kullan" talimatına uyularak kullanıcının
+  kendi "günlük ölçek" önerisi değil, core'un gerçek 15-dakika değeri birebir taşındı
+  (`mc.py` yeni `_MEMORY_HOLD_RETRY_AFTER = timedelta(minutes=15)` sabiti,
+  `record_memory_decision()`'ın hemen üstünde). `record_memory_decision()`'ın
+  `memory_hold` INSERT'i artık `retry_after = created_at + 15dk` yazıyor - `conflict_
+  proposals` artık gerçek veride de tetiklenebilir.
+
+  Test: 5 yeni handler testi (`test_maintenance_checks.py` -
+  `test_detects_active_row_missing_embedding`,
+  `test_expiry_sweep_passes_when_superseded_row_is_really_excluded` (gerçek,
+  mock'suz), `test_detects_replaced_row_leaking_into_search_memory` (mock'lu -
+  expiry_sweep'in mock'suz asla fail edemeyeceği, sadece gelecekteki bir regresyonu
+  yakalayabileceği için), `test_conflict_proposals_passes_for_a_fresh_hold`,
+  `test_detects_overdue_memory_hold`) + 1 yeni test (`test_mc.py` -
+  `test_hold_decision_sets_retry_after_15_minutes_out`). Adım 5'teki kalıtım
+  sürprizini tekrarlamamak için: bu sefer YENİ bir `McTestCase` alt sınıfı AÇILMADI -
+  hepsi var olan sınıflara (`RunMaintenanceChecksTestCase`,
+  `MemoryDecisionHoldTestCase`) eklendi, bu yüzden çarpma yok. `test_mc.py`: 752 -> 753
+  (+1, tam beklenen). `test_maintenance_checks.py`: 12 -> 17 (+5, tam beklenen, bu
+  sınıf zaten düz `unittest.TestCase`, `McTestCase` değil).
+
+  **Ayrı bulgu - Adım 6 kapsamı dışında, ama tam-paket taramada ortaya çıktı:** bu adıma
+  kadar hep sadece `test_mc.py` (veya `test_maintenance_checks.py`) tek başına
+  çalıştırılmıştı, hiçbir oturumda `python -m unittest discover` ile TÜM `test_*.py`
+  (28 dosya) birlikte çalıştırılmamıştı. İlk kez tam taramada (1099 test) 1 hata
+  bulundu: `test_stage_as_memory_metadata.py::test_reindex_changed_content_bumps_
+  version_and_updated_at` - bu Adım 6'nın DEĞİL, Adım 1'in (`supersedes_id` + gerçek
+  append-only versiyon geçmişi) bir yan etkisi. Kök sebep: bu test dosyasının `_row()`
+  yardımcı fonksiyonu (`test_stage_as_memory_metadata.py:47-52`) `SELECT * FROM
+  memory_index WHERE source_file = ?` yapıp `ORDER BY`/`status` filtresi olmadan
+  `.fetchone()` çağırıyor - Adım 1 öncesi (satır içi UPDATE, her `source_file`'ın tek
+  satırı) bu güvenliydi, Adım 1 sonrası (aynı `source_file`'ın artık birden fazla
+  satırı olabiliyor: eski `status='superseded'` + yeni `status='active'`) bu artık
+  hangi satırın döneceğini garanti etmiyor. ÖNEMLİ: bu bir production-kod hatası
+  DEĞİL - `mc.py`'nin kendi gerçek fonksiyonları (`mc.py:4088`, `mc.py:4159`) aynı
+  sorguyu zaten doğru şekilde `AND status = 'active'` ile yapıyor; sadece bu test
+  dosyasının yardımcı fonksiyonu Adım 1 ile birlikte güncellenmemiş, salt bir test
+  açığı. "Sadece `run_maintenance_checks()` ve ilgili yardımcı fonksiyonlara dokun"
+  kısıtı gereği bu Adım 6 kapsamında DÜZELTİLMEDİ - ayrı bir onay/iş kalemi bekliyor.
+
+  Hiçbir şey commit edilmedi - `mc.py`/`test_mc.py`/`test_maintenance_checks.py`/
+  `memory/decisions.md` working tree'de duruyor, açık onay bekliyor. Adım 7-8 henüz
+  başlamadı.
+
+- 2026-08-18 - `test_stage_as_memory_metadata.py::_row()` düzeltildi - Adım 6 raporunda
+  bulunan, Adım 1'in bir downstream etkisiydi. Kök sebep tekrar: Adım 1 sırasında yapılan
+  downstream taraması (`mark_memory_replaced`, `log_lesson`, `find_similar_lesson_groups`,
+  `retire_low_confidence_lessons`) yalnızca `mc.py` içindeydi, ayrı `test_*.py` dosyalarını
+  kapsamıyordu - bu yüzden bu dosyanın kendi test yardımcı fonksiyonu gözden kaçtı.
+
+  **Düzeltme, kullanıcının önerdiği düz `status='active'` filtresinden FARKLI çıktı -
+  önce literal öneri denendi, gerçek veriyle test edildi, iki testi bozduğu görüldü:**
+  `test_mark_memory_replaced_sets_status_and_replaced_by` ve `test_heal_memory_marks_
+  old_notes_replaced_and_hides_them_from_search` bilerek `status='replaced'` olan bir
+  satır bekliyor (`mark_memory_replaced()`, `mc.py:4140-4162` - source_file başına HER
+  ZAMAN tek satır, yerinde UPDATE, Adım 1'in `supersedes_id` zincirinden tamamen ayrı bir
+  mekanizma) - düz `AND status='active'` filtresi bu satır için `None` döndürüp
+  `TypeError` ile patlıyordu. Doğru düzeltme: `_row()` artık `ORDER BY id DESC LIMIT 1`
+  kullanıyor (status filtresi YOK) - hem Adım 1'in supersede zincirini (2 satır: en
+  yüksek id = en güncel/aktif) hem `mark_memory_replaced()`'i (tek satır, id filtresi
+  zaten trivial) doğru ele alıyor.
+
+  **Bu düzeltme sırasında AYRI, gerçek bir `mc.py` hatası ortaya çıktı (henüz
+  düzeltilmedi, onay bekliyor):** `test_created_at_set_once_and_never_changes` hâlâ
+  FAIL veriyor - ama artık DOĞRU satırı karşılaştırdığı için. `index_memory_files()`'ın
+  kendi docstring'i (`mc.py:4062-4063`) "created_at is set once, on the row's first
+  insert, and never overwritten afterward" diyor, ama supersede-insert dalı
+  (`mc.py:4115-4128`) yeni satırın `created_at`'ine `existing["created_at"]` değil `now`
+  yazıyor (`mc.py:4125`, tuple'daki ilk `now`). Bu, önceden `_row()`'un aynı hatası
+  yüzünden maskeleniyordu - eski test yanlış (eski, superseded) satırı çekiyordu, o
+  satırın `created_at`'i haliyle kendisiyle eşitti, bu yüzden hata hiç görünmüyordu.
+  Düzeltme iki değişiklik gerektiriyor: (a) `existing` SELECT'ine (`mc.py:4086-4091`)
+  `created_at` kolonunu eklemek (şu an sadece `id, version, content_hash` çekiyor), (b)
+  `mc.py:4125`'teki ilk `now`'ı `existing["created_at"]` ile değiştirmek. Kapsam dışı
+  bırakıldı - kullanıcının bu mesajdaki talimatı sadece test yardımcısını kapsıyordu,
+  bu gerçek `mc.py` üretim mantığını değiştiren AYRI bir değişiklik, ayrı onay
+  gerektiriyor.
+
+  Düzeltme sonrası `test_stage_as_memory_metadata.py` tek başına: 7 testten 6'sı geçti,
+  1'i (yukarıdaki bilinen, henüz düzeltilmemiş `created_at` hatası yüzünden) FAIL.
+
+  **Sistemik tarama (görev 3):** `mc.py`'de `source_file` üzerinden `memory_index`
+  sorgulayan TÜM yerler tek tek kontrol edildi - hepsi zaten doğru filtreli:
+  `mc.py:4088` (`index_memory_files`, `AND status='active' ORDER BY id DESC LIMIT 1`),
+  `mc.py:4159` (`mark_memory_replaced`, `AND status='active'`), `mc.py:5188`
+  (`log_lesson`, `WHERE status='active'`), `mc.py:5255` (`find_similar_lesson_groups`,
+  `AND status NOT IN ('replaced','superseded')`), `mc.py:5445`
+  (`retire_low_confidence_lessons`, `AND status='active'` - bu fonksiyonun hemen
+  ardından gelen filtresiz `DELETE FROM memory_index WHERE source_file=?`, `mc.py:5455`,
+  KASITLI ve dokümante: "Once a file is retired, the DELETE below removes all of its
+  rows, active and superseded alike" - bir hata değil), `mc.py:4251`/`4300`
+  (`search_memory`/`semantic_search`, ikisi de varsayılan `status NOT IN (...)`).
+  `test_*.py` genelinde de tarandı: `test_mc.py`'deki diğer tüm `WHERE source_file`
+  sorguları (satır 1214, 1227, 1239, 1248, 1291, 1305, 1318, 1668, 2606, 2654, 2663,
+  2673, 2756) tek tek kontrol edildi - hepsi ya tek `index_memory_files()` çağrısından
+  sonra (o an için tek satır garantili) ya da zaten doğru `ORDER BY id`/`fetchall()`
+  kullanıyor (`test_index_memory_files_preserves_superseded_row_and_links_new_version`,
+  satır 1233-1271, Adım 1 sırasında zaten doğru yazılmış). **Sonuç: bu hata izole bir
+  örnekti, sistemik bir desen DEĞİL** - tek kaçan yer `test_stage_as_memory_
+  metadata.py::_row()`'du.
+
+  Hiçbir şey commit edilmedi. Bekleyen onay: `created_at` hatasının şimdi mi yoksa ayrı
+  bir iş kalemi olarak mı düzeltileceği.
+
+- 2026-08-18 - Adım 1'e ait ayrı düzeltme: `created_at` iddiası kod DEĞİL, docstring
+  hataymış - core'a bakılarak doğrulandı, düzeltildi. `index_memory_files()`'ın
+  docstring'i (`mc.py:4059-4063`, önceki hali) "created_at is set once, on the row's
+  first insert, and never overwritten afterward" diyordu; Adım 6 sırasında bulunan
+  `test_stage_as_memory_metadata.py::_row()` hatası düzeltilince bu iddiayı test eden
+  `test_created_at_set_once_and_never_changes` gerçek (yeni) satırı karşılaştırmaya
+  başladı ve FAIL verdi.
+
+  Önce core kontrol edildi (kullanıcı talimatı): `lib/memory_fact_store.py:578-703`
+  (`apply_from_connection` - dosyanın kendi docstring'i "Sole DML owner ... for Mission
+  Control memory_fact" diyor, `promote`/`supersede` için TEK yazma yolu). `supersede`
+  işleminde yeni satırın `INSERT INTO memory_fact(...)` kolon listesi
+  (`lib/memory_fact_store.py:633-637`) **`created_at`'i hiç içermiyor** - şemanın
+  `DEFAULT CURRENT_TIMESTAMP`'ine (`sql/memory_fact.sql`) bırakılıyor. Yani core'da da
+  her yeni satır KENDİ INSERT anının `created_at`'ini alıyor, supersede ettiği satırdan
+  devralmıyor. INSERT sonrası da (aynı fonksiyon içinde, eski satırın sadece `status`'u
+  `'superseded'`e çevriliyor) `created_at`'e hiçbir yerde dokunulmuyor - devralma yok.
+
+  Sonuç: bbb-lite'ın KODU zaten doğruydu (`mc.py:4125`, yeni satıra `now` yazıyor,
+  eskisinden devralmıyor) - core'un gerçek davranışıyla birebir uyumlu. Hatalı olan
+  sadece docstring'in iddiasıydı - bu iddia core'dan gelmiyordu, muhtemelen Adım 1
+  öncesi bir dönemden kalma (o zaman reindex tek satır üzerinde yerinde UPDATE'ti,
+  UPDATE created_at'e hiç dokunmadığı için iddia o zaman doğruydu) ve Adım 1 çok-satırlı
+  zinciri getirdiğinde hiç güncellenmemişti - core'a hiç bakılmadan yazılmış, yanlış bir
+  iddia. **Seçenek (b) uygulandı:** kod DEĞİŞMEDİ, docstring düzeltildi (yeni satırın
+  kendi `created_at`'ini aldığını, core'un `apply_from_connection`'ına referansla
+  netleştirir), `test_created_at_set_once_and_never_changes` ikiye ayrıldı:
+  `test_created_at_unchanged_when_content_unchanged` (içerik değişmeyince satır hiç
+  dokunulmuyor - hâlâ doğru, ayrı ve açık bir testle kaldı) ve
+  `test_created_at_is_fresh_per_version_not_inherited_across_supersede` (içerik
+  değişince yeni satırın `created_at`'i eskisinden FARKLI olmalı - doğru semantiğe göre
+  yeniden yazıldı, `assertNotEqual`).
+
+  Test: `test_stage_as_memory_metadata.py` tek başına 7 -> 8 test (+1, yeni ayrılan
+  test), hepsi yeşil.
+
+  Hiçbir şey commit edilmedi.
+
+- 2026-08-18 - Adım 7 (vektör şeması sadeleştirme) tamamlandı - planın "düşük risk,
+  düşük öncelik" işaretli maddesi.
+
+  **Adım 0'da bulunan mimari fark, kullanıcı onayıyla bilerek KOPYALANMADI:**
+  core'da `embedding_model`/`embedding_dim` karşılığı satır-bazlı değil -
+  `memory_embedding_generation` (`sql/memory_recall.sql`) diye ayrı, normalize bir
+  tablo; `model`/`dim` orada bir "generation"ın (tüm bir yeniden-embed çalışmasının,
+  `shadow`/`eligible`/`active`/`retired` durumlarıyla) özelliği, tek tek satırların
+  değil - çoklu model/versiyon geçişini (canlı re-embedding migration'larını)
+  desteklemek için. bbb-lite'ta böyle bir geçiş hiç yaşanmadı ve planlanmıyor (tek
+  model: `all-MiniLM-L6-v2`, projenin başından beri) - bu yüzden planın literal önerisi
+  (satır-bazlı iki kolon) ile devam edildi, aynı gerekçeyle Adım 6'da
+  `projection_coverage`/`archive_placement`in kapsam dışı bırakılmasıyla aynı kategori:
+  core'un ağır mekanizması bbb-lite'ta karşılığı olmayan bir senaryoyu (çoklu
+  generation yönetimi) çözüyor.
+
+  **Şema** (`mc.py:592-639` bloğunun devamı, Adım 5'in `epistemic_class`/
+  `source_digest` eklerinin hemen ardından):
+  - `mc.py:617-618` - `embedding_model TEXT` (düz `ALTER TABLE ADD COLUMN`).
+  - `mc.py:619-639` - `embedding_dim INTEGER` eklendi + tek seferlik backfill
+    (`mc.py:635-639`): `embedding IS NOT NULL` olan tüm mevcut satırlara
+    `embedding_model=_EMBEDDING_MODEL_NAME`, `embedding_dim=length(embedding)/4`
+    yazan bir `UPDATE`. Backfill'in belirsiz olmaması özellikle kontrol edildi: gerçek
+    `mc.db`'de (test fixture değil) 11 satırın 11'i de zaten `status='active'` VE
+    `embedding IS NOT NULL` - bbb-lite'ın tüm tarihinde tek model kullanıldığı için
+    (model değişikliği hiç olmadı) her satıra aynı sabit `embedding_model` değeri
+    yazmak güvenli, "hangi model üretti" belirsizliği yok.
+
+  **Dinamik `embedding_dim`, sabit 384 DEĞİL** (kullanıcı talimatı): `mc.py:4118-4123`,
+  `index_memory_files()` içinde `embedding = _embed_or_none(...)` çağrısından hemen
+  sonra `embedding_dim = len(embedding) // 4` (float32 = 4 byte/dim) hesaplanıyor -
+  üretilen vektörün KENDİ byte uzunluğundan, `SentenceTransformer.
+  get_sentence_embedding_dimension()` metodunu ayrıca çağırmadan (aynı bilgiyi zaten
+  elimizdeki bytes'tan çıkarmak, modele ikinci bir çağrı yapmaktan daha ucuz ve tek
+  doğruluk kaynağı - vektörün gerçek boyutuyla asla çelişemez). Backfill'deki
+  `length(embedding) / 4` SQL ifadesi aynı mantığı DB tarafında tekrarlıyor - iki
+  farklı türetme yolu, aynı gerçek kaynaktan (byte uzunluğu), asla `_EMBEDDING_MODEL_
+  NAME` sabitinden bağımsız kalmıyor.
+
+  **Her iki INSERT dalına da yazıldı** (`index_memory_files()`'ın iki ayrı yazma
+  noktası, Adım 1'in supersede zincirinden beri iki yerde tekrarlanıyor): ilk-insert
+  dalı (`mc.py:4132-4146`, kolon listesine `embedding_model, embedding_dim` eklendi)
+  ve Adım 1'in supersede-insert dalı (`mc.py:4156-4171`, aynı ekleme) - ikisi de ayrı
+  ayrı test edildi (aşağıda).
+
+  Test (4 yeni, `MemoryIndexTestCase`, `test_mc.py`):
+  - `test_index_memory_files_stores_embedding_model_and_dim` - yeni dosya indexlenince
+    `embedding_model='all-MiniLM-L6-v2'`, `embedding_dim=384` (gerçek model).
+  - `test_supersede_insert_also_stores_embedding_model_and_dim` - içerik değişip
+    Adım 1'in supersede-insert dalı tetiklenince YENİ (aktif) satırın da doğru
+    doldurduğu - ilk-insert dalının testinden ayrı, ikinci dalı özel olarak kapsıyor.
+  - `test_embedding_dim_is_read_dynamically_not_hardcoded` - `mc._embed_or_none`'ı
+    384 değil 17-boyutlu sahte bir vektör döndürecek şekilde mock'layıp
+    `embedding_dim`'in gerçekten 17 yazdığını doğruluyor - hardcoded olsaydı hâlâ 384
+    yazardı.
+  - `test_backfill_fills_embedding_model_and_dim_for_pre_migration_rows` - migration
+    öncesi durumu simüle etmek için `ALTER TABLE memory_index DROP COLUMN` (SQLite
+    3.35+, `sqlite3.sqlite_version` 3.50 ile doğrulanmıştı) kullanılarak iki kolon
+    geri düşürülüp gömme (embedding) olan bir satır ham SQL ile eklendi, sonra
+    `mc.init_db()` tekrar çağrılıp backfill'in gerçekten çalıştığı doğrulandı - bu
+    codebase'de "hesaplanan backfill" (sabit bir DEFAULT değil, başka bir kolondan
+    türetilen) için ilk emsal, önceki migration'ların (`authority` vb.) hepsi düz
+    `DEFAULT` değeriyle çözülüyordu.
+
+  `MemoryIndexTestCase` tek başına: 26 -> 30 test (+4), hepsi yeşil.
+
+  Hiçbir şey commit edilmedi.
+
+- 2026-08-18 - **Adım 8 (doğrulama ve kayıt) - 8 adımlık `BBB-OS-CORE-MEMORY-DB-
+  PARITY-IMPLEMENTATION-PLAN.md`'nin tamamı için üst-seviye özet.** Bu girdi, yukarıdaki
+  tek tek Adım 1-7 girdilerinin yerine geçmiyor - onların üzerine, planın BÜTÜNÜNÜ
+  2026-08-12'deki asıl kapsam kararına bağlayan tek bir kapsayıcı not.
+
+  2026-08-12 kararı şöyleydi: bbb-os-core salt-okunur referans, CLAUDE.md'nin sert
+  kısıtları (SQLite-only/tek dosya/sunucu yok/stdlib-only) SABİT, hedef "%90+
+  mantıksal/özellik benzerliği - mimari değil" (yukarıda, bu dosyada 2026-08-12
+  girdisi). O tarihte owner/authority modeli ve epistemic_class/derivation katmanı
+  "tek kullanıcıda anlamsız"/"production-only, taşınmasın" diye AÇIKÇA kapsam dışı
+  bırakılmıştı (`BBB-OS-CORE-MEMORY-DB-PARITY-REPORT.md`'nin önceki hali).
+
+  8 adımlık liste (2026-08-17 tarihli) bu kararı BİLEREK genişletti: owner/authority
+  (Adım 4) ve epistemic_class/derivation (Adım 5) artık kapsamda, çünkü hedef bu kez
+  açıkça "%100'e yaklaşmak" idi (planın kendi giriş bölümü, madde 1). Ama bu genişleme
+  SEÇİCİYDİ, sınırsız değildi - mimari kısıtlar (HTTP gateway, SSH tünelleri, systemd
+  daemon, Telegram/Whisper/Kokoro, `phases` tablosu) 2026-08-12'den beri hiç
+  değişmedi ve planın kendi "Kapsam dışı kalanlar" bölümünde tekrar teyit edildi.
+  Uygulama sırasında bu SEÇİCİ genişletme prensibi iki kez daha somut olarak devreye
+  girdi: Adım 6'da `projection_coverage`/`archive_placement` (core'un gerçek 6
+  handler'ından 2'si) dışarıda bırakıldı - ikisi de bbb-lite'ta hiç olmayan ve
+  planlanmayan bir outbox/projection tüketicisi ya da arşiv-generation alt sistemi
+  gerektiriyordu, yani "memory/db" değil "mimari" kategorisindeydi (aynı 2026-08-12
+  ayrımı). Adım 7'de core'un normalize `memory_embedding_generation` tablosu (çoklu
+  model/versiyon geçişini desteklemek için var) bilerek KOPYALANMADI, yerine
+  bbb-lite'ın hiç yaşamadığı ve planlamadığı bir senaryo için gereksiz karmaşıklık
+  olacağı gerekçesiyle satır-bazlı iki kolon (`embedding_model`/`embedding_dim`)
+  tercih edildi.
+
+  Sonuç: 8 adımın 5'i (1,2,3,6,7) 2026-08-12'nin orijinal "mantıksal/özellik
+  benzerliği, mimari değil" sınırının İÇİNDE kaldı; 2'si (4,5) o sınırı bilerek ve
+  açıkça genişletti (owner/authority, epistemic_class/derivation); ama HİÇBİRİ mimari
+  kısıtları (sunucu/daemon/SSH/Telegram/HTTP gateway) ihlal etmedi - genişleme sadece
+  "hangi memory/db KAVRAMLARI taşınsın" sorusuna dairdi, "nasıl bir SİSTEM olsun"
+  sorusuna değil. `mc.py` hâlâ tek dosya, SQLite hâlâ tek yerel dosya, hâlâ sunucu yok.
+
+  Doğrulama: `python -m unittest discover` ile TÜM `test_*.py` (28 dosya, sadece
+  `test_mc.py` değil - bu disiplin Adım 6'nın sonunda standart hale getirildi) 1104
+  test, 0 hata. İki gerçek bug bu süreçte bulunup düzeltildi (ayrı Adım 1 girdileri,
+  yukarıda): `test_stage_as_memory_metadata.py::_row()`'un Adım 1'in çok-satırlı
+  zincirinden sonra yanlış satırı seçmesi, ve `index_memory_files()`'ın `created_at`
+  hakkında core'a hiç bakılmadan yazılmış yanlış bir docstring iddiası. Hiçbir şey
+  commit edilmedi - tüm değişiklikler (`mc.py`, `test_mc.py`, `test_maintenance_
+  checks.py`, `test_stage_as_memory_metadata.py`, `PROJECT-HISTORY.md`, bu dosya)
+  working tree'de duruyor, commit kararı ayrıca (kullanıcı tarafından) verilecek.

@@ -47,7 +47,8 @@ class MemoryMetadataTestCase(unittest.TestCase):
     def _row(self, source_file: str) -> dict:
         with contextlib.closing(mc._connect(self.db_path)) as conn:
             row = conn.execute(
-                "SELECT * FROM memory_index WHERE source_file = ?", (source_file,)
+                "SELECT * FROM memory_index WHERE source_file = ? ORDER BY id DESC LIMIT 1",
+                (source_file,),
             ).fetchone()
         return dict(row)
 
@@ -86,7 +87,28 @@ class MemoryMetadataTestCase(unittest.TestCase):
         self.assertNotEqual(first["content_hash"], second["content_hash"])
         self.assertNotEqual(first["updated_at"], second["updated_at"])
 
-    def test_created_at_set_once_and_never_changes(self) -> None:
+    def test_created_at_unchanged_when_content_unchanged(self) -> None:
+        self._write_note("a.md", "Guard note", "The guard blocks raw done writes.")
+        mc.index_memory_files(db_path=self.db_path)
+        first = self._row("a.md")
+
+        time.sleep(0.01)  # so a wrongly-bumped created_at would be detectably different
+        mc.index_memory_files(db_path=self.db_path)  # rerun, same content, same row
+        second = self._row("a.md")
+
+        self.assertIsNotNone(first["created_at"])
+        self.assertEqual(first["created_at"], second["created_at"])
+
+    def test_created_at_is_fresh_per_version_not_inherited_across_supersede(self) -> None:
+        # bbb-os-core's real precedent (lib/memory_fact_store.py:578-703,
+        # apply_from_connection - the sole memory_fact write path for
+        # promote/supersede): its INSERT never carries created_at forward
+        # from the superseded row, it relies on the schema's DEFAULT
+        # CURRENT_TIMESTAMP (sql/memory_fact.sql) - each row's created_at is
+        # its OWN insert time. bbb-lite's code already matched this
+        # (mc.py:4125); only a stale, pre-Adım-1 docstring claim said
+        # otherwise, and this test used to assert the wrong thing by reading
+        # the wrong (old, superseded) row - see memory/decisions.md 2026-08-18.
         self._write_note("a.md", "Guard note", "The guard blocks raw done writes.")
         mc.index_memory_files(db_path=self.db_path)
         first = self._row("a.md")
@@ -97,7 +119,8 @@ class MemoryMetadataTestCase(unittest.TestCase):
         second = self._row("a.md")
 
         self.assertIsNotNone(first["created_at"])
-        self.assertEqual(first["created_at"], second["created_at"])
+        self.assertIsNotNone(second["created_at"])
+        self.assertNotEqual(first["created_at"], second["created_at"])
 
     def test_mark_memory_replaced_sets_status_and_replaced_by(self) -> None:
         self._write_note("old.md", "Old note", "Some fact.")

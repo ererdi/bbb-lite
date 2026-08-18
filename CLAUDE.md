@@ -12,10 +12,17 @@ For background on stakeholder history, see PROJECT-HISTORY.md.
 - Prefer the standard library. Exceptions currently in use: numpy and
   sentence-transformers (Stage E, embedding-based search) — any further
   third-party package needs to be asked about first.
-- The `haroon-bbb-sync` GitHub repo may be read for reference only — never
-  cloned, never written to.
+- The `haroon-bbb-sync` and `bbb-os-core` GitHub repos may be read for
+  reference only — never cloned, never written to. Reading via `gh api
+  .../contents/...` (fetch only, no push, no local clone) is fine; nothing
+  more.
 - Exactly one file, `mc.py`, touches the database directly. No other script
   runs SQL.
+- All work happens locally first. Never push, sync, or otherwise write to any
+  remote (including the user's own `origin` and the `haroon` remote — see
+  `git remote -v`) without the user explicitly asking for that push in that
+  moment. A prior approval to push does not carry forward to later pushes;
+  ask again each time.
 
 ## External repo rules
 

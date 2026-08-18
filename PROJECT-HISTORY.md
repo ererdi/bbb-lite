@@ -283,6 +283,65 @@ tasks, deliberately chosen to be small, separate from each other, and not
 overlapping with whatever Erdi is working on at the same time, to avoid
 merge conflicts between the two of them working in parallel.
 
+## 12. bbb-os-core memory/db parity implementation status (2026-08-18)
+
+Tracking `BBB-OS-CORE-MEMORY-DB-PARITY-IMPLEMENTATION-PLAN.md` (dated
+2026-08-17, repo root) — an 8-step list to bring bbb-lite's memory/db
+layer closer to bbb-os-core's schema discipline, decision/reason
+receipts, provenance/authority tracking, and epistemic classification,
+entirely within CLAUDE.md's SQLite-only/single-file/stdlib-only
+constraints. Supersedes the file's own predecessor,
+`BBB-OS-CORE-MEMORY-DB-PARITY-REPORT.md` (also at repo root).
+
+- [x] Step 1 — Version history: append-only `memory_index` + `supersedes_id`
+- [x] Step 2 — Outbox retry counter (`events_log.attempts`/`max_attempts`, `mark_failed()`)
+- [x] Step 3 — Decision + hold state machine (`memory_decisions` + `memory_hold`)
+- [x] Step 4 — Owner/authority model (`memory_index.authority` + `memory_confirmations` + `confirm_memory()`)
+- [x] Step 5 — Epistemic class + `memory_derivation`
+- [x] Step 6 — Memory-specific hygiene scan (extends `run_maintenance_checks()`)
+- [x] Step 7 — Vector schema simplification (`embedding_model`/`embedding_dim`)
+- [x] Step 8 — Verification and recording (continuous — decisions.md entries,
+      this section, full test suite green after each step)
+
+As of this entry: 680 tests passing, nothing committed — all of it (`mc.py`,
+`test_mc.py`) lives in the working tree pending explicit approval to commit.
+See `memory/decisions.md`, 2026-08-18 entry, for the design decisions made
+along the way (most notably: `confirm_memory()`'s 'rejected' decision maps
+to `memory_index.status='superseded'`, not a new 'rejected' status value —
+bbb-os-core's own `memory_fact.status` enum has no such value either).
+
+**Update (2026-08-18, later same day):** Steps 5–7 completed in follow-on
+sessions — Step 5's `memory_derivation` ended up schema-only (no writer
+function exists yet, no multi-source-abstraction flow in bbb-lite today);
+Step 6 shipped only 4 of bbb-os-core's real 6 `memory_hygiene_receipt`
+handlers (`vector_reconcile`/`expiry_sweep`/`conflict_proposals` implemented,
+`dedup_orphans` closed with no new code — bbb-lite's Step 1
+`idx_memory_index_active_source_file` unique index already makes that failure
+class structurally impossible, `projection_coverage`/`archive_placement`
+excluded as architecture bbb-lite doesn't have); Step 7 added
+`embedding_model`/`embedding_dim` as per-row columns (a deliberate
+simplification of bbb-os-core's normalized `memory_embedding_generation`
+table — no multi-model migration scenario exists or is planned here). Full
+`python -m unittest discover` (all `test_*.py`, not just `test_mc.py`) now
+passes at 1104 tests, 0 failures — see `memory/decisions.md`'s several
+2026-08-18 entries for the step-by-step detail, including two real bugs found
+and fixed along the way (`test_stage_as_memory_metadata.py`'s `_row()` helper
+picking the wrong row after Step 1's multi-row chain, and a stale docstring
+claim about `created_at` being immutable across a supersede that was never
+true post-Step-1 and never matched bbb-os-core either). Still nothing
+committed. Step 8 (this file + decisions.md bookkeeping) is what's in
+progress as of this update.
+
+**Closing update (2026-08-18, same day):** all 8 steps complete. See
+`memory/decisions.md`'s own top-level Adım 8 entry for how the plan ties
+back to the 2026-08-12 scope decision ("%90+ logical/feature parity, not
+architecture" — architecture constraints unchanged throughout: no server,
+no daemon, no SSH/Telegram/HTTP gateway; Step 6's `projection_coverage`/
+`archive_placement` exclusion and Step 7's embedding-generation-table
+decision both applied that same distinction). `python -m unittest discover`
+(all `test_*.py`): 1104 tests, 0 failures. Nothing committed — that decision
+is separate and remains the user's.
+
 This history file should be updated (appended, never shortened) whenever
 a new major stakeholder decision, piece of feedback, or architectural
 ruling is made, so future sessions do not lose this context.

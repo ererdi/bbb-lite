@@ -10,6 +10,7 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -42,6 +43,9 @@ class RunMaintenanceChecksTestCase(unittest.TestCase):
         self.assertEqual("pass", statuses["orphaned_graph_edges"])
         self.assertEqual("pass", statuses["orphaned_context_edges"])
         self.assertEqual("pass", statuses["overdue_reminders"])
+        self.assertEqual("pass", statuses["vector_reconcile"])
+        self.assertEqual("pass", statuses["expiry_sweep"])
+        self.assertEqual("pass", statuses["conflict_proposals"])
         # no session_id/checkpoint given, so memory_currentness_conflicts is
         # skipped entirely (nothing to check against), not recorded as pass/fail.
         self.assertNotIn("memory_currentness_conflicts", statuses)
@@ -64,6 +68,9 @@ class RunMaintenanceChecksTestCase(unittest.TestCase):
         self.assertIn("orphaned_graph_edges", check_names)
         self.assertIn("orphaned_context_edges", check_names)
         self.assertIn("overdue_reminders", check_names)
+        self.assertIn("vector_reconcile", check_names)
+        self.assertIn("expiry_sweep", check_names)
+        self.assertIn("conflict_proposals", check_names)
         for run in runs:
             self.assertIn(run["status"], ("pass", "fail"))
 
@@ -102,6 +109,79 @@ class RunMaintenanceChecksTestCase(unittest.TestCase):
         self.assertEqual("fail", overdue_result["status"])
         self.assertIn("1 task(s)", overdue_result["detail"])
 
+    def test_detects_active_row_missing_embedding(self) -> None:
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            conn.execute(
+                """INSERT INTO memory_index (source_file, title, content, keywords)
+                   VALUES (?, ?, ?, ?)""",
+                ("a.md", "A", "Body A", "a"),
+            )
+            conn.commit()
+        results = mc.run_maintenance_checks(db_path=self.db_path)
+        vector_result = next(r for r in results if r["check_name"] == "vector_reconcile")
+        self.assertEqual("fail", vector_result["status"])
+        self.assertIn("1 active memory_index", vector_result["detail"])
+
+    def test_expiry_sweep_passes_when_superseded_row_is_really_excluded(self) -> None:
+        # No mocking - a real search_memory() call against a real superseded
+        # row, confirming the exclusion Adım 1 relies on actually holds.
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            conn.execute(
+                """INSERT INTO memory_index (source_file, title, content, keywords, status)
+                   VALUES (?, ?, ?, ?, ?)""",
+                ("old.md", "Old", "Stale unique marker content", "old", "superseded"),
+            )
+            conn.commit()
+        results = mc.run_maintenance_checks(db_path=self.db_path)
+        expiry_result = next(r for r in results if r["check_name"] == "expiry_sweep")
+        self.assertEqual("pass", expiry_result["status"])
+
+    def test_detects_replaced_row_leaking_into_search_memory(self) -> None:
+        # search_memory() itself has no bug today - this forces the leak via
+        # a mock, since expiry_sweep can only ever fail if a *future* change
+        # to search_memory()'s exclusion filter regresses (that's the point).
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            conn.execute(
+                """INSERT INTO memory_index (source_file, title, content, keywords, status)
+                   VALUES (?, ?, ?, ?, ?)""",
+                ("old.md", "Old", "Stale leaked content", "old", "superseded"),
+            )
+            conn.commit()
+        leaked_hit = {
+            "source_file": "old.md", "title": "Old", "content": "Stale leaked content",
+            "keywords": "old", "confidence": 0.5,
+        }
+        with mock.patch("mc.search_memory", return_value=[leaked_hit]):
+            results = mc.run_maintenance_checks(db_path=self.db_path)
+        expiry_result = next(r for r in results if r["check_name"] == "expiry_sweep")
+        self.assertEqual("fail", expiry_result["status"])
+        self.assertIn("old.md", expiry_result["detail"])
+
+    def test_conflict_proposals_passes_for_a_fresh_hold(self) -> None:
+        # Real (non-manipulated) retry_after, 15 minutes out - not overdue yet.
+        mc.record_memory_decision(
+            "digest-fresh", ["a.md"], "hold", "test_reason", db_path=self.db_path,
+        )
+        results = mc.run_maintenance_checks(db_path=self.db_path)
+        conflict_result = next(r for r in results if r["check_name"] == "conflict_proposals")
+        self.assertEqual("pass", conflict_result["status"])
+
+    def test_detects_overdue_memory_hold(self) -> None:
+        decision = mc.record_memory_decision(
+            "digest-overdue", ["a.md"], "hold", "test_reason", db_path=self.db_path,
+        )
+        past = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE memory_hold SET retry_after = ? WHERE decision_id = ?",
+                (past, decision["id"]),
+            )
+            conn.commit()
+        results = mc.run_maintenance_checks(db_path=self.db_path)
+        conflict_result = next(r for r in results if r["check_name"] == "conflict_proposals")
+        self.assertEqual("fail", conflict_result["status"])
+        self.assertIn("1 open memory_hold", conflict_result["detail"])
+
     def test_memory_conflict_check_runs_when_checkpoint_has_current_task(self) -> None:
         mc.write_checkpoint("s1", current_task="billing invoice work", db_path=self.db_path)
         with mock.patch("mc.detect_memory_conflicts", return_value=[{"a": 1, "b": 2}]):
@@ -133,6 +213,9 @@ class RunMaintenanceChecksTestCase(unittest.TestCase):
         self.assertIn("orphaned_graph_edges", check_names)
         self.assertIn("orphaned_context_edges", check_names)
         self.assertIn("overdue_reminders", check_names)
+        self.assertIn("vector_reconcile", check_names)
+        self.assertIn("expiry_sweep", check_names)
+        self.assertIn("conflict_proposals", check_names)
 
 
 class SessionStartMaintenanceWiringTestCase(unittest.TestCase):

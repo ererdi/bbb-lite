@@ -537,6 +537,117 @@ def init_db(db_path: Path = DB_PATH) -> None:
             conn.execute(
                 "ALTER TABLE memory_index ADD COLUMN version INTEGER DEFAULT 1"
             )
+        if "supersedes_id" not in existing_columns:
+            # SQLite can't drop/alter a UNIQUE constraint in place, so this
+            # rebuilds the table: the old schema's UNIQUE(source_file) blocks
+            # having both a superseded row and its successor for the same
+            # file. Uniqueness of the *current* row per source_file becomes
+            # an application-level invariant (status = 'active') from here on.
+            conn.execute(
+                """CREATE TABLE memory_index_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_file TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    keywords TEXT NOT NULL,
+                    embedding BLOB,
+                    confidence REAL DEFAULT 0.5,
+                    doc_type TEXT DEFAULT 'lesson',
+                    project TEXT DEFAULT 'global',
+                    evidence_level TEXT DEFAULT 'unknown',
+                    currentness TEXT DEFAULT 'current',
+                    content_hash TEXT,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    status TEXT DEFAULT 'active',
+                    replaced_by TEXT,
+                    version INTEGER DEFAULT 1,
+                    supersedes_id INTEGER REFERENCES memory_index(id)
+                )"""
+            )
+            conn.execute(
+                """INSERT INTO memory_index_new
+                       (id, source_file, title, content, keywords, embedding, confidence,
+                        doc_type, project, evidence_level, currentness, content_hash,
+                        created_at, updated_at, status, replaced_by, version)
+                   SELECT id, source_file, title, content, keywords, embedding, confidence,
+                          doc_type, project, evidence_level, currentness, content_hash,
+                          created_at, updated_at, status, replaced_by, version
+                   FROM memory_index"""
+            )
+            conn.execute("DROP TABLE memory_index")
+            conn.execute("ALTER TABLE memory_index_new RENAME TO memory_index")
+        if "authority" not in existing_columns:
+            # bbb-os-core's haroon/team/agent/external/inference enum, reduced to a
+            # single-user project: 'team' is dropped (no team here), 'haroon' becomes
+            # 'erdi'. Distinguishes "erdi said this directly" from "the agent inferred
+            # it" — a real trustworthiness signal even with one user. Placed after the
+            # supersedes_id rebuild above (not folded into it) since that rebuild's
+            # column list is fixed by an unrelated UNIQUE-constraint problem; a plain
+            # ALTER TABLE ADD COLUMN is all this needs.
+            conn.execute(
+                """ALTER TABLE memory_index ADD COLUMN authority TEXT NOT NULL DEFAULT 'agent'
+                   CHECK(authority IN ('erdi','agent','inference','external'))"""
+            )
+        if "epistemic_class" not in existing_columns:
+            # Adım 5: bbb-os-core's STATED/OBSERVED/IMPORTED/SUMMARY/DERIVED/
+            # SYNTHETIC classification, carried over unchanged. Default
+            # 'IMPORTED' matches reality for every row that predates this
+            # column: it came from a markdown file on disk, not from erdi
+            # saying something directly in chat.
+            conn.execute(
+                """ALTER TABLE memory_index ADD COLUMN epistemic_class TEXT NOT NULL
+                   DEFAULT 'IMPORTED'
+                   CHECK(epistemic_class IN
+                       ('STATED','OBSERVED','IMPORTED','SUMMARY','DERIVED','SYNTHETIC'))"""
+            )
+            conn.execute("ALTER TABLE memory_index ADD COLUMN source_span TEXT")
+            # bbb-os-core's rule, carried over 1:1: a 'STATED' row must carry
+            # proof — source_span (where within the source) and source_digest
+            # (sha256 hex of the stated text, so 64 chars) both present. The
+            # CHECK rides on source_digest's own ALTER TABLE (added last, once
+            # epistemic_class and source_span already exist) rather than a
+            # separate column, since SQLite allows a CHECK added via ALTER
+            # TABLE ADD COLUMN to reference other existing columns.
+            conn.execute(
+                """ALTER TABLE memory_index ADD COLUMN source_digest TEXT
+                   CHECK(epistemic_class != 'STATED'
+                         OR (source_span IS NOT NULL AND length(source_digest) = 64))"""
+            )
+        if "embedding_model" not in existing_columns:
+            conn.execute("ALTER TABLE memory_index ADD COLUMN embedding_model TEXT")
+        if "embedding_dim" not in existing_columns:
+            # Adım 7: bbb-os-core tracks model/dim per embedding GENERATION
+            # (sql/memory_recall.sql, memory_embedding_generation — a whole
+            # re-embed run, with shadow/eligible/active/retired states),
+            # normalized rather than per-row, because it supports live
+            # migrations between embedding models. bbb-lite has never
+            # changed models and none is planned, so one column per row is
+            # a deliberate simplification — same reasoning as Adım 6's
+            # projection_coverage/archive_placement exclusion (see
+            # memory/decisions.md 2026-08-18).
+            conn.execute("ALTER TABLE memory_index ADD COLUMN embedding_dim INTEGER")
+            # Backfill: every row that already has an embedding got it from
+            # the one and only model this codebase has ever used. dim is
+            # read back from the embedding blob itself (float32 = 4
+            # bytes/dim), not hardcoded, so a future model change can't
+            # silently desync it from what index_memory_files() records.
+            conn.execute(
+                """UPDATE memory_index SET embedding_model = ?, embedding_dim = length(embedding) / 4
+                   WHERE embedding IS NOT NULL""",
+                (_EMBEDDING_MODEL_NAME,),
+            )
+        # DB-level backstop for "at most one active row per source_file": a
+        # partial unique index, not just the app-level status='active' query
+        # scoping above — bbb-os-core's memory_fact enforces this rule only
+        # in application code (lib/memory_fact_store.py), with no equivalent
+        # constraint in sql/memory_fact.sql; here it's enforced by SQLite
+        # itself so a future query that forgets to filter by status can't
+        # silently create two active rows for the same file.
+        conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_index_active_source_file
+               ON memory_index(source_file) WHERE status = 'active'"""
+        )
         conn.execute(
             """CREATE TABLE IF NOT EXISTS doc_index (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -672,6 +783,14 @@ def init_db(db_path: Path = DB_PATH) -> None:
         }
         if "outbox_status" not in existing_events_log_columns:
             conn.execute("ALTER TABLE events_log ADD COLUMN outbox_status TEXT")
+        if "attempts" not in existing_events_log_columns:
+            conn.execute(
+                "ALTER TABLE events_log ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+            )
+        if "max_attempts" not in existing_events_log_columns:
+            conn.execute(
+                "ALTER TABLE events_log ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3"
+            )
         conn.execute(
             """CREATE TABLE IF NOT EXISTS maintenance_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -852,6 +971,127 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 created_at TEXT NOT NULL,
                 resolved_at TEXT
             )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS memory_decisions (
+                id TEXT PRIMARY KEY,
+                candidate_digest TEXT NOT NULL,
+                source_ids_json TEXT NOT NULL,
+                decision TEXT NOT NULL CHECK(decision IN
+                    ('promote','reject','hold','dedupe','supersede','correct')),
+                reason_code TEXT NOT NULL,
+                resulting_ids_json TEXT NOT NULL DEFAULT '[]',
+                idempotency_key TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        # bbb-os-core's memory_promotion_decision is append-only; these two
+        # triggers make that a real DB-level guarantee rather than a
+        # convention nobody enforces - any UPDATE/DELETE aborts outright.
+        conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS memory_decisions_immutable_update
+               BEFORE UPDATE ON memory_decisions
+               BEGIN
+                   SELECT RAISE(ABORT, 'memory_decisions rows are immutable (no UPDATE)');
+               END"""
+        )
+        conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS memory_decisions_immutable_delete
+               BEFORE DELETE ON memory_decisions
+               BEGIN
+                   SELECT RAISE(ABORT, 'memory_decisions rows are immutable (no DELETE)');
+               END"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS memory_hold (
+                id TEXT PRIMARY KEY,
+                decision_id TEXT NOT NULL UNIQUE REFERENCES memory_decisions(id),
+                candidate_digest TEXT NOT NULL,
+                reason_code TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('open','claimed','resolved','expired')),
+                claim_epoch INTEGER NOT NULL DEFAULT 0,
+                retry_after TEXT,
+                resolved_by TEXT,
+                resolution_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        # bbb-os-core's memory_hold_state_lifecycle trigger, adapted 1:1:
+        # resolved/expired are terminal (no further state change at all,
+        # not even a same-value rewrite); open -> claimed/resolved/expired;
+        # claimed -> open/claimed/resolved/expired, where re-entering
+        # 'claimed' (including reclaiming from 'claimed' itself) always
+        # requires claim_epoch to strictly advance.
+        conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS memory_hold_state_lifecycle
+               BEFORE UPDATE OF state ON memory_hold
+               BEGIN
+                   SELECT RAISE(ABORT, 'memory_hold: resolved/expired holds are terminal')
+                       WHERE OLD.state IN ('resolved', 'expired');
+                   SELECT RAISE(ABORT, 'memory_hold: invalid state transition')
+                       WHERE NOT (
+                           (OLD.state = 'open' AND NEW.state IN ('claimed', 'resolved', 'expired'))
+                           OR (OLD.state = 'claimed' AND NEW.state IN
+                               ('open', 'claimed', 'resolved', 'expired'))
+                       );
+                   SELECT RAISE(ABORT, 'memory_hold: claim_epoch must advance to (re)enter claimed')
+                       WHERE NEW.state = 'claimed' AND NEW.claim_epoch <= OLD.claim_epoch;
+               END"""
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS memory_hold_state ON memory_hold(state)")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS memory_confirmations (
+                id TEXT PRIMARY KEY,
+                memory_id INTEGER NOT NULL REFERENCES memory_index(id),
+                decision TEXT NOT NULL CHECK(decision IN
+                    ('confirmed','corrected','rejected')),
+                channel TEXT NOT NULL,
+                decided_by TEXT NOT NULL DEFAULT 'erdi',
+                proof_refs_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS memory_confirmations_immutable_update
+               BEFORE UPDATE ON memory_confirmations
+               BEGIN
+                   SELECT RAISE(ABORT, 'memory_confirmations rows are immutable (no UPDATE)');
+               END"""
+        )
+        conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS memory_confirmations_immutable_delete
+               BEFORE DELETE ON memory_confirmations
+               BEGIN
+                   SELECT RAISE(ABORT, 'memory_confirmations rows are immutable (no DELETE)');
+               END"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS memory_confirmations_memory ON memory_confirmations(memory_id, created_at)"
+        )
+        # Adım 5: bbb-os-core's derivation record — a child memory_index row
+        # that abstracts or infers something from >=2 parent rows. No writer
+        # function yet (no flow in bbb-lite produces multi-source abstractions
+        # today); this is the schema half of the step, per the parity plan.
+        # json_array_length(parent_ids_json) >= 2 enforces "at least two
+        # sources" at the DB level rather than trusting a future caller.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS memory_derivation (
+                id TEXT PRIMARY KEY,
+                child_id INTEGER NOT NULL REFERENCES memory_index(id),
+                parent_ids_json TEXT NOT NULL
+                    CHECK(json_array_length(parent_ids_json) >= 2),
+                parent_set_digest TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('ABSTRACTION','BEHAVIORAL_INFERENCE')),
+                producer TEXT NOT NULL,
+                confidence REAL,
+                status TEXT NOT NULL CHECK(status IN ('active','stale','held','revoked')),
+                created_at TEXT NOT NULL,
+                revalidated_at TEXT
+            )"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS memory_derivation_child ON memory_derivation(child_id)"
         )
         conn.execute("CREATE INDEX IF NOT EXISTS health_events_created ON health_events(created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS graph_edges_src ON graph_edges(src, type)")
@@ -1379,6 +1619,28 @@ def mark_consumed(event_id: int, db_path: Path = DB_PATH) -> None:
     with contextlib.closing(_connect(db_path)) as conn:
         conn.execute(
             "UPDATE events_log SET outbox_status = 'consumed' WHERE id = ?", (event_id,)
+        )
+        conn.commit()
+
+
+def mark_failed(event_id: int, db_path: Path = DB_PATH) -> None:
+    """Record one failed delivery attempt for an events_log row.
+
+    Increments attempts; once attempts reaches max_attempts the row is
+    flipped to outbox_status='dead' (dead-letter). Below that threshold
+    outbox_status is left as-is so the row stays 'pending' and eligible for
+    another try via list_pending_events()."""
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        conn.execute(
+            """UPDATE events_log
+               SET attempts = attempts + 1,
+                   outbox_status = CASE
+                       WHEN attempts + 1 >= max_attempts THEN 'dead'
+                       ELSE outbox_status
+                   END
+               WHERE id = ?""",
+            (event_id,),
         )
         conn.commit()
 
@@ -1964,6 +2226,14 @@ def recent_decision_ids(limit: int = 2, db_path: Path = DB_PATH) -> list[int]:
 
 _DECISION_CONFLICT_WORD_OVERLAP_THRESHOLD = 0.5
 
+# Adım 6: bbb-os-core's own TTL for a hold awaiting resolution — verified
+# against lib/memory_fact_service.py (3 call sites: persist_path_decision_
+# from_connection, apply_judged_fact_from_connection, persist_nonwrite),
+# all three use dt.timedelta(minutes=15) with no variation. Carried over
+# as-is rather than guessed, per the "use core's precedent when one exists"
+# rule.
+_MEMORY_HOLD_RETRY_AFTER = timedelta(minutes=15)
+
 
 def detect_decision_conflicts(db_path: Path = DB_PATH) -> list[dict]:
     """Find pairs of decisions that may disagree (Stage AT, Haroon's team doc item 7).
@@ -2010,7 +2280,189 @@ def detect_decision_conflicts(db_path: Path = DB_PATH) -> list[dict]:
                         ),
                     }
                 )
+                source_ids = sorted([a["id"], b["id"]])
+                digest = _sha256_text(f"decision_word_overlap_conflict:{source_ids}")
+                record_memory_decision(
+                    candidate_digest=digest,
+                    source_ids=source_ids,
+                    decision="hold",
+                    reason_code="decision_word_overlap_conflict",
+                    idempotency_key=digest,
+                    db_path=db_path,
+                )
     return conflicts
+
+
+def record_memory_decision(
+    candidate_digest: str,
+    source_ids: list,
+    decision: str,
+    reason_code: str,
+    *,
+    resulting_ids: list | None = None,
+    idempotency_key: str | None = None,
+    db_path: Path = DB_PATH,
+) -> dict:
+    """Append-only decision log — bbb-os-core's memory_promotion_decision.
+
+    Idempotent by idempotency_key (defaults to "digest:decision:reason_code"):
+    calling this twice for the same outcome returns the already-recorded row
+    instead of raising or duplicating it, since detect_memory_conflicts()/
+    detect_decision_conflicts() may re-detect the same pair on every call.
+
+    When decision='hold', this also opens exactly one memory_hold row
+    (state='open') for the new decision — resolved later via
+    claim_memory_hold()/resolve_memory_hold()/reject_conflict(). If a hold
+    already exists for this decision (including one already resolved or
+    expired), the UNIQUE(decision_id) constraint makes the second attempt a
+    no-op, so a resolved hold is never silently reopened. The new hold's
+    retry_after is set to created_at + _MEMORY_HOLD_RETRY_AFTER (Adım 6) —
+    before this, retry_after was always NULL (nothing wrote it), which made
+    run_maintenance_checks()'s conflict_proposals check structurally unable
+    to ever find anything on real data.
+    """
+
+    key = idempotency_key or f"{candidate_digest}:{decision}:{reason_code}"
+    now = _now()
+    with contextlib.closing(_connect(db_path)) as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO memory_decisions
+                   (id, candidate_digest, source_ids_json, decision, reason_code,
+                    resulting_ids_json, idempotency_key, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                uuid.uuid4().hex, candidate_digest, json.dumps(source_ids), decision,
+                reason_code, json.dumps(resulting_ids or []), key, now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM memory_decisions WHERE idempotency_key = ?", (key,)
+        ).fetchone()
+        if decision == "hold":
+            retry_after = (datetime.fromisoformat(now) + _MEMORY_HOLD_RETRY_AFTER).isoformat()
+            conn.execute(
+                """INSERT OR IGNORE INTO memory_hold
+                       (id, decision_id, candidate_digest, reason_code, state,
+                        claim_epoch, retry_after, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, 'open', 0, ?, ?, ?)""",
+                (
+                    uuid.uuid4().hex, row["id"], candidate_digest, reason_code,
+                    retry_after, now, now,
+                ),
+            )
+        conn.commit()
+    return dict(row)
+
+
+def list_memory_holds(state: str | None = None, db_path: Path = DB_PATH) -> list[dict]:
+    with contextlib.closing(_connect(db_path)) as conn:
+        if state is None:
+            rows = conn.execute("SELECT * FROM memory_hold ORDER BY created_at").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM memory_hold WHERE state = ? ORDER BY created_at", (state,)
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _get_memory_hold(hold_id: str, db_path: Path = DB_PATH) -> dict:
+    with contextlib.closing(_connect(db_path)) as conn:
+        row = conn.execute("SELECT * FROM memory_hold WHERE id = ?", (hold_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"no memory_hold row with id {hold_id}")
+    return dict(row)
+
+
+def claim_memory_hold(hold_id: str, db_path: Path = DB_PATH) -> dict:
+    """open/claimed -> claimed, advancing claim_epoch. Any other starting
+    state (resolved/expired) is rejected by memory_hold_state_lifecycle —
+    raises sqlite3.IntegrityError, not a Python-level check, since the
+    trigger is the actual source of truth for valid transitions."""
+
+    current = _get_memory_hold(hold_id, db_path=db_path)
+    with contextlib.closing(_connect(db_path)) as conn:
+        conn.execute(
+            """UPDATE memory_hold SET state = 'claimed', claim_epoch = ?, updated_at = ?
+               WHERE id = ?""",
+            (current["claim_epoch"] + 1, _now(), hold_id),
+        )
+        conn.commit()
+    return _get_memory_hold(hold_id, db_path=db_path)
+
+
+def release_memory_hold(hold_id: str, db_path: Path = DB_PATH) -> dict:
+    """claimed -> open: releases a claim without resolving it."""
+
+    _get_memory_hold(hold_id, db_path=db_path)
+    with contextlib.closing(_connect(db_path)) as conn:
+        conn.execute(
+            "UPDATE memory_hold SET state = 'open', updated_at = ? WHERE id = ?",
+            (_now(), hold_id),
+        )
+        conn.commit()
+    return _get_memory_hold(hold_id, db_path=db_path)
+
+
+def resolve_memory_hold(
+    hold_id: str, resolved_by: str, resolution: dict | None = None, *, db_path: Path = DB_PATH
+) -> dict:
+    """open/claimed -> resolved (terminal)."""
+
+    _get_memory_hold(hold_id, db_path=db_path)
+    with contextlib.closing(_connect(db_path)) as conn:
+        conn.execute(
+            """UPDATE memory_hold SET state = 'resolved', resolved_by = ?,
+                   resolution_json = ?, updated_at = ? WHERE id = ?""",
+            (
+                resolved_by,
+                json.dumps(resolution) if resolution is not None else None,
+                _now(),
+                hold_id,
+            ),
+        )
+        conn.commit()
+    return _get_memory_hold(hold_id, db_path=db_path)
+
+
+def expire_memory_hold(hold_id: str, db_path: Path = DB_PATH) -> dict:
+    """open/claimed -> expired (terminal) — e.g. a hold whose retry_after
+    passed with nobody resolving it (Adım 6's expiry sweep will drive this)."""
+
+    _get_memory_hold(hold_id, db_path=db_path)
+    with contextlib.closing(_connect(db_path)) as conn:
+        conn.execute(
+            "UPDATE memory_hold SET state = 'expired', updated_at = ? WHERE id = ?",
+            (_now(), hold_id),
+        )
+        conn.commit()
+    return _get_memory_hold(hold_id, db_path=db_path)
+
+
+def reject_conflict(hold_id: str, reason_code: str, db_path: Path = DB_PATH) -> dict:
+    """Reject a held conflict: logs a new decision='reject' row (the original
+    'hold' row is never edited — memory_decisions stays append-only) and
+    resolves the memory_hold row that was open for it."""
+
+    hold = _get_memory_hold(hold_id, db_path=db_path)
+    with contextlib.closing(_connect(db_path)) as conn:
+        original = conn.execute(
+            "SELECT * FROM memory_decisions WHERE id = ?", (hold["decision_id"],)
+        ).fetchone()
+    decision = record_memory_decision(
+        candidate_digest=hold["candidate_digest"],
+        source_ids=json.loads(original["source_ids_json"]),
+        decision="reject",
+        reason_code=reason_code,
+        idempotency_key=f"reject:{hold_id}:{reason_code}",
+        db_path=db_path,
+    )
+    resolved_hold = resolve_memory_hold(
+        hold_id,
+        "reject_conflict",
+        {"reject_decision_id": decision["id"], "reason_code": reason_code},
+        db_path=db_path,
+    )
+    return {"decision": decision, "hold": resolved_hold}
 
 
 def upsert_capability_boundary(
@@ -2711,6 +3163,66 @@ def run_maintenance_checks(session_id: str | None = None, *, db_path: Path = DB_
         # not a failure (matches session_start.py's own skip in that case).
     except Exception as exc:
         _record("memory_currentness_conflicts", "fail", f"check raised: {exc}")
+
+    # Adım 6: bbb-os-core's memory_hygiene_receipt handler taxonomy (verified
+    # against sql/memory_p3b2.sql and lib/memory_p3b2_ops.py:891-893 — the
+    # real list is 6 handlers, not the 5 an earlier plan draft assumed):
+    # vector_reconcile, expiry_sweep, dedup_orphans, conflict_proposals,
+    # projection_coverage, archive_placement. Only the first 4 map to
+    # anything bbb-lite has; see memory/decisions.md 2026-08-18 for why
+    # projection_coverage/archive_placement are out of scope and why
+    # dedup_orphans needed no new code here.
+    try:
+        with contextlib.closing(_connect(db_path)) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM memory_index WHERE status = 'active' AND embedding IS NULL"
+            ).fetchone()[0]
+        _record(
+            "vector_reconcile",
+            "pass" if count == 0 else "fail",
+            None if count == 0 else f"{count} active memory_index row(s) missing an embedding",
+        )
+    except Exception as exc:
+        _record("vector_reconcile", "fail", f"check raised: {exc}")
+
+    try:
+        with contextlib.closing(_connect(db_path)) as conn:
+            stale_rows = conn.execute(
+                """SELECT source_file, content FROM memory_index
+                   WHERE status IN ('replaced', 'superseded')"""
+            ).fetchall()
+        leaked = [
+            row["source_file"]
+            for row in stale_rows
+            if any(
+                hit["content"] == row["content"]
+                for hit in search_memory(row["content"], limit=50, db_path=db_path)
+            )
+        ]
+        _record(
+            "expiry_sweep",
+            "pass" if not leaked else "fail",
+            None if not leaked
+            else f"{len(leaked)} replaced/superseded row(s) still returned by search_memory(): {leaked}",
+        )
+    except Exception as exc:
+        _record("expiry_sweep", "fail", f"check raised: {exc}")
+
+    try:
+        with contextlib.closing(_connect(db_path)) as conn:
+            overdue_holds = conn.execute(
+                """SELECT id FROM memory_hold
+                   WHERE state = 'open' AND retry_after IS NOT NULL AND retry_after <= ?""",
+                (_now(),),
+            ).fetchall()
+        _record(
+            "conflict_proposals",
+            "pass" if not overdue_holds else "fail",
+            None if not overdue_holds
+            else f"{len(overdue_holds)} open memory_hold row(s) past retry_after",
+        )
+    except Exception as exc:
+        _record("conflict_proposals", "fail", f"check raised: {exc}")
 
     return results
 
@@ -3568,10 +4080,21 @@ def index_memory_files(db_path: Path = DB_PATH) -> int:
     """Upsert every memory/*.md file into memory_index. Re-running re-indexes, never duplicates.
 
     Stage AS: also tracks content_hash/created_at/updated_at/version. If a
-    row's content_hash is unchanged from what's already stored, updated_at
-    and version are left untouched (nothing actually changed); otherwise
-    updated_at moves to now and version increments. created_at is set once,
-    on the row's first insert, and never overwritten afterward.
+    row's content_hash is unchanged from what's already stored, the row is
+    left untouched entirely (nothing actually changed). If it changed,
+    Adım 1's append-only chain applies instead: the old row is frozen in
+    place (status flips to 'superseded', its own created_at is never
+    touched again) and a brand-new row is inserted for the new content,
+    with version = old + 1 and its OWN created_at/updated_at (now) — NOT
+    the old row's created_at. This mirrors bbb-os-core's real precedent
+    (lib/memory_fact_store.py:578-703, apply_from_connection — the sole
+    memory_fact write path for promote/supersede): its INSERT never
+    carries created_at forward across a supersede either, it lets the
+    schema's DEFAULT CURRENT_TIMESTAMP (sql/memory_fact.sql) apply per
+    row. (An earlier version of this docstring claimed "created_at is set
+    once and never overwritten" — true back when reindexing was a
+    same-row UPDATE, before Adım 1 introduced the multi-row chain; that
+    claim was stale and never verified against core, corrected 2026-08-18.)
 
     Stage AU: a single unreadable/malformed file no longer aborts the whole
     sweep — it's skipped (logged as a health_events row, component=
@@ -3593,41 +4116,60 @@ def index_memory_files(db_path: Path = DB_PATH) -> int:
                 title, body, confidence = parsed["title"], parsed["body"], parsed["confidence"]
                 keywords = _extract_keywords(f"{title} {body}")
                 embedding = _embed_or_none(f"{title}\n{body}")
+                # Adım 7: dim read back from the produced vector's own byte
+                # length (float32 = 4 bytes/dim), never hardcoded - stays
+                # correct even if _EMBEDDING_MODEL_NAME changes later.
+                embedding_model = _EMBEDDING_MODEL_NAME if embedding is not None else None
+                embedding_dim = len(embedding) // 4 if embedding is not None else None
                 content_hash = _sha256_text(body)
-                conn.execute(
-                    """INSERT INTO memory_index
-                           (source_file, title, content, keywords, embedding, confidence,
-                            doc_type, project, evidence_level, currentness,
-                            content_hash, created_at, updated_at, status, replaced_by, version)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, 1)
-                       ON CONFLICT(source_file) DO UPDATE SET
-                           title = excluded.title,
-                           content = excluded.content,
-                           keywords = excluded.keywords,
-                           embedding = excluded.embedding,
-                           confidence = excluded.confidence,
-                           doc_type = excluded.doc_type,
-                           project = excluded.project,
-                           evidence_level = excluded.evidence_level,
-                           currentness = excluded.currentness,
-                           content_hash = excluded.content_hash,
-                           created_at = COALESCE(memory_index.created_at, excluded.created_at),
-                           updated_at = CASE
-                               WHEN memory_index.content_hash IS excluded.content_hash
-                               THEN COALESCE(memory_index.updated_at, excluded.updated_at)
-                               ELSE excluded.updated_at
-                           END,
-                           version = CASE
-                               WHEN memory_index.content_hash IS excluded.content_hash
-                               THEN COALESCE(memory_index.version, 1)
-                               ELSE COALESCE(memory_index.version, 1) + 1
-                           END""",
-                    (
-                        path.name, title, body, keywords, embedding, confidence,
-                        parsed["doc_type"], parsed["project"], parsed["evidence_level"],
-                        parsed["currentness"], content_hash, now, now,
-                    ),
-                )
+                existing = conn.execute(
+                    """SELECT id, version, content_hash FROM memory_index
+                       WHERE source_file = ? AND status = 'active'
+                       ORDER BY id DESC LIMIT 1""",
+                    (path.name,),
+                ).fetchone()
+                if existing is None:
+                    conn.execute(
+                        """INSERT INTO memory_index
+                               (source_file, title, content, keywords, embedding, confidence,
+                                doc_type, project, evidence_level, currentness,
+                                content_hash, created_at, updated_at, status, replaced_by,
+                                version, supersedes_id, embedding_model, embedding_dim)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, 1,
+                                   NULL, ?, ?)""",
+                        (
+                            path.name, title, body, keywords, embedding, confidence,
+                            parsed["doc_type"], parsed["project"], parsed["evidence_level"],
+                            parsed["currentness"], content_hash, now, now,
+                            embedding_model, embedding_dim,
+                        ),
+                    )
+                elif existing["content_hash"] != content_hash:
+                    # Append-only history (mirrors bbb-os-core's memory_fact):
+                    # the old row becomes an immutable historical record —
+                    # only its status moves, never its content — and the new
+                    # content lands in a brand-new row that supersedes it.
+                    conn.execute(
+                        "UPDATE memory_index SET status = 'superseded' WHERE id = ?",
+                        (existing["id"],),
+                    )
+                    conn.execute(
+                        """INSERT INTO memory_index
+                               (source_file, title, content, keywords, embedding, confidence,
+                                doc_type, project, evidence_level, currentness,
+                                content_hash, created_at, updated_at, status, replaced_by,
+                                version, supersedes_id, embedding_model, embedding_dim)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?,
+                                   ?, ?)""",
+                        (
+                            path.name, title, body, keywords, embedding, confidence,
+                            parsed["doc_type"], parsed["project"], parsed["evidence_level"],
+                            parsed["currentness"], content_hash, now, now,
+                            existing["version"] + 1, existing["id"],
+                            embedding_model, embedding_dim,
+                        ),
+                    )
+                # else: content unchanged — leave the existing row exactly as-is.
                 _upsert_memory_graph(conn, path.name, title, body, keywords)
                 count += 1
             except Exception as exc:
@@ -3647,15 +4189,71 @@ def mark_memory_replaced(
     'replaced' and replaced_by points at the successor file, so heal_memory()
     merges leave a trace of what replaced what. search_memory() and
     semantic_search() exclude 'replaced' rows by default.
+
+    Scoped to status = 'active' (Step: append-only version history) — a
+    source_file may also have older 'superseded' rows sitting under it;
+    those already recorded why they stopped being current and shouldn't be
+    relabeled 'replaced' too.
     """
 
     with contextlib.closing(_connect(db_path)) as conn:
         conn.execute(
             """UPDATE memory_index SET status = 'replaced', replaced_by = ?, updated_at = ?
-               WHERE source_file = ?""",
+               WHERE source_file = ? AND status = 'active'""",
             (new_source_file, _now(), old_source_file),
         )
         conn.commit()
+
+
+def confirm_memory(
+    memory_id: int,
+    decision: str,
+    channel: str,
+    proof_refs: list | None = None,
+    *,
+    decided_by: str = "erdi",
+    db_path: Path = DB_PATH,
+) -> dict:
+    """Write an immutable memory_confirmations receipt for one memory_index row —
+    bbb-os-core's owner/authority confirmation flow, adapted to a single user
+    (Adım 4: the "erdi said this directly" vs. "the agent inferred it" signal).
+
+    decision='confirmed' only logs trust — memory_index itself is untouched.
+    decision in ('rejected', 'corrected') both mark the row status='superseded':
+    bbb-os-core's memory_fact.status enum has no 'rejected' value (only
+    'candidate'/'accepted'/'superseded'/'retracted'/'discarded' — checked
+    against sql/memory_fact.sql directly), so this doesn't invent one either.
+    The *why* (confirmed vs. corrected vs. rejected) is preserved losslessly
+    in this immutable receipt's `decision` column, not in memory_index.status.
+    Setting status='superseded' mirrors what index_memory_files() already does
+    when the underlying file's content changes (Adım 1's supersedes_id chain)
+    — if that reindex already ran, this UPDATE is a same-value no-op that
+    just adds the receipt explaining *why* the row stopped being current; if
+    it hasn't run yet, this is what starts it.
+    """
+
+    confirmation_id = uuid.uuid4().hex
+    now = _now()
+    with contextlib.closing(_connect(db_path)) as conn:
+        conn.execute(
+            """INSERT INTO memory_confirmations
+                   (id, memory_id, decision, channel, decided_by, proof_refs_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                confirmation_id, memory_id, decision, channel, decided_by,
+                json.dumps(proof_refs or []), now,
+            ),
+        )
+        if decision in ("rejected", "corrected"):
+            conn.execute(
+                "UPDATE memory_index SET status = 'superseded', updated_at = ? WHERE id = ?",
+                (now, memory_id),
+            )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM memory_confirmations WHERE id = ?", (confirmation_id,)
+        ).fetchone()
+    return dict(row)
 
 
 def search_memory(
@@ -3689,7 +4287,7 @@ def search_memory(
         conditions.append("project = ?")
         params.append(project)
     if not include_replaced:
-        conditions.append("status != 'replaced'")
+        conditions.append("status NOT IN ('replaced', 'superseded')")
     where_clause = f" WHERE {' AND '.join(conditions)}" if conditions else ""
     with contextlib.closing(_connect(db_path)) as conn:
         rows = conn.execute(
@@ -3742,7 +4340,7 @@ def semantic_search(
         conditions.append("project = ?")
         params.append(project)
     if not include_replaced:
-        conditions.append("status != 'replaced'")
+        conditions.append("status NOT IN ('replaced', 'superseded')")
     where_clause = " AND ".join(conditions)
     with contextlib.closing(_connect(db_path)) as conn:
         rows = conn.execute(
@@ -3793,6 +4391,16 @@ def detect_memory_conflicts(query: str, *, db_path: Path = DB_PATH) -> list[dict
                             f"{a['currentness']!r} vs {b['currentness']!r}"
                         ),
                     }
+                )
+                source_ids = sorted([a["source_file"], b["source_file"]])
+                digest = _sha256_text(f"memory_currentness_conflict:{source_ids}")
+                record_memory_decision(
+                    candidate_digest=digest,
+                    source_ids=source_ids,
+                    decision="hold",
+                    reason_code="memory_currentness_conflict",
+                    idempotency_key=digest,
+                    db_path=db_path,
                 )
     return conflicts
 
@@ -4620,7 +5228,7 @@ def log_lesson(
     normalized_new_title = normalize_term(title)
     with contextlib.closing(_connect(db_path)) as conn:
         existing_titles = conn.execute(
-            "SELECT source_file, title FROM memory_index"
+            "SELECT source_file, title FROM memory_index WHERE status = 'active'"
         ).fetchall()
     for row in existing_titles:
         if normalize_term(row["title"]) == normalized_new_title:
@@ -4677,13 +5285,17 @@ def find_similar_lesson_groups(
     Stage AS: rows already marked status='replaced' by a prior heal_memory()
     merge are excluded too — their files are gone from memory/, and
     reconsidering them would re-merge stale, already-archived content.
+    Rows marked status='superseded' (an older version of a file still on
+    disk under the same source_file) are excluded for the same reason: a
+    file's own prior version would otherwise show up as a near-identical
+    "duplicate" of itself.
     """
 
     with contextlib.closing(_connect(db_path)) as conn:
         rows = conn.execute(
             """SELECT source_file, title, content, keywords, embedding FROM memory_index
                WHERE embedding IS NOT NULL AND source_file NOT IN ('MEMORY.md', 'decisions.md')
-                     AND status != 'replaced'
+                     AND status NOT IN ('replaced', 'superseded')
                ORDER BY source_file"""
         ).fetchall()
 
@@ -4784,6 +5396,11 @@ def approve_merge(merge_id: int, db_path: Path = DB_PATH) -> dict:
     pattern: merged-away notes are moved there, never deleted (see
     decisions.md, 2026-07-27). Raises ValueError if merge_id doesn't exist
     or isn't currently 'pending' (already approved, or unknown id).
+
+    Also a memory_decisions wrapper: records 'dedupe' when multiple notes
+    about the same fact got folded into one file (the common case — heal_memory()
+    only proposes a merge for groups an LLM verdict called near-duplicates),
+    or 'supersede' for the degenerate single-source case.
     """
 
     memory_dir = Path(__file__).resolve().parent / "memory"
@@ -4833,7 +5450,17 @@ def approve_merge(merge_id: int, db_path: Path = DB_PATH) -> dict:
         )
         conn.commit()
 
-    return {"merged": True, "healed_file": path.name}
+    decision = record_memory_decision(
+        candidate_digest=_sha256_text(f"pending_merge:{merge_id}"),
+        source_ids=source_files,
+        decision="dedupe" if len(source_files) > 1 else "supersede",
+        reason_code="heal_memory_merge_approved",
+        resulting_ids=[path.name],
+        idempotency_key=f"approve_merge:{merge_id}",
+        db_path=db_path,
+    )
+
+    return {"merged": True, "healed_file": path.name, "decision_id": decision["id"]}
 
 
 def retire_low_confidence_lessons(threshold: float = 0.3, db_path: Path = DB_PATH) -> int:
@@ -4844,6 +5471,12 @@ def retire_low_confidence_lessons(threshold: float = 0.3, db_path: Path = DB_PAT
     entirely. Mirrors heal_memory()'s memory/_archived-healed/ pattern: files
     are moved there, not deleted. MEMORY.md and decisions.md are structural
     index files, not lessons, so they're exempt regardless of confidence.
+
+    The retirement decision is based on the current active row's confidence
+    only (status='active') — a source_file's older 'superseded' rows aren't
+    considered, since they no longer represent the file's live state. Once a
+    file is retired, the DELETE below removes all of its rows, active and
+    superseded alike: the whole history leaves memory_index together with it.
     """
 
     memory_dir = Path(__file__).resolve().parent / "memory"
@@ -4852,7 +5485,7 @@ def retire_low_confidence_lessons(threshold: float = 0.3, db_path: Path = DB_PAT
     with contextlib.closing(_connect(db_path)) as conn:
         rows = conn.execute(
             """SELECT source_file, confidence FROM memory_index
-               WHERE source_file NOT IN ('MEMORY.md', 'decisions.md')"""
+               WHERE source_file NOT IN ('MEMORY.md', 'decisions.md') AND status = 'active'"""
         ).fetchall()
         retired = [
             row["source_file"]
