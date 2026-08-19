@@ -4235,6 +4235,10 @@ def confirm_memory(
     confirmation_id = uuid.uuid4().hex
     now = _now()
     with contextlib.closing(_connect(db_path)) as conn:
+        if conn.execute(
+            "SELECT 1 FROM memory_index WHERE id = ?", (memory_id,)
+        ).fetchone() is None:
+            raise ValueError(f"unknown memory_id: {memory_id}")
         conn.execute(
             """INSERT INTO memory_confirmations
                    (id, memory_id, decision, channel, decided_by, proof_refs_json, created_at)

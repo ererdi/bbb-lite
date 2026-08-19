@@ -2846,6 +2846,30 @@ class MemoryAuthorityConfirmationTestCase(unittest.TestCase):
                     (correction["id"],),
                 )
 
+    def test_confirm_memory_rejects_unknown_memory_id(self) -> None:
+        with self.assertRaises(ValueError):
+            mc.confirm_memory(999999, "confirmed", "chat", db_path=self.db_path)
+
+    def test_confirm_memory_unknown_memory_id_writes_no_receipt(self) -> None:
+        with contextlib.suppress(ValueError):
+            mc.confirm_memory(999999, "confirmed", "chat", db_path=self.db_path)
+
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) AS n FROM memory_confirmations WHERE memory_id = ?",
+                (999999,),
+            ).fetchone()["n"]
+        self.assertEqual(0, count)
+
+    def test_confirm_memory_known_memory_id_still_works(self) -> None:
+        self._write_note("a.md", "Note A", "Body A.")
+        mc.index_memory_files(db_path=self.db_path)
+        memory_id = self._memory_id("a.md")
+
+        receipt = mc.confirm_memory(memory_id, "confirmed", "chat", db_path=self.db_path)
+        self.assertEqual("confirmed", receipt["decision"])
+        self.assertEqual(memory_id, receipt["memory_id"])
+
 
 class MemoryEpistemicClassDerivationTestCase(McTestCase):
     """Adım 5: memory_index.epistemic_class/source_span/source_digest +

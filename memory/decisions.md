@@ -836,3 +836,22 @@
   commit edilmedi - tüm değişiklikler (`mc.py`, `test_mc.py`, `test_maintenance_
   checks.py`, `test_stage_as_memory_metadata.py`, `PROJECT-HISTORY.md`, bu dosya)
   working tree'de duruyor, commit kararı ayrıca (kullanıcı tarafından) verilecek.
+
+- **2026-08-18 — `confirm_memory()`'a var olmayan `memory_id` için varlık kontrolü
+  eklendi.** Sorun: fonksiyon `memory_id`'nin `memory_index` tablosunda gerçekten var
+  olup olmadığını hiç kontrol etmiyordu — `confirm_memory(999999, "confirmed", "chat")`
+  sessizce çalışıp DEĞİŞTİRİLEMEZ `memory_confirmations` defterine var olmayan bir kayıt
+  için sahte bir onay/red yazıyordu. Şemadaki `memory_confirmations.memory_id REFERENCES
+  memory_index(id)` ifadesi bunu engellemiyor, çünkü SQLite'ta foreign key zorlaması
+  varsayılan olarak kapalı ve proje hiçbir yerde `PRAGMA foreign_keys = ON` çalıştırmıyor
+  — yani şemadaki `REFERENCES` sadece dokümantasyon, gerçek bir kısıt değil. Çözüm:
+  `start_task()`/`request_review()`'da zaten kullanılan "aynı bağlantı içinde SELECT +
+  fetchone() is None → `ValueError(f"unknown X: {value}")`" deseniyle tutarlı olacak
+  şekilde, INSERT'ten önce `memory_index`'te satırın var olup olmadığına bakan bir kontrol
+  eklendi (`mc.py:4238-4241`, `raise ValueError(f"unknown memory_id: {memory_id}")`).
+  Geçersiz `memory_id` artık hiçbir INSERT/UPDATE çalıştırmadan hata fırlatıyor; geçerli
+  `memory_id`'lerle davranış değişmedi. 3 yeni test eklendi (`test_mc.py`,
+  `MemoryConfirmations` sınıfı): bilinmeyen id için `ValueError` fırlatıldığını doğrulayan,
+  bu durumda `memory_confirmations`'a hiç satır yazılmadığını doğrulayan, ve bilinen bir
+  id ile eski davranışın aynı kaldığını doğrulayan regresyon testi. `python -m unittest
+  discover`: 1107 test, 0 hata. Hiçbir şey commit edilmedi.
