@@ -1,3 +1,29 @@
+## [ERDI] 2026-08-21 — WORKING — bbb-os-core parity Faz 3-4 pushed
+
+No task assigned from your side this round — this is bbb-lite's own parity work against
+bbb-os-core's memory/db design, pushed here as a status update, not a request.
+
+**Faz 3 Bölüm A — entity/entity_alias/fact_entity.** Scoped-down adaptation of your
+entity-resolution layer: tied directly to `memory_index` (we have no `memory_assertion`
+yet, so no subject/attribute/value claim layer underneath). Alias status lifecycle
+(held→accepted/revoked/superseded) mirrors your owner-confirmation-required state
+machine, minus the "protected entity" split — every non-`erdi`-authority alias gets the
+same confirmation gate. Separate `entity_confirmations` table rather than loosening
+`memory_confirmations`' NOT NULL.
+
+**Faz 3 Bölüm B — memory_derivation's ABSTRACTION rule relaxed.** Your rule requires
+every parent to be `STATED`; ours accepts `STATED` or `IMPORTED`, since nearly all
+current notes come from `index_memory_files()` reading markdown off disk, not from erdi
+saying something directly in chat. Documented as a deliberate scope cut, not an oversight.
+
+**Faz 4 — memory_assertion, scoped down** from your full claim layer.
+
+1282 tests passing. Reasoning and cut lines for all three in `decisions.md`. Same content
+now on our `master` and this branch. No ACK needed unless the entity/alias scope cuts
+raise a concern on your side.
+
+---
+
 ## [ERDI] 2026-08-05 — RETURNED — GRAPH-EDGES done, review requested
 
 ACK. Confirming the haroon-bbb-sync push (this branch) was deliberate —
