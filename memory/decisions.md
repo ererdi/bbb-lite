@@ -855,3 +855,121 @@
   bu durumda `memory_confirmations`'a hiç satır yazılmadığını doğrulayan, ve bilinen bir
   id ile eski davranışın aynı kaldığını doğrulayan regresyon testi. `python -m unittest
   discover`: 1107 test, 0 hata. Hiçbir şey commit edilmedi.
+
+- **2026-08-21 — Faz 3 Bölüm A: entity/entity_alias, core'un tam entity-resolution
+  sisteminin KÜÇÜLTÜLMÜŞ bir uyarlaması, birebir kopyası değil.** bbb-os-core'un
+  entity/alias sistemi `memory_assertion` (subject/attribute/value + zamansal
+  geçerlilik) katmanına bağımlı ve "protected entity" için çift-onay, periyodik
+  yeniden-onay makbuzu gibi production-ölçekli mekanizmalar taşıyor. bbb-lite'ta
+  `memory_assertion` hiç yok (ve bu turda da açılmıyor — kapsam dışı), o yüzden şu
+  uyarlamalar bilerek yapıldı:
+  - `entity`/`entity_alias`/`fact_entity` doğrudan `memory_index`'e bağlanıyor,
+    `memory_assertion`'a değil — `fact_entity.memory_id REFERENCES memory_index(id)`.
+  - `entity_alias.status` state machine'i (held→accepted/revoked, accepted→
+    revoked/superseded, revoked/superseded terminal) core'daki gibi ama "protected
+    entity" ayrımı yok — TÜM non-'erdi' authority alias'lar aynı kurala tabi
+    (`mc.py`'deki `entity_alias_status_lifecycle` trigger'ı, ~1330 civarı).
+  - Periyodik yeniden-onay/iptal akışı (core'un ayrı `memory_alias_confirmation_
+    receipt`'i) YOK — bu turda sadece İLK kabul/red kararı ele alınıyor (görev
+    tanımında açıkça kapsam dışı bırakıldı).
+  - `entity_confirmations`, `memory_confirmations`'ın AYNI şeklini taşıyan ama AYRI
+    bir tablo (`mc.py:~1290`) — sebep: `memory_confirmations.memory_id` `NOT NULL
+    REFERENCES memory_index(id)`, bir entity_alias onayının işaret edeceği bir
+    `memory_index` satırı yok; bu NOT NULL'ı gevşetmek `memory_confirmations`'ın var
+    olan tüm garantisini zayıflatırdı sırf ikinci, alakasız bir makbuz türünü
+    sığdırmak için.
+  - `entity_alias_status_lifecycle` trigger'ı, `authority != 'erdi'` olan bir alias
+    accepted/revoked/superseded'e geçerken `entity_confirmations`'ta o `alias_id`
+    için uygun `decision`'lı bir satır arıyor (confirmed→accepted,
+    corrected/rejected→revoked/superseded) — core'un "owner confirmation required
+    for non-owner authority" ilkesinin bire bir uyarlaması, sadece "protected"
+    ayrımı olmadan.
+  Yazıcı fonksiyonlar: `create_entity()`, `add_entity_alias()`, `confirm_entity_
+  alias()`, `set_entity_alias_status()` (`mc.py:~4615-4750`) — `set_entity_alias_
+  status()` geçiş geçerliliğini Python'da önceden kontrol ETMİYOR, `claim_memory_
+  hold()` ile aynı ilkeyle trigger'ın kendisi gerçek kaynak (geçersiz geçiş veya
+  eksik onay `sqlite3.IntegrityError` fırlatır). `fact_entity` bu turda SADECE şema
+  — Adım 5'teki `memory_derivation` ile aynı emsal: bbb-lite'ta henüz bir
+  memory_index satırını bir entity'ye bağlayan hiçbir akış yok, o yüzden hiçbir
+  yazıcı fonksiyon eklenmedi (kullanılmayan kod yazmamak için). 11 yeni test
+  (`EntityAliasLifecycleTestCase`, `test_mc.py`, + kalıtımla gelen `McTestCase`
+  taban testleri) — hepsi geçti. Hiçbir şey commit edilmedi.
+
+- **2026-08-21 — Faz 3 Bölüm B: memory_derivation'ın ABSTRACTION inşa kuralı,
+  core'un katı 'STATED' şartı yerine 'STATED VEYA IMPORTED' olarak uyarlandı.**
+  Core, bir ABSTRACTION derivation'ın her parent'ının epistemic_class'ının salt
+  'STATED' olmasını şart koşuyor (yani "erdi'nin doğrudan söylediği" kaynaklardan
+  üretilmiş olması). bbb-lite'ta bugün üretilen notların neredeyse tamamı
+  `index_memory_files()` ile diskten okunan `memory/*.md` dosyaları — bunlar
+  schema DEFAULT'una göre 'IMPORTED', 'STATED' değil (Adım 5, `mc.py:~596-600`
+  dokümantasyonu: "Default 'IMPORTED' matches reality for every row that
+  predates this column: it came from a markdown file on disk, not from erdi
+  saying something directly in chat"). `approve_merge()`'ün Faz 2'de aktive
+  edilen tek gerçek ABSTRACTION üreticisi de tam olarak bu IMPORTED notları
+  birleştiriyor. Core'un katı kuralını birebir kopyalasaydık, bugünkü tek üretici
+  akışın HİÇBİR ZAMAN geçemeyeceği bir trigger yazmış olurduk — "kağıt üzerinde
+  var, pratikte hep reddeder" tipik kod-ölü senaryosu. Bunun yerine `STATED OR
+  IMPORTED` kabul edildi (`mc.py`'deki `memory_derivation_abstraction_guard`
+  trigger'ı) — hâlâ anlamlı bir kısıt (SUMMARY/DERIVED/SYNTHETIC parent'lar hâlâ
+  reddediliyor, bkz. `test_abstraction_guard_rejects_non_stated_or_imported_
+  parent`), ama bugünkü gerçek veriyle çalışabilen bir kısıt.
+
+  İkinci uyarlama: core'un "parent'lar aynı scope'u paylaşmalı" kontrolü,
+  bbb-lite'ta ayrı bir scope kavramı olmadığı için "parent'lar aynı `project`
+  alanını paylaşmalı"ya indirgendi (memory_index.project zaten var olan tek
+  yakın karşılık).
+
+  Guard, child'ın `epistemic_class = 'DERIVED'` olmasını da şart koşuyor — ama
+  `index_memory_files()` hiçbir satıra bunu yazmıyor (DEFAULT 'IMPORTED'), o
+  yüzden `approve_merge()`'e, `memory_derivation` INSERT'inden hemen önce, child
+  satırını `epistemic_class = 'DERIVED'`ye çeken bir UPDATE eklendi — semantik
+  olarak da doğru: birleştirilmiş/healed bir not, ham bir import değil, gerçekten
+  bir abstraction'dır. Aynı yerde yeni `memory_inference_producer_receipt`
+  tablosuna `action='produced'` bir satır da düşülüyor.
+
+  BEHAVIORAL_INFERENCE için hiçbir guard eklenmedi (görev tanımında açıkça
+  kapsam dışı — bbb-lite'ta gerçek bir üreticisi yok).
+
+  4 yeni test (+ 1 var olan testin güncellenmesi, yeni sayılmıyor):
+  `MemoryEpistemicClassDerivationTestCase`'e 3 yeni (`test_abstraction_
+  guard_rejects_non_derived_child`, `test_abstraction_guard_rejects_project_
+  mismatch`, `test_abstraction_guard_rejects_non_stated_or_imported_parent`) +
+  var olan `test_memory_derivation_with_two_parents_written`'ın yeni guard'a
+  uyacak şekilde güncellenmesi (child artık açıkça `epistemic_class='DERIVED'`
+  ile ekleniyor); `MemoryDecisionHoldTestCase`'e 1 regresyon testi
+  (`test_approve_merge_still_writes_derivation_and_producer_receipt`) — normal
+  `approve_merge()` akışının hâlâ hem `memory_derivation` hem `memory_inference_
+  producer_receipt` yazdığını doğruluyor. Hiçbir şey commit edilmedi.
+
+- **2026-08-21 — Faz 4: memory_assertion, core'un tam SAV katmanı yerine
+  BİLEREK küçültülmüş, memory_index'e PARALEL/opsiyonel bağlanan bir versiyon
+  olarak eklendi.** Core'da `memory_assertion` tüm veri modelinin altında
+  yatan katman — her `memory_index` benzeri satır aslında bir SAV
+  (subject-attribute-value) iddiasının üstüne kurulu. Bu turda o rijitliği
+  birebir kopyalamadık: `memory_index`'in şeması hiç değişmedi (tek bir kolon
+  bile eklenmedi), `memory_assertion` bunun yanında duran, `memory_id`'si
+  NULL olabilen yeni ve bağımsız bir tablo. Bir not hâlâ normal şekilde
+  `memory_index`'te yaşıyor; `memory_assertion` sadece o notun içinden
+  çıkarılabilecek yapılandırılmış, tekil bir iddiayı isteğe bağlı olarak
+  temsil ediyor. `epistemic_class`'ın `STATED` için `source_span`/
+  `source_digest` şartı, `memory_index`'teki AYNI CHECK deseni (Adım 5) —
+  uyarlama değil, birebir taşıma.
+
+  `memory_assertion_relation`'ın kapalı kelime dağarcığı
+  (`supports`/`contradicts`/`supersedes`/`derived_from`) `GRAPH_EDGE_TYPES`
+  (`mc.py:35`) ile büyük ölçüde örtüşüyor ama aynı sabit değil — `graph_edges`
+  düğüm-tipi-agnostik genel bir graf kenarı, `memory_assertion_relation` ise
+  özel olarak iki `memory_assertion` satırı arasında; ayrı CHECK kalması
+  bilinçli (core'da da ayrı tablo/ayrı vocab).
+
+  Bu turda da (Faz 3'teki `fact_entity`/Adım 5'teki `memory_derivation` ile
+  aynı emsal) hiçbir otomatik iddia çıkarma akışı (NLP/LLM pipeline) yok —
+  sadece CRUD altyapısı: `create_assertion()`, `link_assertion_relation()`,
+  `get_assertions_for_memory()`, `get_assertions_for_subject()`. Bir not
+  dosyasından bir iddia türetmek isteyen gelecekteki bir akış bu
+  fonksiyonları çağırabilir; bugün hiçbiri çağırmıyor.
+
+  7 yeni test (`MemoryAssertionTestCase`, `test_mc.py`) + `test_init_db_
+  creates_tables`'ın beklenen tablo setine `memory_assertion`/`memory_
+  assertion_relation` eklenmesi (yeni sayılmıyor, var olan testin
+  güncellenmesi). Hiçbir şey commit edilmedi.

@@ -59,6 +59,26 @@ UNSUPPORTED_ACTION_TERMS = (
     "eriştim",
 )
 
+def _check_fts5_available() -> bool:
+    """Probe once at import time whether this Python's sqlite3 build has FTS5.
+
+    Not every sqlite3 build includes it (e.g. some system Pythons) - init_db()
+    only creates memory_index_fts when this is True, and search_memory() falls
+    back to the old manual scan when it's False."""
+
+    try:
+        probe = sqlite3.connect(":memory:")
+        try:
+            probe.execute("CREATE VIRTUAL TABLE t USING fts5(x)")
+        finally:
+            probe.close()
+        return True
+    except sqlite3.OperationalError:
+        return False
+
+
+_FTS5_AVAILABLE = _check_fts5_available()
+
 DEFAULT_CAPABILITY_BOUNDARIES = {
     "hosni": "Local prototype only; HOSNI durable dispatch is not connected.",
     "voice": "Out of scope for this stage; needs STT/TTS, mic, latency, and voice harness work.",
@@ -648,6 +668,55 @@ def init_db(db_path: Path = DB_PATH) -> None:
             """CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_index_active_source_file
                ON memory_index(source_file) WHERE status = 'active'"""
         )
+        if _FTS5_AVAILABLE:
+            # MADDE 1: real full-text index for search_memory(), mirroring
+            # bbb-os-core's memory_fact_fts. External-content table (no
+            # separate copy of title/content/keywords) kept in sync via the
+            # AFTER triggers below, following the standard FTS5 external-
+            # content pattern (INSERT with the special 'delete' command to
+            # remove, then a plain INSERT to add). search_memory() uses this
+            # only to narrow candidate rows before applying the exact same
+            # weighted title/keywords/content count-and-confidence scoring
+            # as before, so results stay identical to the pre-FTS5 code.
+            fts_already_existed = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_index_fts'"
+            ).fetchone() is not None
+            conn.execute(
+                """CREATE VIRTUAL TABLE IF NOT EXISTS memory_index_fts USING fts5(
+                       title, content, keywords, content='memory_index', content_rowid='id'
+                   )"""
+            )
+            if not fts_already_existed:
+                conn.execute(
+                    """INSERT INTO memory_index_fts(rowid, title, content, keywords)
+                       SELECT id, title, content, keywords FROM memory_index"""
+                )
+            conn.execute(
+                """CREATE TRIGGER IF NOT EXISTS memory_index_fts_ai
+                   AFTER INSERT ON memory_index
+                   BEGIN
+                       INSERT INTO memory_index_fts(rowid, title, content, keywords)
+                       VALUES (new.id, new.title, new.content, new.keywords);
+                   END"""
+            )
+            conn.execute(
+                """CREATE TRIGGER IF NOT EXISTS memory_index_fts_ad
+                   AFTER DELETE ON memory_index
+                   BEGIN
+                       INSERT INTO memory_index_fts(memory_index_fts, rowid, title, content, keywords)
+                       VALUES ('delete', old.id, old.title, old.content, old.keywords);
+                   END"""
+            )
+            conn.execute(
+                """CREATE TRIGGER IF NOT EXISTS memory_index_fts_au
+                   AFTER UPDATE ON memory_index
+                   BEGIN
+                       INSERT INTO memory_index_fts(memory_index_fts, rowid, title, content, keywords)
+                       VALUES ('delete', old.id, old.title, old.content, old.keywords);
+                       INSERT INTO memory_index_fts(rowid, title, content, keywords)
+                       VALUES (new.id, new.title, new.content, new.keywords);
+                   END"""
+            )
         conn.execute(
             """CREATE TABLE IF NOT EXISTS doc_index (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1017,12 +1086,29 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 updated_at TEXT NOT NULL
             )"""
         )
+        # bbb-os-core's memory_hold_identity_immutable trigger, adapted 1:1:
+        # the identity fields of a memory_hold row can never change, even in
+        # an UPDATE that doesn't touch state at all.
+        conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS memory_hold_identity_immutable
+               BEFORE UPDATE ON memory_hold
+               WHEN
+                   NEW.id IS NOT OLD.id
+                   OR NEW.decision_id IS NOT OLD.decision_id
+                   OR NEW.candidate_digest IS NOT OLD.candidate_digest
+                   OR NEW.reason_code IS NOT OLD.reason_code
+                   OR NEW.created_at IS NOT OLD.created_at
+               BEGIN
+                   SELECT RAISE(ABORT, 'memory_hold: identity fields are immutable');
+               END"""
+        )
         # bbb-os-core's memory_hold_state_lifecycle trigger, adapted 1:1:
         # resolved/expired are terminal (no further state change at all,
         # not even a same-value rewrite); open -> claimed/resolved/expired;
         # claimed -> open/claimed/resolved/expired, where re-entering
         # 'claimed' (including reclaiming from 'claimed' itself) always
-        # requires claim_epoch to strictly advance.
+        # requires claim_epoch to strictly advance; entering resolved/expired
+        # requires resolution custody (resolved_by + resolution_json both set).
         conn.execute(
             """CREATE TRIGGER IF NOT EXISTS memory_hold_state_lifecycle
                BEFORE UPDATE OF state ON memory_hold
@@ -1037,6 +1123,9 @@ def init_db(db_path: Path = DB_PATH) -> None:
                        );
                    SELECT RAISE(ABORT, 'memory_hold: claim_epoch must advance to (re)enter claimed')
                        WHERE NEW.state = 'claimed' AND NEW.claim_epoch <= OLD.claim_epoch;
+                   SELECT RAISE(ABORT, 'memory_hold: resolved/expired requires resolution custody')
+                       WHERE NEW.state IN ('resolved', 'expired')
+                           AND (NEW.resolved_by IS NULL OR NEW.resolution_json IS NULL);
                END"""
         )
         conn.execute("CREATE INDEX IF NOT EXISTS memory_hold_state ON memory_hold(state)")
@@ -1052,6 +1141,18 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 created_at TEXT NOT NULL
             )"""
         )
+        # bbb-os-core's memory_owner_confirmation_receipts.value_sha256, adapted:
+        # pins the receipt to the SHA-256 of the memory_index row's content
+        # *at confirmation time*, so the receipt cryptographically fixes what
+        # was actually being confirmed.
+        existing_confirmations_columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(memory_confirmations)").fetchall()
+        }
+        if "value_sha256" not in existing_confirmations_columns:
+            conn.execute(
+                "ALTER TABLE memory_confirmations ADD COLUMN value_sha256 TEXT"
+            )
         conn.execute(
             """CREATE TRIGGER IF NOT EXISTS memory_confirmations_immutable_update
                BEFORE UPDATE ON memory_confirmations
@@ -1092,6 +1193,326 @@ def init_db(db_path: Path = DB_PATH) -> None:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS memory_derivation_child ON memory_derivation(child_id)"
+        )
+        # Faz 3 Bölüm B: construction guard for kind='ABSTRACTION' derivations
+        # only - BEHAVIORAL_INFERENCE has no producer in bbb-lite yet (kapsam
+        # dışı, per the plan), so it gets no guard here. Adapted from core's
+        # rule, not copied 1:1 - see memory/decisions.md for why parents may
+        # be STATED OR IMPORTED here (core requires strict STATED) and why
+        # "shared scope" became "shared project" (bbb-lite has no separate
+        # scope concept).
+        conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS memory_derivation_abstraction_guard
+               BEFORE INSERT ON memory_derivation
+               WHEN NEW.kind = 'ABSTRACTION'
+               BEGIN
+                   SELECT RAISE(ABORT,
+                       'memory_derivation: ABSTRACTION child must have epistemic_class = DERIVED')
+                       WHERE (SELECT epistemic_class FROM memory_index WHERE id = NEW.child_id)
+                           IS NOT 'DERIVED';
+                   SELECT RAISE(ABORT,
+                       'memory_derivation: ABSTRACTION parents must be STATED or IMPORTED')
+                       WHERE EXISTS (
+                           SELECT 1 FROM memory_index
+                           WHERE id IN (SELECT value FROM json_each(NEW.parent_ids_json))
+                               AND epistemic_class NOT IN ('STATED', 'IMPORTED')
+                       );
+                   SELECT RAISE(ABORT,
+                       'memory_derivation: ABSTRACTION parents must share the same project')
+                       WHERE (
+                           SELECT COUNT(DISTINCT project) FROM memory_index
+                           WHERE id IN (SELECT value FROM json_each(NEW.parent_ids_json))
+                       ) > 1;
+               END"""
+        )
+        # bbb-os-core's inference-producer receipt, adapted: one row per
+        # derivation-construction attempt (produced/abstained/noop), kept
+        # separate from memory_derivation itself so a producer can log
+        # "I looked but didn't produce anything" without an ABSTRACTION row
+        # existing to hang it off of.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS memory_inference_producer_receipt (
+                id TEXT PRIMARY KEY,
+                child_id INTEGER REFERENCES memory_index(id),
+                parent_ids_json TEXT NOT NULL,
+                action TEXT NOT NULL CHECK(action IN ('produced', 'abstained', 'noop')),
+                reason TEXT,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        # MADDE 2: immutable copy of a source file's content at the moment
+        # index_memory_files() indexed it - an audit trail independent of
+        # memory_index's own status/version churn. Append-only: the two
+        # triggers below reject any UPDATE/DELETE outright, same pattern as
+        # memory_decisions/memory_confirmations above.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS memory_source_snapshot (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_file TEXT NOT NULL,
+                content_digest TEXT NOT NULL,
+                content_text TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS memory_source_snapshot_immutable_update
+               BEFORE UPDATE ON memory_source_snapshot
+               BEGIN
+                   SELECT RAISE(ABORT, 'memory_source_snapshot rows are immutable (no UPDATE)');
+               END"""
+        )
+        conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS memory_source_snapshot_immutable_delete
+               BEFORE DELETE ON memory_source_snapshot
+               BEGIN
+                   SELECT RAISE(ABORT, 'memory_source_snapshot rows are immutable (no DELETE)');
+               END"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS memory_source_snapshot_file ON memory_source_snapshot(source_file, created_at)"
+        )
+        # MADDE 3: versioned record of search_memory()'s (title, keyword,
+        # content) weights - the weights themselves stay simple scalars (no
+        # Python code deleted), but which version is "active" is now a real
+        # queryable row instead of an implicit fact about the source code.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS memory_retrieval_policy (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                version INTEGER NOT NULL UNIQUE,
+                title_weight REAL NOT NULL,
+                keyword_weight REAL NOT NULL,
+                content_weight REAL NOT NULL,
+                created_at TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 0
+            )"""
+        )
+        if conn.execute("SELECT 1 FROM memory_retrieval_policy WHERE active = 1").fetchone() is None:
+            conn.execute(
+                """INSERT INTO memory_retrieval_policy
+                       (version, title_weight, keyword_weight, content_weight, created_at, active)
+                   VALUES (1, ?, ?, ?, ?, 1)""",
+                (*_DEFAULT_RETRIEVAL_WEIGHTS, _now()),
+            )
+        # MADDE 4: formalizes "a group of memory_index rows currently in
+        # conflict" as its own row, sitting above the existing
+        # memory_decisions(decision='hold') mechanism rather than replacing
+        # it - detect_memory_conflicts() opens/reuses a domain here first,
+        # then still drives record_memory_decision('hold') exactly as before.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS memory_conflict_domain (
+                id TEXT PRIMARY KEY,
+                member_memory_ids_json TEXT NOT NULL
+                    CHECK(json_array_length(member_memory_ids_json) >= 2),
+                state TEXT NOT NULL CHECK(state IN ('open', 'resolved', 'historical')),
+                created_at TEXT NOT NULL,
+                resolved_at TEXT
+            )"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS memory_conflict_domain_state ON memory_conflict_domain(state)"
+        )
+        # Faz 3 Bölüm A: entity / entity_alias / fact_entity / entity_confirmations
+        # - bbb-os-core's entity-resolution system, scaled down to bbb-lite's
+        # real data model (memory_index only, no separate memory_assertion
+        # layer - see memory/decisions.md for what was cut and why).
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS entity (
+                id TEXT PRIMARY KEY,
+                canonical_name TEXT NOT NULL,
+                entity_type TEXT NOT NULL CHECK(entity_type IN
+                    ('person', 'project', 'product', 'tool', 'api', 'other')),
+                confidence REAL,
+                source_refs_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS entity_alias (
+                id TEXT PRIMARY KEY,
+                entity_id TEXT NOT NULL REFERENCES entity(id),
+                alias TEXT NOT NULL,
+                normalized_alias TEXT NOT NULL,
+                authority TEXT NOT NULL CHECK(authority IN
+                    ('erdi', 'agent', 'inference', 'external')),
+                status TEXT NOT NULL DEFAULT 'held' CHECK(status IN
+                    ('held', 'accepted', 'revoked', 'superseded')),
+                confidence REAL,
+                proof_refs_json TEXT NOT NULL DEFAULT '[]',
+                confirmation_id TEXT,
+                supersedes_alias_id TEXT REFERENCES entity_alias(id),
+                created_at TEXT NOT NULL,
+                decided_at TEXT
+            )"""
+        )
+        conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_alias_entity_normalized
+               ON entity_alias(entity_id, normalized_alias)"""
+        )
+        # bbb-os-core's memory_owner_confirmation_receipts, adapted: kept as
+        # its OWN table rather than reusing memory_confirmations, because
+        # memory_confirmations.memory_id is NOT NULL REFERENCES
+        # memory_index(id) - an entity_alias confirmation has no memory_index
+        # row to point at, and relaxing that NOT NULL to accommodate a second,
+        # unrelated kind of receipt would weaken every existing
+        # memory_confirmations guarantee. See memory/decisions.md.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS entity_confirmations (
+                id TEXT PRIMARY KEY,
+                entity_alias_id TEXT NOT NULL REFERENCES entity_alias(id),
+                decision TEXT NOT NULL CHECK(decision IN
+                    ('confirmed', 'corrected', 'rejected')),
+                channel TEXT NOT NULL,
+                decided_by TEXT NOT NULL DEFAULT 'erdi',
+                proof_refs_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS entity_confirmations_immutable_update
+               BEFORE UPDATE ON entity_confirmations
+               BEGIN
+                   SELECT RAISE(ABORT, 'entity_confirmations rows are immutable (no UPDATE)');
+               END"""
+        )
+        conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS entity_confirmations_immutable_delete
+               BEFORE DELETE ON entity_confirmations
+               BEGIN
+                   SELECT RAISE(ABORT, 'entity_confirmations rows are immutable (no DELETE)');
+               END"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS entity_confirmations_alias ON entity_confirmations(entity_alias_id, created_at)"
+        )
+        # entity_alias identity fields can never change once written, same
+        # pattern as memory_hold_identity_immutable.
+        conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS entity_alias_identity_immutable
+               BEFORE UPDATE ON entity_alias
+               WHEN
+                   NEW.id IS NOT OLD.id
+                   OR NEW.entity_id IS NOT OLD.entity_id
+                   OR NEW.alias IS NOT OLD.alias
+                   OR NEW.normalized_alias IS NOT OLD.normalized_alias
+                   OR NEW.authority IS NOT OLD.authority
+                   OR NEW.created_at IS NOT OLD.created_at
+               BEGIN
+                   SELECT RAISE(ABORT, 'entity_alias: identity fields are immutable');
+               END"""
+        )
+        # held -> accepted/revoked; accepted -> revoked/superseded;
+        # revoked/superseded are terminal. Entering accepted/revoked/superseded
+        # requires decided_at, and - the adapted "owner confirmation required
+        # for non-owner authority" rule - if authority != 'erdi' it also
+        # requires a matching entity_confirmations row for THIS alias_id
+        # (confirmed -> accepted; corrected/rejected -> revoked/superseded).
+        # authority = 'erdi' needs no confirmation - erdi's own alias
+        # assertions are self-authoritative, same as memory_index.authority.
+        conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS entity_alias_status_lifecycle
+               BEFORE UPDATE OF status ON entity_alias
+               BEGIN
+                   SELECT RAISE(ABORT, 'entity_alias: revoked/superseded are terminal')
+                       WHERE OLD.status IN ('revoked', 'superseded');
+                   SELECT RAISE(ABORT, 'entity_alias: invalid state transition')
+                       WHERE NOT (
+                           (OLD.status = 'held' AND NEW.status IN ('accepted', 'revoked'))
+                           OR (OLD.status = 'accepted' AND NEW.status IN ('revoked', 'superseded'))
+                       );
+                   SELECT RAISE(ABORT,
+                       'entity_alias: decided_at required entering accepted/revoked/superseded')
+                       WHERE NEW.status IN ('accepted', 'revoked', 'superseded')
+                           AND NEW.decided_at IS NULL;
+                   SELECT RAISE(ABORT,
+                       'entity_alias: non-owner authority requires a matching entity_confirmations row')
+                       WHERE NEW.authority != 'erdi'
+                           AND (
+                               (NEW.status = 'accepted' AND NOT EXISTS (
+                                   SELECT 1 FROM entity_confirmations
+                                   WHERE entity_alias_id = NEW.id AND decision = 'confirmed'
+                               ))
+                               OR (NEW.status IN ('revoked', 'superseded') AND NOT EXISTS (
+                                   SELECT 1 FROM entity_confirmations
+                                   WHERE entity_alias_id = NEW.id
+                                       AND decision IN ('corrected', 'rejected')
+                               ))
+                           );
+               END"""
+        )
+        conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS entity_alias_no_delete
+               BEFORE DELETE ON entity_alias
+               BEGIN
+                   SELECT RAISE(ABORT, 'entity_alias rows are immutable (no DELETE)');
+               END"""
+        )
+        # fact_entity: schema-only groundwork for this step, same precedent
+        # as memory_derivation in Adım 5 - no flow in bbb-lite links a
+        # memory_index row to an entity yet, so no writer function is added
+        # until one exists to drive it.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS fact_entity (
+                memory_id INTEGER NOT NULL REFERENCES memory_index(id),
+                entity_id TEXT NOT NULL REFERENCES entity(id),
+                role TEXT NOT NULL CHECK(role IN ('subject', 'object', 'mentions')),
+                confidence REAL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(memory_id, entity_id, role)
+            )"""
+        )
+        # Faz 4: bbb-os-core's memory_assertion, deliberately narrowed - a
+        # single structured SAV (subject-attribute-value) claim that CAN be
+        # pulled out of a memory_index note, kept PARALLEL to memory_index
+        # rather than replacing its data model. memory_id is nullable (an
+        # assertion doesn't have to originate from a note); when it does
+        # come from STATED text the same source_span/source_digest CHECK as
+        # memory_index applies. No extraction pipeline exists yet - this is
+        # CRUD-only groundwork, same precedent as memory_derivation in
+        # Adım 5. See memory/decisions.md.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS memory_assertion (
+                id TEXT PRIMARY KEY,
+                memory_id INTEGER REFERENCES memory_index(id),
+                subject TEXT NOT NULL,
+                attribute TEXT NOT NULL,
+                value TEXT NOT NULL,
+                epistemic_class TEXT NOT NULL DEFAULT 'IMPORTED' CHECK(epistemic_class IN
+                    ('STATED','OBSERVED','IMPORTED','SUMMARY','DERIVED','SYNTHETIC')),
+                source_span TEXT,
+                source_digest TEXT
+                    CHECK(epistemic_class != 'STATED'
+                          OR (source_span IS NOT NULL AND length(source_digest) = 64)),
+                effective_from TEXT,
+                effective_until TEXT,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS memory_assertion_memory ON memory_assertion(memory_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS memory_assertion_subject ON memory_assertion(subject)"
+        )
+        # bbb-os-core's assertion-relation edges, adapted: closed vocabulary
+        # mirrors GRAPH_EDGE_TYPES' 'supersedes'/'contradicts'/'derived-from'
+        # (underscored here to match memory_derivation.kind's naming) plus
+        # 'supports', which graph_edges has no equivalent of. The UNIQUE
+        # triple prevents the same (from, to, relation) edge from being
+        # recorded twice.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS memory_assertion_relation (
+                id TEXT PRIMARY KEY,
+                from_assertion_id TEXT NOT NULL REFERENCES memory_assertion(id),
+                to_assertion_id TEXT NOT NULL REFERENCES memory_assertion(id),
+                relation TEXT NOT NULL CHECK(relation IN
+                    ('supports', 'contradicts', 'supersedes', 'derived_from')),
+                created_at TEXT NOT NULL,
+                UNIQUE(from_assertion_id, to_assertion_id, relation)
+            )"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS memory_assertion_relation_from ON memory_assertion_relation(from_assertion_id)"
         )
         conn.execute("CREATE INDEX IF NOT EXISTS health_events_created ON health_events(created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS graph_edges_src ON graph_edges(src, type)")
@@ -2406,7 +2827,10 @@ def release_memory_hold(hold_id: str, db_path: Path = DB_PATH) -> dict:
 def resolve_memory_hold(
     hold_id: str, resolved_by: str, resolution: dict | None = None, *, db_path: Path = DB_PATH
 ) -> dict:
-    """open/claimed -> resolved (terminal)."""
+    """open/claimed -> resolved (terminal). resolution_json is always written
+    as a JSON object (defaulting to {} when no resolution is given), never
+    NULL — memory_hold_state_lifecycle requires resolution custody
+    (resolved_by + resolution_json both set) for any terminal transition."""
 
     _get_memory_hold(hold_id, db_path=db_path)
     with contextlib.closing(_connect(db_path)) as conn:
@@ -2415,7 +2839,7 @@ def resolve_memory_hold(
                    resolution_json = ?, updated_at = ? WHERE id = ?""",
             (
                 resolved_by,
-                json.dumps(resolution) if resolution is not None else None,
+                json.dumps(resolution if resolution is not None else {}),
                 _now(),
                 hold_id,
             ),
@@ -2424,15 +2848,27 @@ def resolve_memory_hold(
     return _get_memory_hold(hold_id, db_path=db_path)
 
 
-def expire_memory_hold(hold_id: str, db_path: Path = DB_PATH) -> dict:
+def expire_memory_hold(
+    hold_id: str, resolved_by: str, resolution: dict | None = None, *, db_path: Path = DB_PATH
+) -> dict:
     """open/claimed -> expired (terminal) — e.g. a hold whose retry_after
-    passed with nobody resolving it (Adım 6's expiry sweep will drive this)."""
+    passed with nobody resolving it (Adım 6's expiry sweep will drive this).
+    Like resolve_memory_hold(), requires resolution custody: resolved_by is
+    mandatory, matching memory_hold_state_lifecycle's requirement that
+    resolved_by and resolution_json both be set before entering a terminal
+    state."""
 
     _get_memory_hold(hold_id, db_path=db_path)
     with contextlib.closing(_connect(db_path)) as conn:
         conn.execute(
-            "UPDATE memory_hold SET state = 'expired', updated_at = ? WHERE id = ?",
-            (_now(), hold_id),
+            """UPDATE memory_hold SET state = 'expired', resolved_by = ?,
+                   resolution_json = ?, updated_at = ? WHERE id = ?""",
+            (
+                resolved_by,
+                json.dumps(resolution if resolution is not None else {}),
+                _now(),
+                hold_id,
+            ),
         )
         conn.commit()
     return _get_memory_hold(hold_id, db_path=db_path)
@@ -4144,6 +4580,12 @@ def index_memory_files(db_path: Path = DB_PATH) -> int:
                             embedding_model, embedding_dim,
                         ),
                     )
+                    conn.execute(
+                        """INSERT INTO memory_source_snapshot
+                               (source_file, content_digest, content_text, created_at)
+                           VALUES (?, ?, ?, ?)""",
+                        (path.name, content_hash, body, now),
+                    )
                 elif existing["content_hash"] != content_hash:
                     # Append-only history (mirrors bbb-os-core's memory_fact):
                     # the old row becomes an immutable historical record —
@@ -4168,6 +4610,12 @@ def index_memory_files(db_path: Path = DB_PATH) -> int:
                             existing["version"] + 1, existing["id"],
                             embedding_model, embedding_dim,
                         ),
+                    )
+                    conn.execute(
+                        """INSERT INTO memory_source_snapshot
+                               (source_file, content_digest, content_text, created_at)
+                           VALUES (?, ?, ?, ?)""",
+                        (path.name, content_hash, body, now),
                     )
                 # else: content unchanged — leave the existing row exactly as-is.
                 _upsert_memory_graph(conn, path.name, title, body, keywords)
@@ -4235,17 +4683,20 @@ def confirm_memory(
     confirmation_id = uuid.uuid4().hex
     now = _now()
     with contextlib.closing(_connect(db_path)) as conn:
-        if conn.execute(
-            "SELECT 1 FROM memory_index WHERE id = ?", (memory_id,)
-        ).fetchone() is None:
+        memory_row = conn.execute(
+            "SELECT content FROM memory_index WHERE id = ?", (memory_id,)
+        ).fetchone()
+        if memory_row is None:
             raise ValueError(f"unknown memory_id: {memory_id}")
+        value_sha256 = hashlib.sha256(memory_row["content"].encode("utf-8")).hexdigest()
         conn.execute(
             """INSERT INTO memory_confirmations
-                   (id, memory_id, decision, channel, decided_by, proof_refs_json, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   (id, memory_id, decision, channel, decided_by, proof_refs_json,
+                    value_sha256, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 confirmation_id, memory_id, decision, channel, decided_by,
-                json.dumps(proof_refs or []), now,
+                json.dumps(proof_refs or []), value_sha256, now,
             ),
         )
         if decision in ("rejected", "corrected"):
@@ -4258,6 +4709,243 @@ def confirm_memory(
             "SELECT * FROM memory_confirmations WHERE id = ?", (confirmation_id,)
         ).fetchone()
     return dict(row)
+
+
+def create_entity(
+    canonical_name: str,
+    entity_type: str,
+    *,
+    confidence: float | None = None,
+    source_refs: list | None = None,
+    db_path: Path = DB_PATH,
+) -> dict:
+    """Faz 3 Bölüm A: a canonical entity that entity_alias rows point at."""
+
+    entity_id = uuid.uuid4().hex
+    now = _now()
+    with contextlib.closing(_connect(db_path)) as conn:
+        conn.execute(
+            """INSERT INTO entity
+                   (id, canonical_name, entity_type, confidence, source_refs_json,
+                    created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                entity_id, canonical_name, entity_type, confidence,
+                json.dumps(source_refs or []), now, now,
+            ),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM entity WHERE id = ?", (entity_id,)).fetchone()
+    return dict(row)
+
+
+def add_entity_alias(
+    entity_id: str,
+    alias: str,
+    authority: str,
+    *,
+    confidence: float | None = None,
+    proof_refs: list | None = None,
+    db_path: Path = DB_PATH,
+) -> dict:
+    """New alias always starts 'held' - status only ever advances via
+    set_entity_alias_status(), enforced by entity_alias_status_lifecycle.
+    normalized_alias reuses normalize_term() (Stage AR) so "SMAs" and "sma"
+    collide on the same entity_id+normalized_alias UNIQUE index."""
+
+    alias_id = uuid.uuid4().hex
+    now = _now()
+    normalized_alias = normalize_term(alias)
+    with contextlib.closing(_connect(db_path)) as conn:
+        conn.execute(
+            """INSERT INTO entity_alias
+                   (id, entity_id, alias, normalized_alias, authority, status,
+                    confidence, proof_refs_json, confirmation_id, supersedes_alias_id,
+                    created_at, decided_at)
+               VALUES (?, ?, ?, ?, ?, 'held', ?, ?, NULL, NULL, ?, NULL)""",
+            (
+                alias_id, entity_id, alias, normalized_alias, authority,
+                confidence, json.dumps(proof_refs or []), now,
+            ),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM entity_alias WHERE id = ?", (alias_id,)).fetchone()
+    return dict(row)
+
+
+def confirm_entity_alias(
+    entity_alias_id: str,
+    decision: str,
+    channel: str,
+    proof_refs: list | None = None,
+    *,
+    decided_by: str = "erdi",
+    db_path: Path = DB_PATH,
+) -> dict:
+    """Immutable entity_confirmations receipt (see entity_confirmations'
+    CREATE TABLE comment in init_db() for why this is its own table rather
+    than reusing memory_confirmations)."""
+
+    confirmation_id = uuid.uuid4().hex
+    now = _now()
+    with contextlib.closing(_connect(db_path)) as conn:
+        if conn.execute(
+            "SELECT 1 FROM entity_alias WHERE id = ?", (entity_alias_id,)
+        ).fetchone() is None:
+            raise ValueError(f"unknown entity_alias id: {entity_alias_id}")
+        conn.execute(
+            """INSERT INTO entity_confirmations
+                   (id, entity_alias_id, decision, channel, decided_by, proof_refs_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                confirmation_id, entity_alias_id, decision, channel, decided_by,
+                json.dumps(proof_refs or []), now,
+            ),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM entity_confirmations WHERE id = ?", (confirmation_id,)
+        ).fetchone()
+    return dict(row)
+
+
+_ENTITY_ALIAS_CONFIRMATION_DECISIONS = {
+    "accepted": ("confirmed",),
+    "revoked": ("corrected", "rejected"),
+    "superseded": ("corrected", "rejected"),
+}
+
+
+def set_entity_alias_status(alias_id: str, new_status: str, *, db_path: Path = DB_PATH) -> dict:
+    """held -> accepted/revoked; accepted -> revoked/superseded; revoked/
+    superseded terminal. Resolves confirmation_id (the entity_confirmations
+    row that authorized this transition, if authority != 'erdi') and sets
+    decided_at, then lets entity_alias_status_lifecycle be the actual source
+    of truth for whether the transition is allowed - same pattern as
+    claim_memory_hold(): an invalid transition or a missing confirmation
+    raises sqlite3.IntegrityError from the trigger, not a Python-level check."""
+
+    now = _now()
+    with contextlib.closing(_connect(db_path)) as conn:
+        alias = conn.execute(
+            "SELECT * FROM entity_alias WHERE id = ?", (alias_id,)
+        ).fetchone()
+        if alias is None:
+            raise ValueError(f"unknown entity_alias id: {alias_id}")
+        confirmation_id = alias["confirmation_id"]
+        required_decisions = _ENTITY_ALIAS_CONFIRMATION_DECISIONS.get(new_status)
+        if alias["authority"] != "erdi" and required_decisions is not None:
+            placeholders = ",".join("?" * len(required_decisions))
+            confirmation_row = conn.execute(
+                f"""SELECT id FROM entity_confirmations
+                    WHERE entity_alias_id = ? AND decision IN ({placeholders})
+                    ORDER BY created_at DESC LIMIT 1""",
+                (alias_id, *required_decisions),
+            ).fetchone()
+            if confirmation_row is not None:
+                confirmation_id = confirmation_row["id"]
+        conn.execute(
+            """UPDATE entity_alias SET status = ?, decided_at = ?, confirmation_id = ?
+               WHERE id = ?""",
+            (new_status, now, confirmation_id, alias_id),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM entity_alias WHERE id = ?", (alias_id,)).fetchone()
+    return dict(row)
+
+
+def create_assertion(
+    subject: str,
+    attribute: str,
+    value: str,
+    *,
+    memory_id: int | None = None,
+    epistemic_class: str = "IMPORTED",
+    source_span: str | None = None,
+    source_digest: str | None = None,
+    effective_from: str | None = None,
+    effective_until: str | None = None,
+    db_path: Path = DB_PATH,
+) -> dict:
+    """Faz 4: a single SAV (subject-attribute-value) claim, optionally tied
+    to the memory_index row it was pulled from. memory_id=None is a valid,
+    expected case - an assertion doesn't have to originate from a note."""
+
+    assertion_id = uuid.uuid4().hex
+    with contextlib.closing(_connect(db_path)) as conn:
+        conn.execute(
+            """INSERT INTO memory_assertion
+                   (id, memory_id, subject, attribute, value, epistemic_class,
+                    source_span, source_digest, effective_from, effective_until,
+                    created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                assertion_id, memory_id, subject, attribute, value, epistemic_class,
+                source_span, source_digest, effective_from, effective_until, _now(),
+            ),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM memory_assertion WHERE id = ?", (assertion_id,)
+        ).fetchone()
+    return dict(row)
+
+
+def link_assertion_relation(from_id: str, to_id: str, relation: str, *, db_path: Path = DB_PATH) -> dict:
+    """supports/contradicts/supersedes/derived_from between two memory_assertion
+    rows. UNIQUE(from_assertion_id, to_assertion_id, relation) rejects a
+    duplicate of the same triple via sqlite3.IntegrityError."""
+
+    relation_id = uuid.uuid4().hex
+    with contextlib.closing(_connect(db_path)) as conn:
+        conn.execute(
+            """INSERT INTO memory_assertion_relation
+                   (id, from_assertion_id, to_assertion_id, relation, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (relation_id, from_id, to_id, relation, _now()),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM memory_assertion_relation WHERE id = ?", (relation_id,)
+        ).fetchone()
+    return dict(row)
+
+
+def get_assertions_for_memory(memory_id: int, *, db_path: Path = DB_PATH) -> list[dict]:
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT * FROM memory_assertion WHERE memory_id = ? ORDER BY created_at",
+            (memory_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_assertions_for_subject(subject: str, *, db_path: Path = DB_PATH) -> list[dict]:
+    with contextlib.closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT * FROM memory_assertion WHERE subject = ? ORDER BY created_at",
+            (subject,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+_DEFAULT_RETRIEVAL_WEIGHTS = (3.0, 2.0, 1.0)
+
+
+def _active_retrieval_weights(conn: sqlite3.Connection) -> tuple[float, float, float]:
+    """MADDE 3: the (title, keyword, content) weights search_memory() uses,
+    read from memory_retrieval_policy's active row rather than hardcoded in
+    Python — so which weight version is live becomes queryable/auditable.
+    Falls back to the original (3, 2, 1) values if no active row exists
+    (e.g. a DB created before this migration ran init_db())."""
+
+    row = conn.execute(
+        """SELECT title_weight, keyword_weight, content_weight FROM memory_retrieval_policy
+           WHERE active = 1 ORDER BY version DESC LIMIT 1"""
+    ).fetchone()
+    if row is None:
+        return _DEFAULT_RETRIEVAL_WEIGHTS
+    return (row["title_weight"], row["keyword_weight"], row["content_weight"])
 
 
 def search_memory(
@@ -4280,10 +4968,18 @@ def search_memory(
     project is an optional filter (Stage AM) — None (the default) searches
     everything, exactly as before that stage. include_replaced (Stage AS) —
     False (the default) hides rows a heal_memory() merge marked 'replaced'.
-    """
+
+    Every call is logged to events_log (event_type='memory_recall') — a
+    simplified stand-in for bbb-os-core's memory_recall_trace, reusing the
+    existing log instead of a new table (Adım 6 lite)."""
 
     terms = list(dict.fromkeys(_significant_words(query)))
     if not terms:
+        record_event(
+            "memory_recall",
+            details={"query": query, "result_count": 0, "top_result_ids": []},
+            db_path=db_path,
+        )
         return []
     conditions = []
     params: list[Any] = []
@@ -4294,24 +4990,62 @@ def search_memory(
         conditions.append("status NOT IN ('replaced', 'superseded')")
     where_clause = f" WHERE {' AND '.join(conditions)}" if conditions else ""
     with contextlib.closing(_connect(db_path)) as conn:
-        rows = conn.execute(
-            f"SELECT source_file, title, content, keywords, confidence FROM memory_index{where_clause}",
-            params,
-        ).fetchall()
-    scored: list[tuple[float, dict]] = []
+        title_weight, keyword_weight, content_weight = _active_retrieval_weights(conn)
+        if _FTS5_AVAILABLE:
+            # MADDE 1: FTS5 narrows candidates to rows containing at least one
+            # term (any column) - the weighted count-and-confidence scoring
+            # below is unchanged, so results match the pre-FTS5 code exactly.
+            match_query = " OR ".join(f'"{term}"' for term in terms)
+            candidate_ids = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT rowid FROM memory_index_fts WHERE memory_index_fts MATCH ?",
+                    (match_query,),
+                ).fetchall()
+            ]
+            if not candidate_ids:
+                rows = []
+            else:
+                id_conditions = ["id IN ({})".format(",".join("?" * len(candidate_ids)))] + conditions
+                id_where_clause = f" WHERE {' AND '.join(id_conditions)}"
+                rows = conn.execute(
+                    f"SELECT id, source_file, title, content, keywords, confidence "
+                    f"FROM memory_index{id_where_clause}",
+                    candidate_ids + params,
+                ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT id, source_file, title, content, keywords, confidence FROM memory_index{where_clause}",
+                params,
+            ).fetchall()
+    scored: list[tuple[float, dict, int]] = []
     for row in rows:
         title = row["title"].lower()
         keywords = row["keywords"].lower()
         content = row["content"].lower()
         raw_score = sum(
-            3 * title.count(term) + 2 * keywords.count(term) + content.count(term)
+            title_weight * title.count(term)
+            + keyword_weight * keywords.count(term)
+            + content_weight * content.count(term)
             for term in terms
         )
         if raw_score > 0:
             confidence = row["confidence"] if row["confidence"] is not None else _DEFAULT_CONFIDENCE
-            scored.append((raw_score * confidence, dict(row)))
-    scored.sort(key=lambda pair: pair[0], reverse=True)
-    return [item for _score, item in scored[:limit]]
+            item = {key: row[key] for key in row.keys() if key != "id"}
+            scored.append((raw_score * confidence, item, row["id"]))
+    scored.sort(key=lambda triple: triple[0], reverse=True)
+    top = scored[:limit]
+    results = [item for _score, item, _id in top]
+    record_event(
+        "memory_recall",
+        details={
+            "query": query,
+            "result_count": len(results),
+            "top_result_ids": [row_id for _score, _item, row_id in top],
+        },
+        db_path=db_path,
+    )
+    return results
 
 
 def semantic_search(
@@ -4335,7 +5069,10 @@ def semantic_search(
     False (the default) hides rows a heal_memory() merge marked 'replaced'.
     The returned dict includes `currentness` (Stage AT: detect_memory_conflicts()
     compares it across results to spot same-topic notes that disagree).
-    """
+
+    Every call is logged to events_log (event_type='memory_recall') — a
+    simplified stand-in for bbb-os-core's memory_recall_trace, reusing the
+    existing log instead of a new table (Adım 6 lite)."""
 
     query_vector = np.frombuffer(_embed(query), dtype=np.float32)
     conditions = ["embedding IS NOT NULL"]
@@ -4348,23 +5085,89 @@ def semantic_search(
     where_clause = " AND ".join(conditions)
     with contextlib.closing(_connect(db_path)) as conn:
         rows = conn.execute(
-            f"""SELECT source_file, title, content, keywords, embedding, confidence, currentness
+            f"""SELECT id, source_file, title, content, keywords, embedding, confidence, currentness
                FROM memory_index WHERE {where_clause}""",
             params,
         ).fetchall()
-    scored: list[tuple[float, dict]] = []
+    scored: list[tuple[float, dict, int]] = []
     for row in rows:
         row_vector = np.frombuffer(row["embedding"], dtype=np.float32)
         similarity = _cosine_similarity(query_vector, row_vector)
         confidence = row["confidence"] if row["confidence"] is not None else _DEFAULT_CONFIDENCE
-        item = {key: row[key] for key in row.keys() if key != "embedding"}
+        item = {key: row[key] for key in row.keys() if key not in ("id", "embedding")}
         item["similarity"] = similarity
-        scored.append((similarity * confidence, item))
-    scored.sort(key=lambda pair: pair[0], reverse=True)
-    return [item for _score, item in scored[:limit]]
+        scored.append((similarity * confidence, item, row["id"]))
+    scored.sort(key=lambda triple: triple[0], reverse=True)
+    top = scored[:limit]
+    results = [item for _score, item, _id in top]
+    record_event(
+        "memory_recall",
+        details={
+            "query": query,
+            "result_count": len(results),
+            "top_result_ids": [row_id for _score, _item, row_id in top],
+        },
+        db_path=db_path,
+    )
+    return results
 
 
 _MEMORY_CONFLICT_SIMILARITY_THRESHOLD = 0.5
+
+
+def _open_or_reuse_conflict_domain(member_ids: list[int], *, db_path: Path = DB_PATH) -> dict:
+    """MADDE 4: reuse the existing OPEN memory_conflict_domain for this exact
+    member set if one exists, otherwise open a new one. Sits above (not
+    instead of) record_memory_decision(decision='hold') — this only tracks
+    "which memory_index rows are currently in a conflict together"; the hold
+    row it's paired with is what a human/agent actually acts on."""
+
+    member_ids_json = json.dumps(sorted(member_ids))
+    with contextlib.closing(_connect(db_path)) as conn:
+        existing = conn.execute(
+            """SELECT * FROM memory_conflict_domain
+               WHERE member_memory_ids_json = ? AND state = 'open'""",
+            (member_ids_json,),
+        ).fetchone()
+        if existing is not None:
+            return dict(existing)
+        domain_id = uuid.uuid4().hex
+        conn.execute(
+            """INSERT INTO memory_conflict_domain
+                   (id, member_memory_ids_json, state, created_at)
+               VALUES (?, ?, 'open', ?)""",
+            (domain_id, member_ids_json, _now()),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM memory_conflict_domain WHERE id = ?", (domain_id,)
+        ).fetchone()
+    return dict(row)
+
+
+def resolve_memory_conflict_domain(domain_id: str, *, db_path: Path = DB_PATH) -> dict:
+    """open -> resolved. Not wired automatically from confirm_memory()/
+    approve_merge() (MADDE 4's optional sub-test): matching "which domain(s)
+    does this confirmation/merge resolve" needs member-set-vs-outcome logic
+    that doesn't exist yet, and guessing at it risks marking a domain
+    resolved while the underlying disagreement is still live. Call this
+    explicitly once a conflict has actually been worked through."""
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        row = conn.execute(
+            "SELECT * FROM memory_conflict_domain WHERE id = ?", (domain_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"no memory_conflict_domain row with id {domain_id}")
+        conn.execute(
+            "UPDATE memory_conflict_domain SET state = 'resolved', resolved_at = ? WHERE id = ?",
+            (_now(), domain_id),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM memory_conflict_domain WHERE id = ?", (domain_id,)
+        ).fetchone()
+    return dict(row)
 
 
 def detect_memory_conflicts(query: str, *, db_path: Path = DB_PATH) -> list[dict]:
@@ -4376,6 +5179,13 @@ def detect_memory_conflicts(query: str, *, db_path: Path = DB_PATH) -> list[dict
     _MEMORY_CONFLICT_SIMILARITY_THRESHOLD similarity to the query AND whose
     `currentness` field disagrees (e.g. one 'current', one 'superseded').
     Detection only: nothing here rewrites currentness or merges anything.
+
+    MADDE 4: for each conflicting pair, also opens (or reuses, if one is
+    already open for this exact member set) a memory_conflict_domain row via
+    _open_or_reuse_conflict_domain() before driving the existing
+    record_memory_decision(decision='hold') call — the domain tracks "this
+    set of rows is in conflict", the decision/hold pair tracks "here is the
+    actionable item for it"; neither replaces the other.
     """
 
     results = semantic_search(query, limit=5, db_path=db_path)
@@ -4397,6 +5207,15 @@ def detect_memory_conflicts(query: str, *, db_path: Path = DB_PATH) -> list[dict
                     }
                 )
                 source_ids = sorted([a["source_file"], b["source_file"]])
+                with contextlib.closing(_connect(db_path)) as conn:
+                    member_id_rows = conn.execute(
+                        """SELECT id FROM memory_index
+                           WHERE source_file IN (?, ?) AND status = 'active'""",
+                        (a["source_file"], b["source_file"]),
+                    ).fetchall()
+                member_ids = sorted({row["id"] for row in member_id_rows})
+                if len(member_ids) >= 2:
+                    _open_or_reuse_conflict_domain(member_ids, db_path=db_path)
                 digest = _sha256_text(f"memory_currentness_conflict:{source_ids}")
                 record_memory_decision(
                     candidate_digest=digest,
@@ -5436,7 +6255,15 @@ def approve_merge(merge_id: int, db_path: Path = DB_PATH) -> dict:
         encoding="utf-8",
     )
 
+    parent_ids: list[int] = []
     for source_file in source_files:
+        with contextlib.closing(_connect(db_path)) as conn:
+            parent_row = conn.execute(
+                "SELECT id FROM memory_index WHERE source_file = ? AND status = 'active'",
+                (source_file,),
+            ).fetchone()
+        if parent_row is not None:
+            parent_ids.append(parent_row["id"])
         mark_memory_replaced(source_file, path.name, db_path=db_path)
 
     archived_dir.mkdir(exist_ok=True)
@@ -5446,6 +6273,13 @@ def approve_merge(merge_id: int, db_path: Path = DB_PATH) -> dict:
             old_path.rename(archived_dir / source_file)
 
     index_memory_files(db_path)
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        child_row = conn.execute(
+            "SELECT id FROM memory_index WHERE source_file = ? AND status = 'active'",
+            (path.name,),
+        ).fetchone()
+    child_id = child_row["id"] if child_row is not None else None
 
     with contextlib.closing(_connect(db_path)) as conn:
         conn.execute(
@@ -5463,6 +6297,52 @@ def approve_merge(merge_id: int, db_path: Path = DB_PATH) -> dict:
         idempotency_key=f"approve_merge:{merge_id}",
         db_path=db_path,
     )
+
+    # bbb-os-core's memory_derivation, activated: approve_merge() already
+    # produces exactly what a derivation records — a child row abstracted
+    # from >=2 parent memory_index rows. The single-source (len==1) case
+    # above ('supersede') can't satisfy memory_derivation's
+    # json_array_length(parent_ids_json) >= 2 CHECK, so it's skipped here,
+    # same as core would reject it.
+    if child_id is not None and len(parent_ids) >= 2:
+        sorted_parent_ids = sorted(parent_ids)
+        parent_ids_json = json.dumps(sorted_parent_ids)
+        parent_set_digest = hashlib.sha256(
+            json.dumps(
+                sorted_parent_ids, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        with contextlib.closing(_connect(db_path)) as conn:
+            # Faz 3 Bölüm B: a merge-produced note IS an abstraction of its
+            # sources, not an imported raw one - memory_derivation_
+            # abstraction_guard requires the child's epistemic_class to be
+            # 'DERIVED' before the INSERT below is allowed, so this UPDATE
+            # has to run first. index_memory_files() above never sets this
+            # column (defaults to 'IMPORTED' like every other indexed note).
+            conn.execute(
+                "UPDATE memory_index SET epistemic_class = 'DERIVED' WHERE id = ?",
+                (child_id,),
+            )
+            conn.execute(
+                """INSERT INTO memory_derivation
+                       (id, child_id, parent_ids_json, parent_set_digest, kind, producer,
+                        confidence, status, created_at)
+                   VALUES (?, ?, ?, ?, 'ABSTRACTION', 'approve_merge', NULL, 'active', ?)""",
+                (
+                    uuid.uuid4().hex,
+                    child_id,
+                    parent_ids_json,
+                    parent_set_digest,
+                    _now(),
+                ),
+            )
+            conn.execute(
+                """INSERT INTO memory_inference_producer_receipt
+                       (id, child_id, parent_ids_json, action, reason, created_at)
+                   VALUES (?, ?, ?, 'produced', 'approve_merge folded >=2 sources', ?)""",
+                (uuid.uuid4().hex, child_id, parent_ids_json, _now()),
+            )
+            conn.commit()
 
     return {"merged": True, "healed_file": path.name, "decision_id": decision["id"]}
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import sqlite3
 import subprocess
@@ -37,23 +38,31 @@ class McTestCase(unittest.TestCase):
                     "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
                 ).fetchall()
             }
-        self.assertEqual(
-            {
-                "sessions", "checkpoints", "tasks", "memory_index", "task_activity",
-                "task_completions", "task_receipts",
-                "projects", "sprints", "roles", "turns", "decision_packets",
-                "dispatch_runs", "agent_outputs", "evidence", "events_log",
-                "capability_boundaries", "graph_nodes", "graph_edges",
-                "answer_quality_scores", "answer_receipts", "lifecycle_runs",
-                "decisions", "compact_snapshots", "documents",
-                "context_nodes", "context_edges",
-                "doc_index", "symbol_index", "reuse_receipts",
-                "term_aliases", "health_events", "pending_merges", "maintenance_runs",
-                "memory_decisions", "memory_hold", "memory_confirmations",
-                "memory_derivation",
-            },
-            names,
-        )
+        expected = {
+            "sessions", "checkpoints", "tasks", "memory_index", "task_activity",
+            "task_completions", "task_receipts",
+            "projects", "sprints", "roles", "turns", "decision_packets",
+            "dispatch_runs", "agent_outputs", "evidence", "events_log",
+            "capability_boundaries", "graph_nodes", "graph_edges",
+            "answer_quality_scores", "answer_receipts", "lifecycle_runs",
+            "decisions", "compact_snapshots", "documents",
+            "context_nodes", "context_edges",
+            "doc_index", "symbol_index", "reuse_receipts",
+            "term_aliases", "health_events", "pending_merges", "maintenance_runs",
+            "memory_decisions", "memory_hold", "memory_confirmations",
+            "memory_derivation",
+            "memory_source_snapshot", "memory_retrieval_policy", "memory_conflict_domain",
+            "entity", "entity_alias", "fact_entity", "entity_confirmations",
+            "memory_inference_producer_receipt",
+            "memory_assertion", "memory_assertion_relation",
+        }
+        if mc._FTS5_AVAILABLE:
+            # External-content virtual table + its shadow tables (MADDE 1).
+            expected |= {
+                "memory_index_fts", "memory_index_fts_data", "memory_index_fts_idx",
+                "memory_index_fts_docsize", "memory_index_fts_config",
+            }
+        self.assertEqual(expected, names)
 
     def test_init_db_adds_embedding_column_to_memory_index(self) -> None:
         with contextlib.closing(mc._connect(self.db_path)) as conn:
@@ -1488,6 +1497,211 @@ class MemoryIndexTestCase(unittest.TestCase):
         results = mc.search_memory("session", limit=2, db_path=self.db_path)
         self.assertEqual(2, len(results))
 
+    def test_search_memory_logs_a_memory_recall_event(self) -> None:
+        # Simplified memory_recall_trace parity (Adım 6 lite): every
+        # search_memory() call drops an events_log row so recall is traceable.
+        self._write_note("a.md", "Guard note", "The guard blocks raw done writes.")
+        mc.index_memory_files(db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            memory_id = conn.execute(
+                "SELECT id FROM memory_index WHERE source_file = 'a.md'"
+            ).fetchone()["id"]
+
+        results = mc.search_memory("guard", db_path=self.db_path)
+
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT * FROM events_log WHERE event_type = 'memory_recall' "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        self.assertIsNotNone(row)
+        details = json.loads(row["details_json"])
+        self.assertEqual("guard", details["query"])
+        self.assertEqual(len(results), details["result_count"])
+        self.assertEqual([memory_id], details["top_result_ids"])
+
+    def test_search_memory_logging_does_not_change_the_return_value(self) -> None:
+        # Regression: the events_log side effect must not alter what
+        # search_memory() hands back to its caller.
+        self._write_note("a.md", "Guard note", "The guard blocks raw done writes.")
+        self._write_note("b.md", "Checkpoint note", "Checkpoints record the current task.")
+        mc.index_memory_files(db_path=self.db_path)
+
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            before_count = conn.execute("SELECT COUNT(*) FROM events_log").fetchone()[0]
+        results = mc.search_memory("guard", db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            after_count = conn.execute("SELECT COUNT(*) FROM events_log").fetchone()[0]
+
+        self.assertEqual(1, len(results))
+        self.assertEqual("Guard note", results[0]["title"])
+        self.assertEqual(before_count + 1, after_count)
+
+    def test_memory_index_fts_stays_in_sync_after_insert(self) -> None:
+        if not mc._FTS5_AVAILABLE:
+            self.skipTest("FTS5 not available in this sqlite3 build")
+        self._write_note("a.md", "Guard note", "The guard blocks raw done writes.")
+        mc.index_memory_files(db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            memory_count = conn.execute("SELECT COUNT(*) FROM memory_index").fetchone()[0]
+            fts_count = conn.execute("SELECT COUNT(*) FROM memory_index_fts").fetchone()[0]
+        self.assertEqual(1, memory_count)
+        self.assertEqual(memory_count, fts_count)
+
+    def test_memory_index_fts_stays_in_sync_after_supersede(self) -> None:
+        if not mc._FTS5_AVAILABLE:
+            self.skipTest("FTS5 not available in this sqlite3 build")
+        self._write_note("a.md", "Guard note", "The guard blocks raw done writes.")
+        mc.index_memory_files(db_path=self.db_path)
+        self._write_note("a.md", "Guard note updated", "Updated body about the guard.")
+        mc.index_memory_files(db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            memory_count = conn.execute("SELECT COUNT(*) FROM memory_index").fetchone()[0]
+            fts_count = conn.execute("SELECT COUNT(*) FROM memory_index_fts").fetchone()[0]
+            active_id = conn.execute(
+                "SELECT id FROM memory_index WHERE status = 'active'"
+            ).fetchone()["id"]
+            fts_title = conn.execute(
+                "SELECT title FROM memory_index_fts WHERE rowid = ?", (active_id,)
+            ).fetchone()["title"]
+        self.assertEqual(2, memory_count)
+        self.assertEqual(memory_count, fts_count)
+        self.assertEqual("Guard note updated", fts_title)
+
+    def test_search_memory_fts5_matches_manual_fallback_results(self) -> None:
+        # Regression: FTS5 only narrows candidates - the weighted scoring
+        # underneath is untouched, so the ranked source_file order must match
+        # the pre-FTS5 (manual full-scan) code path exactly.
+        self._write_note("a.md", "Guard note", "The guard blocks raw done writes.")
+        self._write_note("b.md", "Checkpoint note", "Checkpoints record the current task.")
+        self._write_note("c.md", "Gizmo note", "A gizmo is mentioned only in this body.")
+        mc.index_memory_files(db_path=self.db_path)
+
+        with_fts = mc.search_memory("guard checkpoint gizmo", limit=10, db_path=self.db_path)
+        with mock.patch.object(mc, "_FTS5_AVAILABLE", False):
+            without_fts = mc.search_memory("guard checkpoint gizmo", limit=10, db_path=self.db_path)
+
+        self.assertEqual(
+            [r["source_file"] for r in with_fts],
+            [r["source_file"] for r in without_fts],
+        )
+        self.assertEqual({"a.md", "b.md", "c.md"}, {r["source_file"] for r in with_fts})
+
+    def test_search_memory_fts5_fallback_never_queries_fts_table(self) -> None:
+        # Proof the fallback branch isn't dead code: with _FTS5_AVAILABLE
+        # patched False, search_memory() must never issue a query against
+        # memory_index_fts - it must fall all the way back to the manual
+        # full-scan SQL. Wraps mc._connect()'s returned connection so every
+        # SQL string search_memory() executes is captured and inspected.
+        self._write_note("a.md", "Guard note", "The guard blocks raw done writes.")
+        mc.index_memory_files(db_path=self.db_path)
+
+        real_connect = mc._connect
+        queries_seen: list[str] = []
+
+        class _TracingConn:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def execute(self, sql, *args, **kwargs):
+                queries_seen.append(sql)
+                return self._inner.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        def tracing_connect(path):
+            return _TracingConn(real_connect(path))
+
+        with mock.patch.object(mc, "_FTS5_AVAILABLE", False), \
+                mock.patch.object(mc, "_connect", tracing_connect):
+            results = mc.search_memory("guard", db_path=self.db_path)
+
+        self.assertEqual(1, len(results))
+        fts_queries = [q for q in queries_seen if "memory_index_fts" in q]
+        self.assertEqual([], fts_queries)
+        self.assertTrue(
+            any(
+                "SELECT id, source_file, title, content, keywords, confidence FROM memory_index" in q
+                and "WHERE id IN" not in q
+                for q in queries_seen
+            ),
+            "expected the manual full-scan query to run",
+        )
+
+    def test_index_memory_files_creates_snapshot_on_first_index(self) -> None:
+        self._write_note("a.md", "Guard note", "The guard blocks raw done writes.")
+        mc.index_memory_files(db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            rows = conn.execute(
+                "SELECT * FROM memory_source_snapshot WHERE source_file = 'a.md'"
+            ).fetchall()
+        self.assertEqual(1, len(rows))
+        self.assertEqual("The guard blocks raw done writes.", rows[0]["content_text"])
+        self.assertEqual(
+            mc._sha256_text("The guard blocks raw done writes."), rows[0]["content_digest"]
+        )
+
+    def test_index_memory_files_appends_new_snapshot_on_content_change(self) -> None:
+        self._write_note("a.md", "Guard note", "The guard blocks raw done writes.")
+        mc.index_memory_files(db_path=self.db_path)
+        self._write_note("a.md", "Guard note updated", "Updated body about the guard.")
+        mc.index_memory_files(db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            rows = conn.execute(
+                "SELECT content_text FROM memory_source_snapshot "
+                "WHERE source_file = 'a.md' ORDER BY id"
+            ).fetchall()
+        self.assertEqual(2, len(rows))
+        self.assertEqual("The guard blocks raw done writes.", rows[0]["content_text"])
+        self.assertEqual("Updated body about the guard.", rows[1]["content_text"])
+
+    def test_memory_source_snapshot_rejects_update_and_delete(self) -> None:
+        self._write_note("a.md", "Guard note", "The guard blocks raw done writes.")
+        mc.index_memory_files(db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            snapshot_id = conn.execute("SELECT id FROM memory_source_snapshot").fetchone()["id"]
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "UPDATE memory_source_snapshot SET content_text = 'tampered' WHERE id = ?",
+                    (snapshot_id,),
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute("DELETE FROM memory_source_snapshot WHERE id = ?", (snapshot_id,))
+
+    def test_memory_retrieval_policy_default_active_row_matches_original_weights(self) -> None:
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                """SELECT version, title_weight, keyword_weight, content_weight
+                   FROM memory_retrieval_policy WHERE active = 1"""
+            ).fetchone()
+        self.assertEqual(1, row["version"])
+        self.assertEqual(3.0, row["title_weight"])
+        self.assertEqual(2.0, row["keyword_weight"])
+        self.assertEqual(1.0, row["content_weight"])
+
+    def test_search_memory_reads_weights_from_active_retrieval_policy_row(self) -> None:
+        self._write_note("a.md", "Alpha note", "gizmo gizmo gizmo gizmo in the body only")
+        self._write_note("b.md", "Gizmo headline", "body text without any repeats")
+        mc.index_memory_files(db_path=self.db_path)
+
+        default_results = mc.search_memory("gizmo", db_path=self.db_path)
+        self.assertEqual("Alpha note", default_results[0]["title"])
+
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            conn.execute("UPDATE memory_retrieval_policy SET active = 0 WHERE active = 1")
+            conn.execute(
+                """INSERT INTO memory_retrieval_policy
+                       (version, title_weight, keyword_weight, content_weight, created_at, active)
+                   VALUES (2, 100, 0, 0, ?, 1)""",
+                (mc._now(),),
+            )
+            conn.commit()
+
+        reweighted_results = mc.search_memory("gizmo", db_path=self.db_path)
+        self.assertEqual(1, len(reweighted_results))
+        self.assertEqual("Gizmo headline", reweighted_results[0]["title"])
+
     def test_log_lesson_writes_new_file_when_no_similar_note_exists(self) -> None:
         path = mc.log_lesson(
             "Guard blocks done", "The guard refuses raw done writes.", db_path=self.db_path
@@ -1779,6 +1993,49 @@ class SemanticSearchTestCase(unittest.TestCase):
         keyword_files = {item["source_file"] for item in keyword_results}
         print("[search_memory] keyword hits:", keyword_files)
         self.assertNotIn("refusal.md", keyword_files)
+
+    def test_semantic_search_logs_a_memory_recall_event(self) -> None:
+        # Simplified memory_recall_trace parity (Adım 6 lite): every
+        # semantic_search() call drops an events_log row so recall is traceable.
+        self._write_note("a.md", "Guard note", "The guard blocks raw done writes.")
+        mc.index_memory_files(db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            memory_id = conn.execute(
+                "SELECT id FROM memory_index WHERE source_file = 'a.md'"
+            ).fetchone()["id"]
+
+        results = mc.semantic_search("guard blocks writes", db_path=self.db_path)
+
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT * FROM events_log WHERE event_type = 'memory_recall' "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        self.assertIsNotNone(row)
+        details = json.loads(row["details_json"])
+        self.assertEqual("guard blocks writes", details["query"])
+        self.assertEqual(len(results), details["result_count"])
+        self.assertEqual([memory_id], details["top_result_ids"])
+
+    def test_semantic_search_logging_does_not_change_the_return_value(self) -> None:
+        # Regression: the events_log side effect must not alter what
+        # semantic_search() hands back to its caller (including `similarity`,
+        # which isn't a raw memory_index column).
+        self._write_note("a.md", "Guard note", "The guard blocks raw done writes.")
+        mc.index_memory_files(db_path=self.db_path)
+
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            before_count = conn.execute("SELECT COUNT(*) FROM events_log").fetchone()[0]
+        results = mc.semantic_search("guard blocks writes", db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            after_count = conn.execute("SELECT COUNT(*) FROM events_log").fetchone()[0]
+
+        self.assertEqual(1, len(results))
+        self.assertEqual("Guard note", results[0]["title"])
+        self.assertIn("similarity", results[0])
+        self.assertNotIn("id", results[0])
+        self.assertNotIn("embedding", results[0])
+        self.assertEqual(before_count + 1, after_count)
 
 
 class AskOllamaTestCase(unittest.TestCase):
@@ -2520,7 +2777,7 @@ class MemoryDecisionHoldTestCase(McTestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             mc.release_memory_hold(hold_id, db_path=self.db_path)
         with self.assertRaises(sqlite3.IntegrityError):
-            mc.expire_memory_hold(hold_id, db_path=self.db_path)
+            mc.expire_memory_hold(hold_id, "erdi", db_path=self.db_path)
 
     def test_claim_without_advancing_epoch_is_rejected(self) -> None:
         hold_id = self._open_hold("digest-7")
@@ -2553,8 +2810,11 @@ class MemoryDecisionHoldTestCase(McTestCase):
 
     def test_expire_memory_hold_from_open(self) -> None:
         hold_id = self._open_hold("digest-11")
-        expired = mc.expire_memory_hold(hold_id, db_path=self.db_path)
+        expired = mc.expire_memory_hold(
+            hold_id, "expiry_sweep", {"reason": "retry_after passed"}, db_path=self.db_path,
+        )
         self.assertEqual("expired", expired["state"])
+        self.assertEqual("expiry_sweep", expired["resolved_by"])
 
     def test_reject_conflict_logs_reject_decision_and_resolves_hold(self) -> None:
         hold_id = self._open_hold("digest-12", source_ids=("a.md", "b.md"))
@@ -2570,6 +2830,60 @@ class MemoryDecisionHoldTestCase(McTestCase):
         # The hold is already resolved (terminal) - rejecting it again must fail.
         with self.assertRaises(sqlite3.IntegrityError):
             mc.reject_conflict(hold_id, "not_a_real_conflict", db_path=self.db_path)
+
+    def test_identity_fields_are_immutable_even_without_state_change(self) -> None:
+        # memory_hold_identity_immutable: an UPDATE that never touches state
+        # (here: reason_code) must still be rejected.
+        hold_id = self._open_hold("digest-13")
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "UPDATE memory_hold SET reason_code = 'changed' WHERE id = ?",
+                    (hold_id,),
+                )
+
+    def test_resolving_without_resolution_custody_is_rejected(self) -> None:
+        # memory_hold_state_lifecycle's resolution-custody guard: entering
+        # 'resolved' or 'expired' requires both resolved_by and
+        # resolution_json to already be non-NULL in the same UPDATE.
+        hold_open = self._open_hold("digest-14")
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "UPDATE memory_hold SET state = 'resolved', resolved_by = 'erdi' "
+                    "WHERE id = ?",
+                    (hold_open,),
+                )
+
+        hold_expired = self._open_hold("digest-15")
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "UPDATE memory_hold SET state = 'expired', resolution_json = '{}' "
+                    "WHERE id = ?",
+                    (hold_expired,),
+                )
+
+    def test_resolution_custody_present_still_allows_terminal_transition(self) -> None:
+        # Regression: when both fields are supplied, resolve/expire still work
+        # normally (via the public API, which now always fills both).
+        hold_id = self._open_hold("digest-16")
+        resolved = mc.resolve_memory_hold(
+            hold_id, "erdi", {"outcome": "kept both"}, db_path=self.db_path,
+        )
+        self.assertEqual("resolved", resolved["state"])
+        self.assertEqual("erdi", resolved["resolved_by"])
+        self.assertEqual({"outcome": "kept both"}, json.loads(resolved["resolution_json"]))
+
+        other_hold = self._open_hold("digest-17")
+        expired = mc.expire_memory_hold(
+            other_hold, "expiry_sweep", {"reason": "retry_after passed"}, db_path=self.db_path,
+        )
+        self.assertEqual("expired", expired["state"])
+        self.assertEqual("expiry_sweep", expired["resolved_by"])
+        self.assertEqual(
+            {"reason": "retry_after passed"}, json.loads(expired["resolution_json"])
+        )
 
     def test_detect_decision_conflicts_writes_hold_decision(self) -> None:
         md_path = self.db_path.parent / f"{self.db_path.stem}-decisions.md"
@@ -2630,6 +2944,149 @@ class MemoryDecisionHoldTestCase(McTestCase):
         self.assertEqual(["a.md", "b.md"], json.loads(row["source_ids_json"]))
         self.assertEqual([result["healed_file"]], json.loads(row["resulting_ids_json"]))
 
+    def test_approve_merge_writes_memory_derivation_row(self) -> None:
+        # memory_derivation activation: approve_merge() folding >=2 source
+        # rows into one is exactly what a derivation records.
+        self.project_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.project_dir.cleanup)
+        memory_dir = Path(self.project_dir.name) / "memory"
+        memory_dir.mkdir()
+        patcher = mock.patch.object(mc, "__file__", str(Path(self.project_dir.name) / "mc.py"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        (memory_dir / "a.md").write_text(
+            "---\ntitle: A\n---\n\nNote A.\n", encoding="utf-8"
+        )
+        (memory_dir / "b.md").write_text(
+            "---\ntitle: B\n---\n\nNote B.\n", encoding="utf-8"
+        )
+        mc.index_memory_files(db_path=self.db_path)
+
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            parent_ids = sorted(
+                r["id"]
+                for r in conn.execute(
+                    "SELECT id FROM memory_index WHERE source_file IN ('a.md', 'b.md')"
+                ).fetchall()
+            )
+            cur = conn.execute(
+                """INSERT INTO pending_merges (source_files, title, content, status, created_at)
+                   VALUES (?, ?, ?, 'pending', ?)""",
+                (json.dumps(["a.md", "b.md"]), "Merged note", "Note A.\n\nNote B.", mc._now()),
+            )
+            merge_id = cur.lastrowid
+            conn.commit()
+
+        result = mc.approve_merge(merge_id, db_path=self.db_path)
+
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            child_id = conn.execute(
+                "SELECT id FROM memory_index WHERE source_file = ? AND status = 'active'",
+                (result["healed_file"],),
+            ).fetchone()["id"]
+            derivation = conn.execute(
+                "SELECT * FROM memory_derivation WHERE child_id = ?", (child_id,)
+            ).fetchone()
+
+        self.assertIsNotNone(derivation)
+        self.assertEqual("ABSTRACTION", derivation["kind"])
+        self.assertEqual(child_id, derivation["child_id"])
+        self.assertEqual(parent_ids, sorted(json.loads(derivation["parent_ids_json"])))
+        self.assertGreaterEqual(len(json.loads(derivation["parent_ids_json"])), 2)
+        self.assertEqual("active", derivation["status"])
+
+    def test_approve_merge_single_source_writes_no_derivation_row(self) -> None:
+        # The len==1 ('supersede') case can't satisfy memory_derivation's
+        # json_array_length(parent_ids_json) >= 2 CHECK, so it must be skipped
+        # rather than raising an IntegrityError.
+        self.project_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.project_dir.cleanup)
+        memory_dir = Path(self.project_dir.name) / "memory"
+        memory_dir.mkdir()
+        patcher = mock.patch.object(mc, "__file__", str(Path(self.project_dir.name) / "mc.py"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        (memory_dir / "a.md").write_text(
+            "---\ntitle: A\n---\n\nNote A.\n", encoding="utf-8"
+        )
+        mc.index_memory_files(db_path=self.db_path)
+
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            cur = conn.execute(
+                """INSERT INTO pending_merges (source_files, title, content, status, created_at)
+                   VALUES (?, ?, ?, 'pending', ?)""",
+                (json.dumps(["a.md"]), "Merged note", "Note A, restated.", mc._now()),
+            )
+            merge_id = cur.lastrowid
+            conn.commit()
+
+        result = mc.approve_merge(merge_id, db_path=self.db_path)
+
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            count = conn.execute("SELECT COUNT(*) AS n FROM memory_derivation").fetchone()["n"]
+        self.assertEqual(0, count)
+        self.assertIn("decision_id", result)
+
+    def test_approve_merge_still_writes_derivation_and_producer_receipt(self) -> None:
+        # Faz 3 Bölüm B regression: adding memory_derivation_abstraction_guard
+        # must not break the Faz 2 approve_merge() -> memory_derivation flow -
+        # it now also sets the child's epistemic_class to DERIVED (required by
+        # the guard) and drops a memory_inference_producer_receipt row.
+        self.project_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.project_dir.cleanup)
+        memory_dir = Path(self.project_dir.name) / "memory"
+        memory_dir.mkdir()
+        patcher = mock.patch.object(mc, "__file__", str(Path(self.project_dir.name) / "mc.py"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        (memory_dir / "a.md").write_text(
+            "---\ntitle: A\n---\n\nNote A.\n", encoding="utf-8"
+        )
+        (memory_dir / "b.md").write_text(
+            "---\ntitle: B\n---\n\nNote B.\n", encoding="utf-8"
+        )
+        mc.index_memory_files(db_path=self.db_path)
+
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            parent_ids = sorted(
+                r["id"]
+                for r in conn.execute(
+                    "SELECT id FROM memory_index WHERE source_file IN ('a.md', 'b.md')"
+                ).fetchall()
+            )
+            cur = conn.execute(
+                """INSERT INTO pending_merges (source_files, title, content, status, created_at)
+                   VALUES (?, ?, ?, 'pending', ?)""",
+                (json.dumps(["a.md", "b.md"]), "Merged note", "Note A.\n\nNote B.", mc._now()),
+            )
+            merge_id = cur.lastrowid
+            conn.commit()
+
+        result = mc.approve_merge(merge_id, db_path=self.db_path)
+
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            child_row = conn.execute(
+                "SELECT id, epistemic_class FROM memory_index WHERE source_file = ? AND status = 'active'",
+                (result["healed_file"],),
+            ).fetchone()
+            child_id = child_row["id"]
+            derivation = conn.execute(
+                "SELECT * FROM memory_derivation WHERE child_id = ?", (child_id,)
+            ).fetchone()
+            receipt = conn.execute(
+                "SELECT * FROM memory_inference_producer_receipt WHERE child_id = ?", (child_id,)
+            ).fetchone()
+
+        self.assertEqual("DERIVED", child_row["epistemic_class"])
+        self.assertIsNotNone(derivation)
+        self.assertEqual("ABSTRACTION", derivation["kind"])
+        self.assertIsNotNone(receipt)
+        self.assertEqual("produced", receipt["action"])
+        self.assertEqual(parent_ids, sorted(json.loads(receipt["parent_ids_json"])))
+
 
 class MemoryConflictDecisionWiringTestCase(unittest.TestCase):
     """Adım 3: detect_memory_conflicts() writes a 'hold' memory_decisions/memory_hold
@@ -2686,6 +3143,49 @@ class MemoryConflictDecisionWiringTestCase(unittest.TestCase):
         # Re-detecting the same pair must not duplicate the decision/hold.
         mc.detect_memory_conflicts(body, db_path=self.db_path)
         self.assertEqual(1, len(mc.list_memory_holds(db_path=self.db_path)))
+
+    def _write_conflicting_pair(self) -> str:
+        body = "the guard blocks unsafe database writes"
+        (self.memory_dir / "current.md").write_text(
+            f"---\ntitle: Guard current\n---\n\n{body}\n", encoding="utf-8"
+        )
+        (self.memory_dir / "stale.md").write_text(
+            f"---\ntitle: Guard stale\n---\n\n{body}\n", encoding="utf-8"
+        )
+        mc.index_memory_files(db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE memory_index SET currentness = 'superseded' WHERE source_file = 'stale.md'"
+            )
+            conn.commit()
+        return body
+
+    def test_detect_memory_conflicts_reuses_same_open_conflict_domain(self) -> None:
+        body = self._write_conflicting_pair()
+
+        mc.detect_memory_conflicts(body, db_path=self.db_path)
+        mc.detect_memory_conflicts(body, db_path=self.db_path)
+
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            domains = conn.execute(
+                "SELECT * FROM memory_conflict_domain WHERE state = 'open'"
+            ).fetchall()
+        self.assertEqual(1, len(domains))
+        member_ids = json.loads(domains[0]["member_memory_ids_json"])
+        self.assertEqual(2, len(member_ids))
+
+    def test_resolve_memory_conflict_domain_marks_state_resolved(self) -> None:
+        body = self._write_conflicting_pair()
+        mc.detect_memory_conflicts(body, db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            domain_id = conn.execute(
+                "SELECT id FROM memory_conflict_domain WHERE state = 'open'"
+            ).fetchone()["id"]
+
+        resolved = mc.resolve_memory_conflict_domain(domain_id, db_path=self.db_path)
+
+        self.assertEqual("resolved", resolved["state"])
+        self.assertIsNotNone(resolved["resolved_at"])
 
 
 class MemoryAuthorityConfirmationTestCase(unittest.TestCase):
@@ -2870,6 +3370,142 @@ class MemoryAuthorityConfirmationTestCase(unittest.TestCase):
         self.assertEqual("confirmed", receipt["decision"])
         self.assertEqual(memory_id, receipt["memory_id"])
 
+    def test_confirm_memory_pins_value_sha256_to_content_at_confirmation_time(self) -> None:
+        # memory_owner_confirmation_receipts.value_sha256 parity: the receipt
+        # cryptographically fixes what memory_index.content actually was at
+        # the moment of confirmation.
+        self._write_note("a.md", "Note A", "Body A pinned content.")
+        mc.index_memory_files(db_path=self.db_path)
+        memory_id = self._memory_id("a.md")
+
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            content = conn.execute(
+                "SELECT content FROM memory_index WHERE id = ?", (memory_id,)
+            ).fetchone()["content"]
+        expected = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+        receipt = mc.confirm_memory(memory_id, "confirmed", "chat", db_path=self.db_path)
+        self.assertEqual(expected, receipt["value_sha256"])
+
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            stored = conn.execute(
+                "SELECT value_sha256 FROM memory_confirmations WHERE id = ?", (receipt["id"],)
+            ).fetchone()["value_sha256"]
+        self.assertEqual(expected, stored)
+
+
+class EntityAliasLifecycleTestCase(McTestCase):
+    """Faz 3 Bölüm A: entity / entity_alias / entity_confirmations - a scaled
+    down adaptation of bbb-os-core's entity-resolution + owner/authority
+    confirmation model onto bbb-lite's real schema (memory_index only)."""
+
+    def _make_entity_and_alias(self, authority: str = "erdi") -> tuple[dict, dict]:
+        entity = mc.create_entity("Widget", "product", db_path=self.db_path)
+        alias = mc.add_entity_alias(
+            entity["id"], "Widget", authority, db_path=self.db_path
+        )
+        return entity, alias
+
+    def test_erdi_authority_transitions_without_confirmation(self) -> None:
+        _entity, alias = self._make_entity_and_alias(authority="erdi")
+        self.assertEqual("held", alias["status"])
+
+        updated = mc.set_entity_alias_status(alias["id"], "accepted", db_path=self.db_path)
+
+        self.assertEqual("accepted", updated["status"])
+        self.assertIsNotNone(updated["decided_at"])
+        self.assertIsNone(updated["confirmation_id"])
+
+    def test_non_owner_authority_rejected_without_confirmation(self) -> None:
+        _entity, alias = self._make_entity_and_alias(authority="agent")
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            mc.set_entity_alias_status(alias["id"], "accepted", db_path=self.db_path)
+
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            status = conn.execute(
+                "SELECT status FROM entity_alias WHERE id = ?", (alias["id"],)
+            ).fetchone()["status"]
+        self.assertEqual("held", status)
+
+    def test_non_owner_authority_accepted_after_confirmation(self) -> None:
+        _entity, alias = self._make_entity_and_alias(authority="agent")
+        confirmation = mc.confirm_entity_alias(
+            alias["id"], "confirmed", "chat", db_path=self.db_path
+        )
+
+        updated = mc.set_entity_alias_status(alias["id"], "accepted", db_path=self.db_path)
+
+        self.assertEqual("accepted", updated["status"])
+        self.assertEqual(confirmation["id"], updated["confirmation_id"])
+
+    def test_non_owner_authority_revoked_after_rejected_confirmation(self) -> None:
+        _entity, alias = self._make_entity_and_alias(authority="agent")
+        mc.confirm_entity_alias(alias["id"], "rejected", "chat", db_path=self.db_path)
+
+        updated = mc.set_entity_alias_status(alias["id"], "revoked", db_path=self.db_path)
+
+        self.assertEqual("revoked", updated["status"])
+
+    def test_wrong_decision_kind_does_not_satisfy_confirmation_requirement(self) -> None:
+        # A 'rejected' confirmation authorizes revoked/superseded, not accepted.
+        _entity, alias = self._make_entity_and_alias(authority="agent")
+        mc.confirm_entity_alias(alias["id"], "rejected", "chat", db_path=self.db_path)
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            mc.set_entity_alias_status(alias["id"], "accepted", db_path=self.db_path)
+
+    def test_revoked_is_terminal(self) -> None:
+        _entity, alias = self._make_entity_and_alias(authority="erdi")
+        mc.set_entity_alias_status(alias["id"], "revoked", db_path=self.db_path)
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            mc.set_entity_alias_status(alias["id"], "accepted", db_path=self.db_path)
+
+    def test_superseded_is_terminal(self) -> None:
+        _entity, alias = self._make_entity_and_alias(authority="erdi")
+        mc.set_entity_alias_status(alias["id"], "accepted", db_path=self.db_path)
+        mc.set_entity_alias_status(alias["id"], "superseded", db_path=self.db_path)
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            mc.set_entity_alias_status(alias["id"], "revoked", db_path=self.db_path)
+
+    def test_held_cannot_jump_directly_to_superseded(self) -> None:
+        _entity, alias = self._make_entity_and_alias(authority="erdi")
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            mc.set_entity_alias_status(alias["id"], "superseded", db_path=self.db_path)
+
+    def test_duplicate_normalized_alias_for_same_entity_rejected(self) -> None:
+        entity, _alias = self._make_entity_and_alias(authority="erdi")
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            mc.add_entity_alias(entity["id"], "widget", "erdi", db_path=self.db_path)
+
+    def test_same_alias_text_allowed_on_a_different_entity(self) -> None:
+        entity_a, _alias = self._make_entity_and_alias(authority="erdi")
+        entity_b = mc.create_entity("Gadget", "product", db_path=self.db_path)
+
+        other_alias = mc.add_entity_alias(entity_b["id"], "Widget", "erdi", db_path=self.db_path)
+        self.assertEqual(entity_b["id"], other_alias["entity_id"])
+
+    def test_entity_confirmations_rejects_update_and_delete(self) -> None:
+        _entity, alias = self._make_entity_and_alias(authority="agent")
+        confirmation = mc.confirm_entity_alias(
+            alias["id"], "confirmed", "chat", db_path=self.db_path
+        )
+
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "UPDATE entity_confirmations SET decision = 'rejected' WHERE id = ?",
+                    (confirmation["id"],),
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "DELETE FROM entity_confirmations WHERE id = ?", (confirmation["id"],)
+                )
+
 
 class MemoryEpistemicClassDerivationTestCase(McTestCase):
     """Adım 5: memory_index.epistemic_class/source_span/source_digest +
@@ -2941,9 +3577,13 @@ class MemoryEpistemicClassDerivationTestCase(McTestCase):
                 )
 
     def test_memory_derivation_with_two_parents_written(self) -> None:
+        # Faz 3 Bölüm B added memory_derivation_abstraction_guard, which
+        # requires the child to be epistemic_class='DERIVED' for kind=
+        # 'ABSTRACTION' - explicit here since _insert_memory_row()'s default
+        # (IMPORTED) would now be rejected by that trigger.
         parent_a = self._insert_memory_row("a.md")
         parent_b = self._insert_memory_row("b.md")
-        child_id = self._insert_memory_row("c.md")
+        child_id = self._insert_memory_row("c.md", epistemic_class="DERIVED")
         with contextlib.closing(mc._connect(self.db_path)) as conn:
             conn.execute(
                 """INSERT INTO memory_derivation
@@ -2959,6 +3599,131 @@ class MemoryEpistemicClassDerivationTestCase(McTestCase):
             ).fetchone()
         self.assertEqual(child_id, row["child_id"])
         self.assertEqual([parent_a, parent_b], json.loads(row["parent_ids_json"]))
+
+    def test_abstraction_guard_rejects_non_derived_child(self) -> None:
+        parent_a = self._insert_memory_row("a.md")
+        parent_b = self._insert_memory_row("b.md")
+        child_id = self._insert_memory_row("c.md")  # defaults to IMPORTED, not DERIVED
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    """INSERT INTO memory_derivation
+                           (id, child_id, parent_ids_json, parent_set_digest, kind,
+                            producer, status, created_at)
+                       VALUES ('d3', ?, ?, 'digest', 'ABSTRACTION', 'agent',
+                               'active', '2026-08-21T00:00:00')""",
+                    (child_id, json.dumps([parent_a, parent_b])),
+                )
+
+    def test_abstraction_guard_rejects_project_mismatch(self) -> None:
+        parent_a = self._insert_memory_row("a.md", project="alpha")
+        parent_b = self._insert_memory_row("b.md", project="beta")
+        child_id = self._insert_memory_row("c.md", epistemic_class="DERIVED")
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    """INSERT INTO memory_derivation
+                           (id, child_id, parent_ids_json, parent_set_digest, kind,
+                            producer, status, created_at)
+                       VALUES ('d4', ?, ?, 'digest', 'ABSTRACTION', 'agent',
+                               'active', '2026-08-21T00:00:00')""",
+                    (child_id, json.dumps([parent_a, parent_b])),
+                )
+
+    def test_abstraction_guard_rejects_non_stated_or_imported_parent(self) -> None:
+        parent_a = self._insert_memory_row("a.md")  # IMPORTED - allowed
+        parent_b = self._insert_memory_row("b.md", epistemic_class="DERIVED")  # not allowed
+        child_id = self._insert_memory_row("c.md", epistemic_class="DERIVED")
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    """INSERT INTO memory_derivation
+                           (id, child_id, parent_ids_json, parent_set_digest, kind,
+                            producer, status, created_at)
+                       VALUES ('d5', ?, ?, 'digest', 'ABSTRACTION', 'agent',
+                               'active', '2026-08-21T00:00:00')""",
+                    (child_id, json.dumps([parent_a, parent_b])),
+                )
+
+
+class MemoryAssertionTestCase(McTestCase):
+    """Faz 4: memory_assertion / memory_assertion_relation - a deliberately
+    narrowed, CRUD-only version of bbb-os-core's memory_assertion, kept
+    parallel to (not replacing) memory_index. No extraction pipeline exists
+    yet, so these tests only exercise create_assertion() /
+    link_assertion_relation() directly."""
+
+    def _insert_memory_row(self, source_file: str = "a.md") -> int:
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            cur = conn.execute(
+                """INSERT INTO memory_index (source_file, title, content, keywords)
+                   VALUES (?, 'Note', 'Body.', 'note')""",
+                (source_file,),
+            )
+            conn.commit()
+            return cur.lastrowid
+
+    def test_create_assertion_with_memory_id_none(self) -> None:
+        assertion = mc.create_assertion(
+            "bbb-lite", "database", "sqlite", db_path=self.db_path
+        )
+        self.assertIsNone(assertion["memory_id"])
+        self.assertEqual("bbb-lite", assertion["subject"])
+        self.assertEqual("IMPORTED", assertion["epistemic_class"])
+
+    def test_create_assertion_with_valid_memory_id(self) -> None:
+        memory_id = self._insert_memory_row()
+        assertion = mc.create_assertion(
+            "bbb-lite", "database", "sqlite", memory_id=memory_id, db_path=self.db_path
+        )
+        self.assertEqual(memory_id, assertion["memory_id"])
+
+    def test_stated_without_source_span_and_digest_rejected(self) -> None:
+        with self.assertRaises(sqlite3.IntegrityError):
+            mc.create_assertion(
+                "bbb-lite", "database", "sqlite",
+                epistemic_class="STATED", db_path=self.db_path,
+            )
+
+    def test_stated_with_span_and_valid_digest_accepted(self) -> None:
+        digest = mc._sha256_text("erdi said this directly")
+        assertion = mc.create_assertion(
+            "bbb-lite", "database", "sqlite",
+            epistemic_class="STATED", source_span="turn 12", source_digest=digest,
+            db_path=self.db_path,
+        )
+        self.assertEqual("STATED", assertion["epistemic_class"])
+
+    def test_link_assertion_relation_rejects_duplicate_triple(self) -> None:
+        a = mc.create_assertion("bbb-lite", "database", "sqlite", db_path=self.db_path)
+        b = mc.create_assertion("bbb-lite", "database", "postgres", db_path=self.db_path)
+        mc.link_assertion_relation(a["id"], b["id"], "contradicts", db_path=self.db_path)
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            mc.link_assertion_relation(a["id"], b["id"], "contradicts", db_path=self.db_path)
+
+    def test_get_assertions_for_memory_filters_correctly(self) -> None:
+        memory_a = self._insert_memory_row("a.md")
+        memory_b = self._insert_memory_row("b.md")
+        mc.create_assertion("x", "y", "1", memory_id=memory_a, db_path=self.db_path)
+        mc.create_assertion("x", "y", "2", memory_id=memory_a, db_path=self.db_path)
+        mc.create_assertion("x", "y", "3", memory_id=memory_b, db_path=self.db_path)
+        mc.create_assertion("x", "y", "4", db_path=self.db_path)  # memory_id=None
+
+        results = mc.get_assertions_for_memory(memory_a, db_path=self.db_path)
+
+        self.assertEqual(2, len(results))
+        self.assertEqual({"1", "2"}, {row["value"] for row in results})
+
+    def test_get_assertions_for_subject_filters_correctly(self) -> None:
+        mc.create_assertion("bbb-lite", "database", "sqlite", db_path=self.db_path)
+        mc.create_assertion("bbb-lite", "language", "python", db_path=self.db_path)
+        mc.create_assertion("haroon-bbb-sync", "database", "postgres", db_path=self.db_path)
+
+        results = mc.get_assertions_for_subject("bbb-lite", db_path=self.db_path)
+
+        self.assertEqual(2, len(results))
+        self.assertEqual({"database", "language"}, {row["attribute"] for row in results})
 
 
 if __name__ == "__main__":
