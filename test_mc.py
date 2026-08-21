@@ -108,6 +108,58 @@ class McTestCase(unittest.TestCase):
         latest = mc.latest_checkpoint("unknown-session", db_path=self.db_path)
         self.assertEqual("only one", latest["current_task"])
 
+    def test_latest_checkpoint_does_not_cross_project_boundary(self) -> None:
+        # Regression test for the recovery bug: a session in one known
+        # project must never surface another known project's checkpoint.
+        project_a = mc.add_project("project-a", db_path=self.db_path)
+        project_b = mc.add_project("project-b", db_path=self.db_path)
+        mc.ensure_session("s-a", project_id=project_a, db_path=self.db_path)
+        mc.ensure_session("s-b", project_id=project_b, db_path=self.db_path)
+        mc.write_checkpoint("s-a", current_task="a's task", db_path=self.db_path)
+
+        self.assertIsNone(mc.latest_checkpoint("s-b", db_path=self.db_path))
+
+    def test_latest_checkpoint_falls_back_within_same_project(self) -> None:
+        project_a = mc.add_project("project-a", db_path=self.db_path)
+        mc.ensure_session("s-a1", project_id=project_a, db_path=self.db_path)
+        mc.ensure_session("s-a2", project_id=project_a, db_path=self.db_path)
+        mc.write_checkpoint("s-a1", current_task="a1's task", db_path=self.db_path)
+
+        latest = mc.latest_checkpoint("s-a2", db_path=self.db_path)
+        self.assertEqual("a1's task", latest["current_task"])
+
+    def test_write_checkpoint_records_sessions_project_id(self) -> None:
+        project_id = mc.add_project("project-a", db_path=self.db_path)
+        mc.ensure_session("s1", project_id=project_id, db_path=self.db_path)
+        mc.write_checkpoint("s1", current_task="a task", db_path=self.db_path)
+
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT project_id FROM checkpoints WHERE session_id = ?", ("s1",)
+            ).fetchone()
+        self.assertEqual(project_id, row["project_id"])
+
+    def test_ensure_session_records_surface(self) -> None:
+        mc.ensure_session("s1", surface="claude-code-hook", db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT surface FROM sessions WHERE session_id = ?", ("s1",)
+            ).fetchone()
+        self.assertEqual("claude-code-hook", row["surface"])
+
+    def test_ensure_session_surface_none_does_not_overwrite_existing_value(self) -> None:
+        mc.ensure_session("s1", surface="dispatch-cli", db_path=self.db_path)
+        mc.ensure_session("s1", db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT surface FROM sessions WHERE session_id = ?", ("s1",)
+            ).fetchone()
+        self.assertEqual("dispatch-cli", row["surface"])
+
+    def test_ensure_session_invalid_surface_raises_integrity_error(self) -> None:
+        with self.assertRaises(sqlite3.IntegrityError):
+            mc.ensure_session("s1", surface="not-a-real-surface", db_path=self.db_path)
+
     def test_add_and_list_open_tasks(self) -> None:
         mc.add_task("write tests", db_path=self.db_path)
         mc.add_task("ship it", db_path=self.db_path)
@@ -791,6 +843,28 @@ class McTestCase(unittest.TestCase):
             ).fetchone()
         self.assertEqual("completed", row["status"])
 
+    def test_mark_session_completed_with_summary_sets_ended_at_and_summary(
+        self,
+    ) -> None:
+        mc.ensure_session("s1", db_path=self.db_path)
+        mc.mark_session_completed("s1", summary="wrapped up the parity work", db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT ended_at, summary FROM sessions WHERE session_id = ?", ("s1",)
+            ).fetchone()
+        self.assertIsNotNone(row["ended_at"])
+        self.assertEqual("wrapped up the parity work", row["summary"])
+
+    def test_mark_session_completed_without_summary_leaves_summary_null(self) -> None:
+        mc.ensure_session("s1", db_path=self.db_path)
+        mc.mark_session_completed("s1", db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT ended_at, summary FROM sessions WHERE session_id = ?", ("s1",)
+            ).fetchone()
+        self.assertIsNotNone(row["ended_at"])
+        self.assertIsNone(row["summary"])
+
     def test_cursor_cannot_bypass_the_guard(self) -> None:
         task_id = mc.add_task("write tests", db_path=self.db_path)
         with self.assertRaises(mc.MCCompletionRefused):
@@ -922,11 +996,18 @@ class StageGTestCase(unittest.TestCase):
     def tearDown(self) -> None:
         self.db_path.unlink(missing_ok=True)
 
-    def _insert_session(self, session_id: str, started_at: str, status: str = "active") -> None:
+    def _insert_session(
+        self,
+        session_id: str,
+        started_at: str,
+        status: str = "active",
+        surface: str | None = None,
+    ) -> None:
         with contextlib.closing(mc._connect(self.db_path)) as conn:
             conn.execute(
-                "INSERT INTO sessions (session_id, started_at, status) VALUES (?, ?, ?)",
-                (session_id, started_at, status),
+                "INSERT INTO sessions (session_id, started_at, status, surface) "
+                "VALUES (?, ?, ?, ?)",
+                (session_id, started_at, status, surface),
             )
             conn.commit()
 
@@ -969,6 +1050,38 @@ class StageGTestCase(unittest.TestCase):
             ).fetchone()
         self.assertEqual("stale", row["status"])
 
+    def test_sweep_stale_sessions_stamps_ended_at_and_summary(self) -> None:
+        self._insert_session("old", self._iso(hours_ago=48))
+        changed = mc.sweep_stale_sessions(hours=24, db_path=self.db_path)
+        self.assertEqual(1, changed)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT ended_at, summary FROM sessions WHERE session_id = ?", ("old",)
+            ).fetchone()
+        self.assertIsNotNone(row["ended_at"])
+        self.assertEqual(
+            "Automatically marked stale: no fresh checkpoint within 24 hours",
+            row["summary"],
+        )
+
+    def test_sweep_stale_sessions_does_not_restamp_already_stale_rows(self) -> None:
+        self._insert_session("old", self._iso(hours_ago=48))
+        mc.sweep_stale_sessions(hours=24, db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            first_ended_at = conn.execute(
+                "SELECT ended_at FROM sessions WHERE session_id = ?", ("old",)
+            ).fetchone()["ended_at"]
+
+        # Second sweep run: the row is already 'stale', so the WHERE
+        # status='active' clause must not touch it again.
+        changed = mc.sweep_stale_sessions(hours=24, db_path=self.db_path)
+        self.assertEqual(0, changed)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            second_ended_at = conn.execute(
+                "SELECT ended_at FROM sessions WHERE session_id = ?", ("old",)
+            ).fetchone()["ended_at"]
+        self.assertEqual(first_ended_at, second_ended_at)
+
     def test_sweep_stale_sessions_leaves_recent_sessions_active(self) -> None:
         self._insert_session("recent", self._iso(hours_ago=1))
         changed = mc.sweep_stale_sessions(hours=24, db_path=self.db_path)
@@ -984,6 +1097,49 @@ class StageGTestCase(unittest.TestCase):
         self._insert_session("completed", self._iso(hours_ago=48), status="completed")
         changed = mc.sweep_stale_sessions(hours=24, db_path=self.db_path)
         self.assertEqual(0, changed)
+
+    def test_sweep_stale_sessions_pseudo_session_with_recent_checkpoint_stays_active(
+        self,
+    ) -> None:
+        # Regression test: dispatch-cli/web-assistant are permanent
+        # pseudo-sessions whose started_at is never touched after creation
+        # (see decisions.md, 2026-08-21) - staleness must follow checkpoint
+        # activity, not the decades-old started_at.
+        self._insert_session("dispatch-cli", self._iso(days_ago=30), surface="dispatch-cli")
+        self._insert_checkpoint("dispatch-cli", self._iso(hours_ago=1))
+        changed = mc.sweep_stale_sessions(hours=24, db_path=self.db_path)
+        self.assertEqual(0, changed)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT status FROM sessions WHERE session_id = ?", ("dispatch-cli",)
+            ).fetchone()
+        self.assertEqual("active", row["status"])
+
+    def test_sweep_stale_sessions_pseudo_session_without_recent_checkpoint_goes_stale(
+        self,
+    ) -> None:
+        self._insert_session("web-assistant", self._iso(days_ago=30), surface="web-assistant")
+        changed = mc.sweep_stale_sessions(hours=24, db_path=self.db_path)
+        self.assertEqual(1, changed)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT status FROM sessions WHERE session_id = ?", ("web-assistant",)
+            ).fetchone()
+        self.assertEqual("stale", row["status"])
+
+    def test_sweep_stale_sessions_claude_code_hook_session_ages_off_started_at(self) -> None:
+        # No permanent pseudo-session leniency for real hook sessions - old
+        # behavior unchanged.
+        self._insert_session(
+            "hook-session", self._iso(hours_ago=25), surface="claude-code-hook"
+        )
+        changed = mc.sweep_stale_sessions(hours=24, db_path=self.db_path)
+        self.assertEqual(1, changed)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT status FROM sessions WHERE session_id = ?", ("hook-session",)
+            ).fetchone()
+        self.assertEqual("stale", row["status"])
 
     def test_check_floor_empty_when_nothing_flagged(self) -> None:
         self.assertEqual([], mc.check_floor(db_path=self.db_path))
@@ -2269,6 +2425,20 @@ class StageRTestCase(unittest.TestCase):
                 "SELECT status FROM sessions WHERE session_id = ?", (self.session_id,)
             ).fetchone()[0]
         self.assertEqual("degraded", status)
+
+    def test_mark_session_degraded_does_not_set_ended_at(self) -> None:
+        # Regression test: degraded is deliberately NOT terminal (see
+        # mark_session_degraded's docstring and decisions.md, 2026-08-21) —
+        # a session flagged degraded may still continue, so it must not get
+        # an ended_at stamp. Don't "fix" this as if it were an omission.
+        mc.mark_session_degraded(self.session_id, db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT status, ended_at FROM sessions WHERE session_id = ?",
+                (self.session_id,),
+            ).fetchone()
+        self.assertEqual("degraded", row["status"])
+        self.assertIsNone(row["ended_at"])
 
 
 class StageACTestCase(McTestCase):

@@ -973,3 +973,107 @@
   creates_tables`'ın beklenen tablo setine `memory_assertion`/`memory_
   assertion_relation` eklenmesi (yeni sayılmıyor, var olan testin
   güncellenmesi). Hiçbir şey commit edilmedi.
+
+- **2026-08-21 — Session/checkpoint recovery proje sınırı tanımıyordu, düzeltildi
+  (session management parity, Adım 1).** Bug: `sessions` ve `checkpoints`
+  tablolarında `project_id` yoktu, bu yüzden `mc.latest_checkpoint(session_id)`
+  kendi checkpoint'i olmayan bir session için DB'deki mutlak en son checkpoint'e
+  (herhangi bir projeden) düşüyordu — örn. Nextven'de açılan yeni bir session,
+  kendi checkpoint'i yoksa bbb-lite'ın son checkpoint'ini "recovery" olarak
+  gösterebiliyordu.
+
+  Düzeltme: `sessions.project_id` ve `checkpoints.project_id` eklendi
+  (client_session_uuid migration-guard pattern'i birebir taklit edilerek).
+  `hooks/session_start.py`'de `resolve_project(cwd)` artık `ensure_session(...)`
+  çağrısından ÖNCE yapılıyor, sonucu `ensure_session(..., project_id=...)`'a
+  veriliyor. `write_checkpoint()` her satıra session'ın project_id'sini otomatik
+  yazıyor.
+
+  `latest_checkpoint()`'in fallback davranışı BİLEREK ikiye bölündü:
+  - session'ın project_id'si BİLİNİYORSA: fallback `WHERE project_id = ?` ile o
+    projeye sınırlı (bug'ın doğrudan düzeltmesi).
+  - project_id BİLİNMİYORSA (session hiç `ensure_session` ile kaydedilmemiş VEYA
+    cwd gerçekten unmapped): eski global fallback (tüm `checkpoints` tablosunda
+    en son satır) AYNEN korundu — bu, yeni/sınıflandırılmamış bir session'a hâlâ
+    faydalı bir "son görev" bağlamı verme amaçlı bilinçli bir tasarımdı (bkz.
+    `memory/lesson-latest-checkpoint-fallback.md`, ve onu kanıtlayan
+    `test_latest_checkpoint_falls_back_when_session_has_none`, `test_mc.py`).
+    Bu ayrımı yeni `test_latest_checkpoint_does_not_cross_project_boundary` ve
+    `test_latest_checkpoint_falls_back_within_same_project` testleri kanıtlıyor.
+
+- **2026-08-21 — Session management parity, Adım 2: `sessions.surface`
+  etiketi eklendi (henüz kullanılmıyor).** Tespit: bbb-lite'a üç farklı
+  giriş noktasından session yazılıyor ama hangi yüzeyden geldikleri hiçbir
+  yerde kayıtlı değildi — `hooks/session_start.py` (gerçek Claude Code
+  UUID'leri), `bin/dispatch.py` (sabit `dispatch-cli` kimliği), ve
+  `bin/assistant_server.py` (sabit `web-assistant` kimliği, Canvas kendi
+  id'sini göndermezse). Bu üçü aynı `sessions`/`checkpoints` şemasını
+  paylaşıyor ama `dispatch-cli`/`web-assistant` KALICI sözde-session'lar
+  oldukları için `started_at`e göre değerlendirilmeleri yanlış (her zaman
+  "eski" görünürler, halbuki her çağrıda tekrar aktif oluyorlar).
+
+  Bu adımda: `sessions`e `surface TEXT CHECK(surface IN
+  ('claude-code-hook','dispatch-cli','web-assistant'))` eklendi
+  (`project_id`'nin migration-guard pattern'i birebir taklit edilerek, NULL'a
+  izin veren bir ALTER TABLE — SQLite'ta `NULL IN (...)` CHECK'i ihlal
+  saymıyor). `ensure_session()`e `surface` parametresi eklendi, var olan
+  satırda `project_id` ile simetrik davranıyor: `surface=None` verilirse
+  mevcut değer korunuyor, dolu verilirse UPDATE ediliyor. Üç giriş noktası
+  kendini işaretliyor: `claude-code-hook`, `dispatch-cli`, `web-assistant`.
+
+  Bilinçli olarak SADECE etiketleme — fallback/recovery mantığına
+  dokunulmadı. Adım 3'te bu etiket, `dispatch-cli`/`web-assistant` gibi
+  kalıcı sözde-session'ların `started_at` yerine son aktiviteye göre
+  değerlendirilmesi için kullanılacak (bu adımın motivasyonu, henüz
+  uygulaması değil).
+
+- **2026-08-21 — Session management parity, Adım 3: `sweep_stale_sessions()`
+  artık kalıcı sözde-session'lar için checkpoint tazeliğine bakıyor,
+  `started_at`e değil.** Bug (gerçek, doğrulanabilir): `bin/daily_check.py`
+  günlük `mc.sweep_stale_sessions(hours=24)` çağırıyor, ama bu fonksiyon
+  'active' session'ları SADECE `started_at` yaşına göre 'stale'
+  işaretliyordu. Adım 2'de etiketlenen `dispatch-cli`/`web-assistant` ise
+  KALICI, tek satırlık session'lar — `ensure_session()` satır zaten varsa
+  `started_at`'e dokunmuyor. Sonuç: bu iki kimlik ilk oluşturulduktan 24
+  saat sonra SONSUZA DEK 'stale' kalıyordu, her gün aktif kullanılsalar
+  bile — hiçbir şey onları geri 'active' yapmıyordu. Bu da
+  `check_floor()`'daki "N session stale" uyarısını kalıcı yanlış pozitif
+  yapıyordu.
+
+  Düzeltme: `sweep_stale_sessions()` artık `surface`e göre ikiye ayrılıyor.
+  `surface IN ('dispatch-cli','web-assistant')` için sinyal SON AKTİVİTE —
+  o session_id'ye ait en son checkpoint'in `created_at`'i (yoksa
+  `started_at`'e düşülüyor, tamamen terk edilmiş bir pseudo-session hâlâ
+  yakalanabilsin diye). `surface = 'claude-code-hook'` veya NULL (Adım 2
+  öncesi eski satırlar) için davranış AYNEN eskisi gibi: `started_at`
+  yaşına bakılıyor — her hook session'ı zaten kendi UUID'si, doğal olarak
+  süresi sınırlı.
+
+  Bu, `check_safepoint_stale()`'in zaten kullandığı sinyalle (per-session
+  checkpoint tazeliği, `latest_checkpoint()`'in cross-session fallback'ine
+  düşmeden) birleştirme — `check_safepoint_stale()`'e dokunulmadı, sadece
+  asıl mutasyonu yapan `sweep_stale_sessions()` aynı doğru sinyale
+  taşındı.
+
+- **2026-08-21 — Session management parity, Adım 4: `sessions`e `ended_at`/
+  `summary` audit kolonları eklendi — SADECE gerçekten terminal olan
+  geçişlere (`completed`, `stale`) uygulandı, `degraded`'a BİLEREK
+  uygulanmadı.** `mark_session_completed()` artık `status='completed'`
+  yanında `ended_at`'i (şimdi, ISO UTC) yazıyor; opsiyonel `summary`
+  parametresi verilmezse `summary` NULL kalıyor (uydurma bir varsayılan
+  metin yazılmıyor). `sweep_stale_sessions()`'ın 'active'→'stale' çeviren
+  UPDATE'i de aynı şekilde `ended_at` ve otomatik üretilmiş
+  `summary='Automatically marked stale: no fresh checkpoint within N
+  hours'` yazıyor — mevcut `WHERE status='active'` koşulu zaten sadece o
+  anda gerçekten geçiş yapan satırları etkilediği için, önceden zaten
+  'stale' olan satırlar her sweep çalışmasında tekrar damgalanmıyor.
+
+  `mark_session_degraded()`'a KASITLI olarak dokunulmadı. Sebep zaten
+  kendi docstring'inde açık: "compact recovery could not be verified
+  intact" terminal bir durum değil — session'ın kendisi devam edebilir,
+  sadece bütünlüğü şüpheli diye işaretleniyor (bkz. 2026-07-27 kararı,
+  fail-soft'un bilinçli istisnası). Ona `ended_at` koymak "bu session
+  bitti" gibi yanlış bir sinyal verirdi. Bu, `test_mc.py`'de açık bir
+  regresyon testiyle korunuyor (`mark_session_degraded` sonrası
+  `ended_at`'in hâlâ NULL olduğunu doğrulayan test) — ileride biri bunu
+  "eksik kalmış" sanıp ekleyebilir, test onu engellesin diye.

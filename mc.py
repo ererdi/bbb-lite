@@ -459,6 +459,19 @@ def init_db(db_path: Path = DB_PATH) -> None:
         }
         if "client_session_uuid" not in existing_session_columns:
             conn.execute("ALTER TABLE sessions ADD COLUMN client_session_uuid TEXT")
+        if "project_id" not in existing_session_columns:
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN project_id INTEGER REFERENCES projects(id)"
+            )
+        if "surface" not in existing_session_columns:
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN surface TEXT "
+                "CHECK(surface IN ('claude-code-hook', 'dispatch-cli', 'web-assistant'))"
+            )
+        if "ended_at" not in existing_session_columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN ended_at TEXT")
+        if "summary" not in existing_session_columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN summary TEXT")
         conn.execute(
             """CREATE TABLE IF NOT EXISTS roles (
                 session_id TEXT PRIMARY KEY,
@@ -477,6 +490,13 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 risk TEXT
             )"""
         )
+        existing_checkpoint_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(checkpoints)").fetchall()
+        }
+        if "project_id" not in existing_checkpoint_columns:
+            conn.execute(
+                "ALTER TABLE checkpoints ADD COLUMN project_id INTEGER REFERENCES projects(id)"
+            )
         conn.execute(
             """CREATE TABLE IF NOT EXISTS tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1537,7 +1557,11 @@ def init_db(db_path: Path = DB_PATH) -> None:
 
 
 def ensure_session(
-    session_id: str, client_session_uuid: str | None = None, db_path: Path = DB_PATH
+    session_id: str,
+    client_session_uuid: str | None = None,
+    project_id: int | None = None,
+    surface: str | None = None,
+    db_path: Path = DB_PATH,
 ) -> str:
     with contextlib.closing(_connect(db_path)) as conn:
         row = conn.execute(
@@ -1546,15 +1570,26 @@ def ensure_session(
         if row is None:
             conn.execute(
                 """INSERT INTO sessions
-                   (session_id, started_at, status, client_session_uuid)
-                   VALUES (?, ?, ?, ?)""",
-                (session_id, _now(), "active", client_session_uuid),
+                   (session_id, started_at, status, client_session_uuid, project_id, surface)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (session_id, _now(), "active", client_session_uuid, project_id, surface),
             )
-        elif client_session_uuid is not None:
-            conn.execute(
-                "UPDATE sessions SET client_session_uuid = ? WHERE session_id = ?",
-                (client_session_uuid, session_id),
-            )
+        else:
+            if client_session_uuid is not None:
+                conn.execute(
+                    "UPDATE sessions SET client_session_uuid = ? WHERE session_id = ?",
+                    (client_session_uuid, session_id),
+                )
+            if project_id is not None:
+                conn.execute(
+                    "UPDATE sessions SET project_id = ? WHERE session_id = ?",
+                    (project_id, session_id),
+                )
+            if surface is not None:
+                conn.execute(
+                    "UPDATE sessions SET surface = ? WHERE session_id = ?",
+                    (surface, session_id),
+                )
         conn.commit()
     return session_id
 
@@ -1650,16 +1685,34 @@ def write_checkpoint(
     db_path: Path = DB_PATH,
 ) -> None:
     with contextlib.closing(_connect(db_path)) as conn:
+        session_row = conn.execute(
+            "SELECT project_id FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        project_id = session_row["project_id"] if session_row else None
         conn.execute(
             """INSERT INTO checkpoints
-               (session_id, created_at, current_task, last_decision, next_action, open_queue, risk)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (session_id, _now(), current_task, last_decision, next_action, open_queue, risk),
+               (session_id, created_at, current_task, last_decision, next_action, open_queue, risk, project_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (session_id, _now(), current_task, last_decision, next_action, open_queue, risk, project_id),
         )
         conn.commit()
 
 
 def latest_checkpoint(session_id: str, db_path: Path = DB_PATH) -> dict | None:
+    """The newest checkpoint scoped to session_id, if there is one.
+
+    Otherwise, falls back — but the scope of that fallback depends on whether
+    session_id has a KNOWN project_id (see decisions.md, 2026-08-21):
+    - known project_id: fallback is limited to checkpoints from sessions in
+      that same project. A session in one project must never surface another
+      project's checkpoint as "recovery" context.
+    - unknown project_id (session never registered via ensure_session, or
+      registered with an unmapped cwd): falls back to the newest checkpoint
+      across the whole table, unchanged from the original Stage-era behavior
+      (see memory/lesson-latest-checkpoint-fallback.md) — a new/unclassified
+      session still gets a useful "last task" nudge.
+    """
+
     with contextlib.closing(_connect(db_path)) as conn:
         row = conn.execute(
             """SELECT * FROM checkpoints WHERE session_id = ?
@@ -1667,9 +1720,20 @@ def latest_checkpoint(session_id: str, db_path: Path = DB_PATH) -> dict | None:
             (session_id,),
         ).fetchone()
         if row is None:
-            row = conn.execute(
-                "SELECT * FROM checkpoints ORDER BY created_at DESC LIMIT 1"
+            session_row = conn.execute(
+                "SELECT project_id FROM sessions WHERE session_id = ?", (session_id,)
             ).fetchone()
+            project_id = session_row["project_id"] if session_row else None
+            if project_id is not None:
+                row = conn.execute(
+                    """SELECT * FROM checkpoints WHERE project_id = ?
+                       ORDER BY created_at DESC LIMIT 1""",
+                    (project_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM checkpoints ORDER BY created_at DESC LIMIT 1"
+                ).fetchone()
     return dict(row) if row else None
 
 
@@ -3420,13 +3484,43 @@ def has_completed_task_since(session_id: str, db_path: Path = DB_PATH) -> bool:
 
 
 def sweep_stale_sessions(hours: int = 24, db_path: Path = DB_PATH) -> int:
-    """Mark 'active' sessions older than `hours` as 'stale'; return how many changed."""
+    """Mark 'active' sessions older than `hours` as 'stale'; return how many changed.
+
+    `dispatch-cli` and `web-assistant` are permanent pseudo-sessions (see
+    decisions.md, 2026-08-21) — ensure_session() never touches their
+    started_at once the row exists, so ageing them off started_at would mark
+    them stale forever after their first `hours` window, even while used
+    daily. For those two surfaces, staleness is judged by last activity (the
+    most recent checkpoint for that session_id, falling back to started_at
+    if it never checkpointed) instead. Sessions with surface
+    'claude-code-hook' or NULL (legacy, pre-Adım-2 rows) keep the original
+    started_at-only behavior unchanged — each is already a distinct,
+    naturally time-bounded UUID.
+    """
 
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    now = datetime.now(timezone.utc).isoformat()
+    summary = f"Automatically marked stale: no fresh checkpoint within {hours} hours"
     with contextlib.closing(_connect(db_path)) as conn:
         updated = conn.execute(
-            "UPDATE sessions SET status = 'stale' WHERE status = 'active' AND started_at < ?",
-            (cutoff,),
+            """UPDATE sessions
+               SET status = 'stale', ended_at = ?, summary = ?
+               WHERE status = 'active'
+                 AND (
+                   (
+                     (surface IS NULL OR surface = 'claude-code-hook')
+                     AND started_at < ?
+                   )
+                   OR (
+                     surface IN ('dispatch-cli', 'web-assistant')
+                     AND COALESCE(
+                       (SELECT MAX(created_at) FROM checkpoints
+                        WHERE checkpoints.session_id = sessions.session_id),
+                       started_at
+                     ) < ?
+                   )
+                 )""",
+            (now, summary, cutoff, cutoff),
         )
         conn.commit()
         return updated.rowcount
@@ -3681,11 +3775,14 @@ def list_maintenance_runs(
     )
 
 
-def mark_session_completed(session_id: str, db_path: Path = DB_PATH) -> None:
+def mark_session_completed(
+    session_id: str, summary: str | None = None, db_path: Path = DB_PATH
+) -> None:
     with contextlib.closing(_connect(db_path)) as conn:
         conn.execute(
-            "UPDATE sessions SET status = 'completed' WHERE session_id = ?",
-            (session_id,),
+            "UPDATE sessions SET status = 'completed', ended_at = ?, summary = ? "
+            "WHERE session_id = ?",
+            (datetime.now(timezone.utc).isoformat(), summary, session_id),
         )
         conn.commit()
 
