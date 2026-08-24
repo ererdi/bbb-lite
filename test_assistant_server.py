@@ -211,7 +211,9 @@ class CollectContextTestCase(unittest.TestCase):
             ) as score, \
             mock.patch("assistant_server.mc.detect_memory_conflicts") as conflicts:
             context = assistant_server.collect_context("you are the builder", "web")
-        ensure.assert_called_once()
+        ensure.assert_called_once_with(
+            "web", surface="web-assistant", db_path=assistant_server.mc.DB_PATH
+        )
         set_role.assert_called_once_with("web", "builder", db_path=assistant_server.mc.DB_PATH)
         self.assertEqual("builder", context["role"])
         self.assertEqual([{"title": "kw"}], context["keyword_memory"])

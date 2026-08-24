@@ -156,7 +156,12 @@ async def _collect_text(prompt: str, system_prompt: str, cwd: str | None = None)
 
 async def dispatch(task: str) -> None:
     _safe_mc(None, mc.init_db)
-    _safe_mc(None, mc.ensure_session, DISPATCH_SESSION_ID)
+    # run_id (a real uuid4, unique per invocation) is generated here before
+    # ensure_session so the session_id below can be derived from it - two
+    # dispatch() runs close together must not share one session_id, or
+    # tasks_touched_by_session() would mix their tasks together (see
+    # decisions.md, 2026-08-21). DISPATCH_SESSION_ID itself is kept as the
+    # prefix, and as the fail-soft fallback if run_id couldn't be created.
     run_id = _safe_mc(
         None,
         mc.create_dispatch_run,
@@ -164,6 +169,8 @@ async def dispatch(task: str) -> None:
         status="running",
         summary=task,
     )
+    session_id = f"{DISPATCH_SESSION_ID}-{run_id}" if run_id else DISPATCH_SESSION_ID
+    _safe_mc(None, mc.ensure_session, session_id, surface="dispatch-cli")
     task_id = None
     cto_reply = await run_claude(f"Task: {task}", system_prompt=CTO_SYSTEM_PROMPT)
     parsed_cto = _parse_cto_response(cto_reply) if cto_reply is not None else None
@@ -177,7 +184,7 @@ async def dispatch(task: str) -> None:
         if run_id:
             _safe_mc(None, mc.record_agent_output, run_id, "cto", cto_reply)
         task_id = _safe_mc(
-            None, mc.add_task, title, status="in_progress", session_id=DISPATCH_SESSION_ID
+            None, mc.add_task, title, status="in_progress", session_id=session_id
         )
         role_needed = "architect" if needs_architect else "builder"
     else:
@@ -250,7 +257,7 @@ async def dispatch(task: str) -> None:
             None,
             mc.complete_task,
             task_id,
-            session_id=DISPATCH_SESSION_ID,
+            session_id=session_id,
             evidence_id=evidence_id,
             completion_summary=change,
             require_test_evidence=False,

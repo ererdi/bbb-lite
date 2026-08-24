@@ -122,6 +122,47 @@ class DispatchTestCase(unittest.TestCase):
             asyncio.run(dispatch.dispatch(task))
         return buffer.getvalue()
 
+    def test_dispatch_tags_session_with_dispatch_cli_surface(self) -> None:
+        # create_dispatch_run is mocked (setUp) to always return "run-1", so
+        # the derived session_id is an exact, predictable value here - see
+        # decisions.md, 2026-08-21.
+        with mock.patch("dispatch.mc.classify", return_value="builder"), \
+            mock.patch("dispatch.run_claude", return_value="I'd add a function."):
+            self._run()
+        self.mock_ensure_session.assert_called_once_with(
+            f"{dispatch.DISPATCH_SESSION_ID}-run-1", surface="dispatch-cli"
+        )
+
+    def test_two_dispatch_runs_get_distinct_session_ids(self) -> None:
+        # Regression test: two dispatch() invocations close together must
+        # not share a session_id, or tasks_touched_by_session() would mix
+        # their tasks together (see decisions.md, 2026-08-21).
+        with mock.patch("dispatch.mc.classify", return_value="builder"), \
+            mock.patch("dispatch.run_claude", return_value="I'd add a function."):
+            self.mock_create_dispatch_run.return_value = "run-1"
+            self._run()
+            self.mock_create_dispatch_run.return_value = "run-2"
+            self._run()
+        session_ids = [
+            call.args[0] for call in self.mock_ensure_session.call_args_list
+        ]
+        self.assertEqual(
+            [f"{dispatch.DISPATCH_SESSION_ID}-run-1", f"{dispatch.DISPATCH_SESSION_ID}-run-2"],
+            session_ids,
+        )
+
+    def test_dispatch_falls_back_to_constant_session_id_when_run_id_missing(self) -> None:
+        # create_dispatch_run failing (fail-soft -> None, e.g. a DB error) must
+        # not propagate into an f"{...}-None" session_id - fall back to the
+        # old constant behavior instead (see decisions.md, 2026-08-21).
+        self.mock_create_dispatch_run.return_value = None
+        with mock.patch("dispatch.mc.classify", return_value="builder"), \
+            mock.patch("dispatch.run_claude", return_value="I'd add a function."):
+            self._run()
+        self.mock_ensure_session.assert_called_once_with(
+            dispatch.DISPATCH_SESSION_ID, surface="dispatch-cli"
+        )
+
     def test_builder_only_path(self) -> None:
         # CTO turn's reply ("I'd add a function.") doesn't parse, so this
         # falls back to classify() — same as every pre-Stage-U scenario below.
@@ -186,12 +227,13 @@ class DispatchTestCase(unittest.TestCase):
             ):
             output = self._run()
         classify_mock.assert_not_called()  # CTO answered cleanly, no fallback needed
+        derived_session_id = f"{dispatch.DISPATCH_SESSION_ID}-run-1"
         add_task_mock.assert_called_once_with(
-            "Fix the login bug", status="in_progress", session_id=dispatch.DISPATCH_SESSION_ID
+            "Fix the login bug", status="in_progress", session_id=derived_session_id
         )
         complete_task_mock.assert_called_once_with(
             42,
-            session_id=dispatch.DISPATCH_SESSION_ID,
+            session_id=derived_session_id,
             evidence_id=self.mock_record_evidence.return_value,
             completion_summary="short change",
             require_test_evidence=False,
@@ -211,12 +253,13 @@ class DispatchTestCase(unittest.TestCase):
             output = self._run()
         classify_mock.assert_not_called()
         self.assertEqual(2, claude_mock.call_count)  # cto + builder, no architect turn
+        derived_session_id = f"{dispatch.DISPATCH_SESSION_ID}-run-1"
         add_task_mock.assert_called_once_with(
-            "Add a helper", status="in_progress", session_id=dispatch.DISPATCH_SESSION_ID
+            "Add a helper", status="in_progress", session_id=derived_session_id
         )
         complete_task_mock.assert_called_once_with(
             7,
-            session_id=dispatch.DISPATCH_SESSION_ID,
+            session_id=derived_session_id,
             evidence_id=self.mock_record_evidence.return_value,
             completion_summary="short change",
             require_test_evidence=False,

@@ -54,7 +54,21 @@ def main() -> None:
     linked_session_id = (
         mc.find_session_by_client_uuid(client_session_uuid) if client_session_uuid else None
     )
-    mc.ensure_session(session_id, client_session_uuid=client_session_uuid)
+
+    # Stage AG: match cwd's folder name against projects.name. An unmapped
+    # cwd is said out loud, not silently attached to some existing project
+    # (Haroon's "unmapped" principle - see decisions.md, 2026-07-29). Resolved
+    # BEFORE ensure_session() so the session's project_id can be recorded at
+    # creation time (see decisions.md, 2026-08-21 - checkpoint recovery must
+    # not cross project boundaries).
+    project = mc.resolve_project(cwd)
+    mc.ensure_session(
+        session_id,
+        client_session_uuid=client_session_uuid,
+        project_id=project["id"] if project["status"] != "unmapped" else None,
+        surface="claude-code-hook",
+        parent_session_id=linked_session_id,
+    )
     mc.record_lifecycle_run(
         "session_start",
         session_id=session_id,
@@ -63,10 +77,6 @@ def main() -> None:
         details={"source": source},
     )
 
-    # Stage AG: match cwd's folder name against projects.name. An unmapped
-    # cwd is said out loud, not silently attached to some existing project
-    # (Haroon's "unmapped" principle - see decisions.md, 2026-07-29).
-    project = mc.resolve_project(cwd)
     if project["status"] == "unmapped":
         print("[bbb-lite] project: unmapped (cwd not linked to any project)")
     else:

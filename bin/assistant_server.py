@@ -387,7 +387,7 @@ def _safe_call(default, func, *args, **kwargs):
 
 def collect_context(message: str, session_id: str, *, db_path: Path = mc.DB_PATH) -> dict:
     mc.init_db(db_path)
-    mc.ensure_session(session_id, db_path=db_path)
+    mc.ensure_session(session_id, surface="web-assistant", db_path=db_path)
     declared = _declared_role(message)
     if declared:
         mc.set_role(session_id, declared, db_path=db_path)

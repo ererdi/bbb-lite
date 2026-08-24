@@ -472,6 +472,11 @@ def init_db(db_path: Path = DB_PATH) -> None:
             conn.execute("ALTER TABLE sessions ADD COLUMN ended_at TEXT")
         if "summary" not in existing_session_columns:
             conn.execute("ALTER TABLE sessions ADD COLUMN summary TEXT")
+        if "parent_session_id" not in existing_session_columns:
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN parent_session_id TEXT "
+                "REFERENCES sessions(session_id)"
+            )
         conn.execute(
             """CREATE TABLE IF NOT EXISTS roles (
                 session_id TEXT PRIMARY KEY,
@@ -1561,6 +1566,7 @@ def ensure_session(
     client_session_uuid: str | None = None,
     project_id: int | None = None,
     surface: str | None = None,
+    parent_session_id: str | None = None,
     db_path: Path = DB_PATH,
 ) -> str:
     with contextlib.closing(_connect(db_path)) as conn:
@@ -1570,11 +1576,19 @@ def ensure_session(
         if row is None:
             conn.execute(
                 """INSERT INTO sessions
-                   (session_id, started_at, status, client_session_uuid, project_id, surface)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (session_id, _now(), "active", client_session_uuid, project_id, surface),
+                   (session_id, started_at, status, client_session_uuid, project_id,
+                    surface, parent_session_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id, _now(), "active", client_session_uuid, project_id,
+                    surface, parent_session_id,
+                ),
             )
         else:
+            # parent_session_id is lineage, not state: fixed at birth, never
+            # updated on an existing row (unlike client_session_uuid/
+            # project_id/surface below, which may legitimately change as a
+            # session progresses) - see decisions.md, 2026-08-21.
             if client_session_uuid is not None:
                 conn.execute(
                     "UPDATE sessions SET client_session_uuid = ? WHERE session_id = ?",
@@ -1605,6 +1619,23 @@ def find_session_by_client_uuid(
             """SELECT session_id FROM sessions WHERE client_session_uuid = ?
                ORDER BY started_at DESC LIMIT 1""",
             (client_session_uuid,),
+        ).fetchone()
+    return row["session_id"] if row else None
+
+
+def get_successor_session_id(session_id: str, db_path: Path = DB_PATH) -> str | None:
+    """The most recent session that named `session_id` as its parent, or None.
+
+    There is no successor_session_id column (see decisions.md, 2026-08-21) -
+    parent_session_id is the single source of truth, this just queries it in
+    reverse, consistent with find_session_by_client_uuid()'s query style.
+    """
+
+    with contextlib.closing(_connect(db_path)) as conn:
+        row = conn.execute(
+            """SELECT session_id FROM sessions WHERE parent_session_id = ?
+               ORDER BY started_at DESC LIMIT 1""",
+            (session_id,),
         ).fetchone()
     return row["session_id"] if row else None
 

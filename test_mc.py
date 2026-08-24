@@ -160,6 +160,75 @@ class McTestCase(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             mc.ensure_session("s1", surface="not-a-real-surface", db_path=self.db_path)
 
+    def test_ensure_session_records_parent_session_id(self) -> None:
+        mc.ensure_session("parent", db_path=self.db_path)
+        mc.ensure_session("child", parent_session_id="parent", db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT parent_session_id FROM sessions WHERE session_id = ?", ("child",)
+            ).fetchone()
+        self.assertEqual("parent", row["parent_session_id"])
+
+    def test_ensure_session_parent_session_id_is_immutable(self) -> None:
+        # Regression test: parent_session_id is lineage, fixed at birth -
+        # a later ensure_session() call with a different parent must not
+        # overwrite it (see decisions.md, 2026-08-21).
+        mc.ensure_session("original-parent", db_path=self.db_path)
+        mc.ensure_session("other-parent", db_path=self.db_path)
+        mc.ensure_session("child", parent_session_id="original-parent", db_path=self.db_path)
+        mc.ensure_session("child", parent_session_id="other-parent", db_path=self.db_path)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT parent_session_id FROM sessions WHERE session_id = ?", ("child",)
+            ).fetchone()
+        self.assertEqual("original-parent", row["parent_session_id"])
+
+    def test_get_successor_session_id_returns_child(self) -> None:
+        mc.ensure_session("parent", db_path=self.db_path)
+        mc.ensure_session("child", parent_session_id="parent", db_path=self.db_path)
+        self.assertEqual(
+            "child", mc.get_successor_session_id("parent", db_path=self.db_path)
+        )
+
+    def test_get_successor_session_id_returns_none_without_children(self) -> None:
+        mc.ensure_session("lonely", db_path=self.db_path)
+        self.assertIsNone(mc.get_successor_session_id("lonely", db_path=self.db_path))
+
+    def test_parent_session_id_links_across_simulated_clear(self) -> None:
+        # End-to-end: mirrors hooks/session_start.py's actual sequence for
+        # two consecutive SessionStart calls under the same
+        # client_session_uuid (e.g. before and after a /clear) - look up
+        # the previous session BEFORE tagging the new one, then pass it as
+        # parent_session_id.
+        client_session_uuid = "claude-uuid-fixed"
+
+        linked_before_first = mc.find_session_by_client_uuid(
+            client_session_uuid, db_path=self.db_path
+        )
+        mc.ensure_session(
+            "s1",
+            client_session_uuid=client_session_uuid,
+            parent_session_id=linked_before_first,
+            db_path=self.db_path,
+        )
+
+        linked_before_second = mc.find_session_by_client_uuid(
+            client_session_uuid, db_path=self.db_path
+        )
+        mc.ensure_session(
+            "s2",
+            client_session_uuid=client_session_uuid,
+            parent_session_id=linked_before_second,
+            db_path=self.db_path,
+        )
+
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT parent_session_id FROM sessions WHERE session_id = ?", ("s2",)
+            ).fetchone()
+        self.assertEqual("s1", row["parent_session_id"])
+        self.assertEqual("s2", mc.get_successor_session_id("s1", db_path=self.db_path))
+
     def test_add_and_list_open_tasks(self) -> None:
         mc.add_task("write tests", db_path=self.db_path)
         mc.add_task("ship it", db_path=self.db_path)

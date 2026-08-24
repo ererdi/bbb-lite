@@ -1077,3 +1077,59 @@
   regresyon testiyle korunuyor (`mark_session_degraded` sonrası
   `ended_at`'in hâlâ NULL olduğunu doğrulayan test) — ileride biri bunu
   "eksik kalmış" sanıp ekleyebilir, test onu engellesin diye.
+
+- **2026-08-21 — Session management parity, Adım 5: `/clear` sonrası
+  kurulan session bağlantısı artık açık bir `parent_session_id` kolonunda,
+  sadece TEK YÖNLÜ.** Daha önce bu bağlantı `find_session_by_client_uuid()`
+  ile her seferinde dolaylı hesaplanıyordu ama hiçbir yere yazılmıyordu —
+  sorgulanamıyordu ("bu session'ın çocuğu var mı" sorusuna cevap yoktu).
+
+  Bilinçli tercih: `successor_session_id` diye AYRI, ikinci bir kolon
+  EKLENMEDİ. İki yönlü bir şema, yeni bir session açıldığında geçmişte
+  kalmış (belki zaten `completed`/`stale` olmuş) bir satıra geri dönüp
+  `successor_session_id` yazmayı gerektirirdi — bu da iki satırın senkron
+  kalmasını garanti etmek için ekstra bir sorumluluk yaratırdı (write iki
+  yere gider, biri başarısız olursa tutarsızlık). Bunun yerine sadece
+  `parent_session_id` var (tek yazma, session doğarken); ters yön
+  (`get_successor_session_id()`) `WHERE parent_session_id = ?` ile
+  sorgulanıyor — `find_session_by_client_uuid()`'nin zaten kullandığı
+  "en yeniyi al" sorgu stiliyle birebir tutarlı. Tek doğruluk kaynağı
+  `parent_session_id`; successor bilgisi ondan türetiliyor, ayrıca
+  saklanmıyor.
+
+  `parent_session_id` KASITLI olarak immutable: `ensure_session()` sadece
+  INSERT dalında yazıyor, var olan bir session'ın satırı UPDATE edilirken
+  (client_session_uuid/project_id/surface gibi) asla dokunulmuyor — bu bir
+  soy kütüğü (lineage) gerçeği, session hangi önceki session'dan
+  türediyse o hep öyle kalır, sonradan değişmez. `hooks/session_start.py`
+  zaten `ensure_session()`'dan ÖNCE hesapladığı `linked_session_id`'yi
+  (Stage AH, `find_session_by_client_uuid` ile) artık aynı çağrıya
+  `parent_session_id=` olarak da geçiyor — ekstra bir hesaplama yok, var
+  olan değer bir kolona yazılıyor.
+
+- **2026-08-21 — Session management parity, Adım 6: `bin/dispatch.py`'nin
+  sabit `DISPATCH_SESSION_ID` kimliği artık invocation-özel.** Bug:
+  `dispatch()` her çalıştırıldığında `ensure_session`/`add_task`/
+  `complete_task` hep aynı `"dispatch-cli"` kimliğini kullanıyordu; aynı
+  fonksiyonda zaten `create_dispatch_run` ile gerçekten invocation'a özel
+  bir `run_id` (uuid4) üretiliyordu ama session kimliğine hiç yansımıyordu.
+  Sonuç: iki `dispatch()` çalıştırması art arda/yakın zamanda olursa
+  `tasks_touched_by_session("dispatch-cli")` ikisinin task'larını
+  birbirine karıştırırdı.
+
+  Düzeltme: `create_dispatch_run` çağrısı `ensure_session`'dan ÖNCEYE
+  alındı (`run_id` üretilsin diye), sonra `session_id =
+  f"{DISPATCH_SESSION_ID}-{run_id}"` türetiliyor ve `dispatch()` içindeki
+  `ensure_session`/`add_task`/`complete_task` çağrıları bu türetilmiş
+  kimliğe geçti. `create_dispatch_run`'ın kendi çağrısı hâlâ sabit
+  `DISPATCH_SESSION_ID`'yi kullanıyor (bilerek — o an `run_id` henüz yok,
+  tavuk-yumurta sorunu) — yani `dispatch_runs.session_id` sütunu sabit
+  kalıyor, ama bbb-lite'ın asıl session/task izlemesi (`sessions`,
+  `tasks.session_id`) invocation-özel kimliğe geçti.
+
+  `run_id` `None` dönerse (fail-soft: `create_dispatch_run` DB hatasıyla
+  başarısız olursa) `session_id` eski sabit `DISPATCH_SESSION_ID`'ye geri
+  düşüyor — `f"...-None"` gibi anlamsız bir kimlik üretmek yerine, bu
+  projenin fail-soft felsefesiyle tutarlı bir varsayılan. `DISPATCH_SESSION_ID`
+  sabitinin kendisi silinmedi — hem prefix hem bu fallback için hâlâ
+  gerekli.

@@ -34,6 +34,7 @@ _BOUND_FUNCS = (
     "ensure_session",
     "run_maintenance_checks",
     "record_lifecycle_run",
+    "resolve_project",
     "get_role",
     "can_write_code",
     "can_write_data",
@@ -125,6 +126,15 @@ class SessionStartRecoveryPackageTestCase(unittest.TestCase):
         with _bind_to_test_db(self.db_path):
             output = _run_session_start(self.session_id)
         self.assertNotIn("WARNING", output)
+
+    def test_session_start_tags_session_with_claude_code_hook_surface(self) -> None:
+        with _bind_to_test_db(self.db_path):
+            _run_session_start(self.session_id)
+        with contextlib.closing(mc._connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT surface FROM sessions WHERE session_id = ?", (self.session_id,)
+            ).fetchone()
+        self.assertEqual("claude-code-hook", row["surface"])
 
     def test_recovery_package_size_is_small_and_printed(self) -> None:
         mc.write_checkpoint(
